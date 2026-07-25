@@ -850,6 +850,14 @@ function elasticat.note_off()
   engine_call("noteOff")
 end
 
+-- Force a fresh amp/filter re-attack for auditioning a stopped step preview.
+-- Unlike note_on, this re-attacks even under portamento (whose legato hold
+-- otherwise swallows a note-on on a still-sounding preview note). seconds <= 0
+-- keeps the indefinite hold used by the sustained preview.
+function elasticat.retrig_note(seconds)
+  engine_call("retrigNote", seconds or 0)
+end
+
 -- Push the amp-envelope + pan/vol params to the engine. Needed on init because
 -- these params are added with their action set afterwards (so their defaults
 -- never fire) and aren't in older psets, leaving the engine on stale defaults.
@@ -1195,11 +1203,13 @@ function elasticat.load_pool_slot(slot, path, make_active)
   return true
 end
 
--- Wipe one pool slot's script-side state (New Project / a project load that
--- doesn't use this slot). The engine keeps the last-loaded buffer -- there is
--- no unload command -- but nothing references an emptied slot until it's
--- reloaded, so it stays silent.
+-- Wipe one pool slot's script-side state AND unload its engine buffer (New
+-- Project / a project load that doesn't use this slot). Freeing the engine
+-- buffer is required: without it an emptied ACTIVE slot kept looping the
+-- previous sample on play. Only slots that actually held a sample send the
+-- engine command, so a normal load doesn't spray 128 no-op clears.
 local function clear_pool_slot(slot)
+  local had_sample = sample_pool.paths[slot] ~= nil
   sample_pool.paths[slot] = nil
   sample_pool.samples[slot] = nil
   sample_pool.rates[slot] = nil
@@ -1209,6 +1219,9 @@ local function clear_pool_slot(slot)
   sample_pool.trim_starts[slot] = nil
   sample_pool.trim_ends[slot] = nil
   sample_pool.gains[slot] = nil
+  if had_sample then
+    engine_call("clearPoolSlot", slot)
+  end
 end
 
 -- Make the pool EXACTLY equal to `paths`: load the slots it lists and CLEAR

@@ -1065,6 +1065,7 @@ Engine_Elasticat : CroneEngine {
 	installCommands {
 		this.addCommand(\loadSample, "s", { arg msg; this.loadSample(msg[1]); });
 		this.addCommand(\loadPoolSlot, "is", { arg msg; this.loadPoolSlot(msg[1], msg[2]); });
+		this.addCommand(\clearPoolSlot, "i", { arg msg; this.clearPoolSlot(msg[1]); });
 		this.addCommand(\setSampleSlot, "i", { arg msg; this.setSampleSlot(msg[1]); });
 		this.addCommand(\sampleSlot, "i", { arg msg; this.setSampleSlot(msg[1]); });
 		this.addCommand(\previewSlot, "iffff", { arg msg; this.previewSlot(msg[1], msg[2], msg[3], msg[4], msg[5]); });
@@ -1183,6 +1184,38 @@ Engine_Elasticat : CroneEngine {
 			});
 			if(filterSynth.notNil, {
 				filterSynth.set(\envReleaseTrig, noteOffTrigCount);
+			});
+		});
+		// Force a fresh amp/filter re-attack, for auditioning a stopped step
+		// preview (grid loop/pitch-key edits while holding a step). Unlike a
+		// plain noteOn, this ALWAYS re-attacks -- even under portamento, whose
+		// held-gate legato deliberately swallows a note-on on a still-sounding
+		// note (readerAmpEnv's port branch). A preview is monitoring, not
+		// legato, so it must be heard. With portamento off a plain note-on
+		// already re-attacks, so we just do that (no release blip). With
+		// portamento on we mimic a manual re-press: close the gate now, reopen
+		// it one block later via SystemClock.sched -- separated so SetResetFF
+		// sees reset THEN set (same-block would be reset-wins -> stuck closed).
+		this.addCommand(\retrigNote, "f", { arg msg;
+			var seconds = msg[1];
+			var applyNoteOn;
+			applyNoteOn = {
+				if(seconds > 0, { envNoteSeconds = seconds.max(0.005) }, { envNoteSeconds = -1 });
+				envTrigCount = envTrigCount + 1;
+				if(activeSynth.notNil, {
+					activeSynth.set(\envGateSeconds, envNoteSeconds, \envTrig, envTrigCount);
+				});
+				if(filterSynth.notNil, {
+					filterSynth.set(\envGateSeconds, envNoteSeconds, \envTrig, envTrigCount);
+				});
+			};
+			if(portamento > 0, {
+				noteOffTrigCount = noteOffTrigCount + 1;
+				if(activeSynth.notNil, { activeSynth.set(\envReleaseTrig, noteOffTrigCount) });
+				if(filterSynth.notNil, { filterSynth.set(\envReleaseTrig, noteOffTrigCount) });
+				SystemClock.sched(0.008, { applyNoteOn.value; nil });
+			}, {
+				applyNoteOn.value;
 			});
 		});
 		this.addCommand(\setSliceMono, "i", { arg msg; sliceMono = msg[1].asInteger.clip(0, 1); });
@@ -1932,6 +1965,34 @@ Engine_Elasticat : CroneEngine {
 
 		if(oldL.notNil, { oldL.free; });
 		if(oldR.notNil and: { oldR != oldL }, { oldR.free; });
+	}
+
+	// Unload a pool slot's buffer entirely (New Project / a project load that
+	// omits this slot). Without this the server kept the last-loaded buffer, so
+	// an emptied ACTIVE slot kept looping the previous sample on play. Bumps the
+	// slot's generation so any in-flight async load lands stale (freed by
+	// installPoolBuffers' generation check) instead of resurrecting the slot.
+	clearPoolSlot { arg slot;
+		var idx, oldL, oldR;
+		slot = slot.asInteger.clip(1, poolSize);
+		idx = slot - 1;
+		loadGeneration = loadGeneration + 1;
+		poolGenerations[idx] = loadGeneration;
+		oldL = poolBufL[idx];
+		oldR = poolBufR[idx];
+		poolBufL[idx] = nil;
+		poolBufR[idx] = nil;
+		poolPaths[idx] = "";
+		poolLoaded[idx] = 0;
+		poolFrames[idx] = 4;
+		poolRates[idx] = 48000;
+		if(oldL.notNil, { oldL.free; });
+		if(oldR.notNil and: { oldR != oldL }, { oldR.free; });
+		// If the active reader was on this slot, repoint it at silence now
+		// (setSampleSlot sees poolLoaded == 0 and swaps in the default buffers).
+		if(slot == sampleSlot, {
+			this.setSampleSlot(slot);
+		});
 	}
 
 	setSampleSlot { arg slot;

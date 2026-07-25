@@ -2058,6 +2058,9 @@ function init()
     note_off = function()
       elasticat.note_off()
     end,
+    retrig_note = function(seconds)
+      elasticat.retrig_note(seconds)
+    end,
     base_region = function()
       return params:get(id("loop_start")), params:get(id("loop_end"))
     end,

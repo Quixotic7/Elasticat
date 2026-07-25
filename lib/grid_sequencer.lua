@@ -197,7 +197,7 @@ function GridSequencer.new(options)
   self.pattern_selection_made = false
   self.crossfade = 0  -- A/B crossfader position (0 = A, 1 = B), PRD §6.6
   self.scene_glide_target = nil  -- fader-key glide target (0..1) while held
-  self.scene_glide_clock = nil
+  self.scene_glide_metro = nil   -- reused metro that eases toward it while held
   self.g.key = function(x, y, z) self:key(x, y, z) end
   return self
 end
@@ -808,9 +808,16 @@ function GridSequencer:refresh_preview_region(retrigger)
   self:push_active_range(locks.range_start, locks.range_end)
   local start_point, end_point = self:locked_region(record)
   self:apply_step_pitch(record)
-  if retrigger and not is_slice_machine(self:machine()) and self.options.note_on ~= nil then
+  if retrigger and not is_slice_machine(self:machine()) then
     self:set_region_with_phase(start_point, end_point, 0)
-    self.options.note_on(0)
+    -- retrig_note forces a fresh attack even under portamento (a plain note_on
+    -- on the still-held preview note would be swallowed as legato). Falls back
+    -- to note_on where the engine facade predates retrig_note.
+    if self.options.retrig_note ~= nil then
+      self.options.retrig_note(0)
+    elseif self.options.note_on ~= nil then
+      self.options.note_on(0)
+    end
   else
     self:set_region(start_point, end_point)
   end
@@ -1143,20 +1150,20 @@ end
 
 -- Ease the crossfade toward scene_glide_target while a fader key is held:
 -- value += (target - value) * rate*dt (exponential approach -- fast over big
--- distances, easing in as it lands; ~0.33s to fully close). Runs on a clock at
--- ~30Hz; each step goes through options.set_crossfade, i.e. the `crossfade`
--- param, so the MASTER-page encoder and LEDs stay in sync.
+-- distances, easing in as it lands). Driven by a reused norns metro at ~30Hz
+-- (the same reliable C-timer the sequencer runs on, not a clock coroutine);
+-- each step goes through options.set_crossfade, i.e. the `crossfade` param, so
+-- the MASTER-page encoder and LEDs stay in sync.
 local SCENE_GLIDE_HZ = 30
 local SCENE_GLIDE_RATE = 5  -- per-second approach rate (time constant ~0.2s)
 
 -- One eased step of the crossfade toward scene_glide_target. Shared by the
--- immediate step on a fader-key press (so even a fast TAP moves -- otherwise
--- the release could beat the 33ms glide tick and nothing would happen) and the
--- while-held glide clock below.
+-- immediate step on a fader-key press (so even a fast TAP moves) and the
+-- while-held glide metro below. Returns true once it has landed on the target.
 function GridSequencer:step_scene_glide()
   local target = self.scene_glide_target
   if target == nil or self.options.set_crossfade == nil or self.options.get_crossfade == nil then
-    return
+    return true
   end
   local current = self.options.get_crossfade() or 0
   local factor = math.min(1, SCENE_GLIDE_RATE / SCENE_GLIDE_HZ)
@@ -1168,30 +1175,40 @@ function GridSequencer:step_scene_glide()
     self.options.set_crossfade(next_value)
     self:request_redraw()
   end
+  return next_value == target
 end
 
 function GridSequencer:start_scene_glide()
-  self:step_scene_glide()  -- move immediately so a tap registers
-  if self.scene_glide_clock ~= nil or clock == nil or clock.run == nil then
+  self:step_scene_glide()  -- move immediately so even a fast tap registers
+  if metro == nil or metro.init == nil then
     return
   end
-  self.scene_glide_clock = clock.run(function()
-    while self.scene_glide_target ~= nil do
-      clock.sleep(1 / SCENE_GLIDE_HZ)
+  -- Lazily allocate ONE glide metro and reuse it for every fader gesture (the
+  -- norns metro pool is small, so never init per-press). It keeps easing while a
+  -- fader key is held (a no-op once the target is reached -- cheap, and it lets
+  -- a release-retarget to another still-held key resume gliding); it stops only
+  -- when the target is cleared on release (stop_scene_glide).
+  if self.scene_glide_metro == nil then
+    self.scene_glide_metro = metro.init(function()
       if self.scene_glide_target == nil then
-        break
+        if self.scene_glide_metro ~= nil then
+          self.scene_glide_metro:stop()
+        end
+        return
       end
       self:step_scene_glide()
-    end
-    self.scene_glide_clock = nil
-  end)
+    end, 1 / SCENE_GLIDE_HZ, -1)
+  end
+  if self.scene_glide_metro ~= nil then
+    self.scene_glide_metro.time = 1 / SCENE_GLIDE_HZ
+    self.scene_glide_metro:start()
+  end
 end
 
 function GridSequencer:stop_scene_glide()
   self.scene_glide_target = nil
-  if self.scene_glide_clock ~= nil and clock ~= nil and clock.cancel ~= nil then
-    clock.cancel(self.scene_glide_clock)
-    self.scene_glide_clock = nil
+  if self.scene_glide_metro ~= nil then
+    self.scene_glide_metro:stop()
   end
 end
 

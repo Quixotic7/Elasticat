@@ -49,52 +49,32 @@ function ProjectStore.date_name()
   return os.date("%y%m%d-%H%M")
 end
 
--- Runtime detection of the /dust/code/namesizer library: the auto-name option
--- only offers Namesizer when it's actually installed, and generate_name()
--- falls back to Date if it's selected but later goes missing.
+-- Runtime detection of the bundled namesizer library (lib/namesizer, added to
+-- the script). The auto-name option only produces a namesizer name when it's
+-- present; generate_name() falls back to Date if it's selected but missing.
 function ProjectStore.namesizer_available()
-  return util.file_exists ~= nil and util.file_exists(_path.code .. "namesizer/")
+  return util.file_exists ~= nil
+    and util.file_exists(_path.code .. "elasticat/lib/namesizer/namesizer.lua")
 end
 
--- Best-effort call into namesizer for a generated name. namesizer's own public
--- Lua API isn't something this workstream owns or controls; this tries the
--- conventional entry points a dust name-generator library would expose
--- (`generate()` / `name()`, as either a module function or a `.new()`
--- instance method) and falls back to the Date scheme if none resolve to a
--- usable string. ASSUMPTION flagged for confirmation once namesizer is
--- actually available to test against directly.
+-- Generate a project name via the bundled namesizer: NameSizer.rnd(sep) returns
+-- a random "descriptor<sep>thing" pair (reading lib/namesizer/descriptors.txt
+-- and things.txt). A hyphen separator keeps the result a clean, filename-safe
+-- single token (e.g. "cosmic-cat"). Falls back to the Date scheme if the
+-- library is missing or errors.
 function ProjectStore.namesizer_name()
   if not ProjectStore.namesizer_available() then
     return ProjectStore.date_name()
   end
-
-  local function try_call(fn)
-    if type(fn) ~= "function" then
-      return nil
-    end
-    local ok, result = pcall(fn)
-    if ok and type(result) == "string" and result ~= "" then
-      return result
-    end
-    return nil
-  end
-
-  local ok, mod = pcall(function() return include("namesizer/lib/namesizer") end)
-  if not ok or mod == nil then
-    ok, mod = pcall(function() return dofile(_path.code .. "namesizer/lib/namesizer.lua") end)
-  end
-  if not ok or mod == nil then
+  local ok, NameSizer = pcall(function() return include("lib/namesizer/namesizer") end)
+  if not ok or type(NameSizer) ~= "table" or type(NameSizer.rnd) ~= "function" then
     return ProjectStore.date_name()
   end
-
-  local name = try_call(mod.generate) or try_call(mod.name)
-  if name == nil and type(mod.new) == "function" then
-    local ok2, instance = pcall(mod.new)
-    if ok2 and instance ~= nil then
-      name = try_call(instance.generate) or try_call(instance.name)
-    end
+  local ok2, name = pcall(NameSizer.rnd, "-")
+  if ok2 and type(name) == "string" and name ~= "" then
+    return name
   end
-  return name or ProjectStore.date_name()
+  return ProjectStore.date_name()
 end
 
 -- auto_name mode: 1 = None (caller must resolve a name another way, e.g. the
