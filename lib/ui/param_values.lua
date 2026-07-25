@@ -60,8 +60,12 @@ local ID_FORMATTERS = {
   source_bpm = fmt_round,
   sample_steps = fmt_round,
   pattern_steps = fmt_round,
+  global_pattern_length = fmt_round,
   slice_count = fmt_round,
   slice_index = fmt_round,
+  trig_chance = fmt_round,
+  trig_ratchet = fmt_round,
+  swing = fmt_round,
   grain_density = fmt_round,
   pitch = fmt_1dp,
   default_length = fmt_2dp,
@@ -76,6 +80,45 @@ local ID_FORMATTERS = {
   mode_macro = fmt_2dp,
   amp = fmt_2dp,
   pan = fmt_2dp,
+  crossfade = fmt_round,
+  filter_balance = fmt_round,
+  fx_drive = fmt_round,
+  fx_mix = fmt_round,
+  delay_feedback = fmt_round,
+  delay_tone = fmt_round,
+  reverb_size = fmt_round,
+  reverb_damp = fmt_round,
+  lofi_bits = fmt_round,
+  lofi_rate = fmt_round,
+  -- Send 1/2 + Master insert FX (PRD SS3/SS8) -- same shape as Insert 1 above,
+  -- namespaced per slot (delay_time is an options param, not listed here, same
+  -- as Insert 1's delay_time).
+  send1_level = fmt_round,
+  send2_level = fmt_round,
+  send1_fx_drive = fmt_round,
+  send1_fx_mix = fmt_round,
+  send1_delay_feedback = fmt_round,
+  send1_delay_tone = fmt_round,
+  send1_reverb_size = fmt_round,
+  send1_reverb_damp = fmt_round,
+  send1_lofi_bits = fmt_round,
+  send1_lofi_rate = fmt_round,
+  send2_fx_drive = fmt_round,
+  send2_fx_mix = fmt_round,
+  send2_delay_feedback = fmt_round,
+  send2_delay_tone = fmt_round,
+  send2_reverb_size = fmt_round,
+  send2_reverb_damp = fmt_round,
+  send2_lofi_bits = fmt_round,
+  send2_lofi_rate = fmt_round,
+  master_fx_drive = fmt_round,
+  master_fx_mix = fmt_round,
+  master_delay_feedback = fmt_round,
+  master_delay_tone = fmt_round,
+  master_reverb_size = fmt_round,
+  master_reverb_damp = fmt_round,
+  master_lofi_bits = fmt_round,
+  master_lofi_rate = fmt_round,
   slice_rate = fmt_2dp,
   pv_dispersion = fmt_2dp,
   chop_steps = fmt_chop_steps,
@@ -99,6 +142,8 @@ function ParamValues.new(opts)
     param_value_or = opts.param_value_or,
     get_grid_ui = opts.get_grid_ui,
     get_alt = opts.get_alt,
+    get_scene_edit = opts.get_scene_edit,
+    get_scene_value = opts.get_scene_value,
     get_select_sample = opts.get_select_sample,
     get_default_trig_length = opts.get_default_trig_length,
     set_default_trig_length = opts.set_default_trig_length,
@@ -123,8 +168,17 @@ function ParamValues:option_value(param_id)
 end
 
 function ParamValues:item_locked(param_item)
+  if param_item == nil then
+    return false
+  end
+  -- A held A/B scene anchor shows this param's scene lock with the same
+  -- visuals as a held step's p-lock (PRD §6.6).
+  if self.get_scene_edit ~= nil and self.get_scene_edit() ~= nil
+    and self.get_scene_value ~= nil and self.get_scene_value(param_item.id) ~= nil then
+    return true
+  end
   local grid_ui = self.get_grid_ui()
-  if grid_ui == nil or param_item == nil or param_item.lockable ~= true then
+  if grid_ui == nil or param_item.lockable ~= true then
     return false
   end
   return grid_ui:held_param_lock(param_item.lock_id or param_item.id) ~= nil
@@ -215,6 +269,14 @@ function ParamValues:item_raw_value(param_item)
       local locked = grid_ui:held_param_lock(lock_id)
       if locked ~= nil then
         return locked
+      end
+    end
+    -- Held A/B anchor: show the scene's locked value for this param (the
+    -- value an encoder edit would adjust), like a held step's lock.
+    if self.get_scene_edit ~= nil and self.get_scene_edit() ~= nil and self.get_scene_value ~= nil then
+      local scene_value = self.get_scene_value(param_item.id)
+      if scene_value ~= nil then
+        return scene_value
       end
     end
     if self.active_step_lock_bases[lock_id] ~= nil then

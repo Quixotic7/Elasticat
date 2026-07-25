@@ -11,10 +11,14 @@ local Registry = {}
 
 local machines = {
   [1] = include("lib/filter_modes/classic"),
-  [2] = include("lib/filter_modes/morphing")
+  [2] = include("lib/filter_modes/morphing"),
+  [3] = include("lib/filter_modes/classic_stereo"),
+  [4] = include("lib/filter_modes/morphing_stereo"),
+  [5] = include("lib/filter_modes/classic_ms"),
+  [6] = include("lib/filter_modes/morphing_ms")
 }
 
-local names = {"CLASSIC", "MORPHING"}
+local names = {"CLASSIC", "MORPHING", "CLASSIC ST", "MORPH ST", "CLASSIC MS", "MORPH MS"}
 
 function Registry.get(machine_id)
   return machines[math.floor((tonumber(machine_id) or 1) + 0.5)] or machines[1]

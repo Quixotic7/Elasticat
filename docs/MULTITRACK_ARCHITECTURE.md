@@ -5,6 +5,30 @@ player into an 8-track instrument, and the phased roadmap for building it. It
 complements `docs/ARCHITECTURE.md`, which covers code organization; this document
 covers the feature/DSP design.
 
+**Read `docs/PRD.md` first** — it owns the product decisions this design serves
+(signal chain, filter/FX machine catalogs, parameter conventions, CPU budget),
+and it defines the **1-track MVP that must ship before Phase 1 begins**. Where
+this document and the PRD disagree, the PRD wins; flag the discrepancy rather
+than silently picking one.
+
+*Status note (July 2026)*: much of Phase 2's substance already exists in
+1-track form — the amp envelope (AHR/ADSR, Elektron time mapping), the
+post-mix filter stage with Classic + Morphing machines and an independent
+filter envelope, and pan/vol at the filter output. Multitrack Phase 2 is
+therefore mostly "make the existing stages per-track," plus the remaining
+filter machines and insert-FX slots from the PRD catalogs.
+
+Additional pull-forwards into the 1-track MVP (PRD §8): **Phase 4 partially**
+(the A/B crossfader/scene-morph ships single-track first — note the row-5
+layout now hosts octave keys at x1/x2 and the pattern key at x8, so the scene
+row placement needs re-resolution, see PRD §6.6) and **Phase 7 substantially**
+(the Projects system — 16-pattern project files, temp work project, memorize/
+recall — ships for 1 track; multitrack Phase 7 becomes "extend the project
+format per-track"). The NEI/!NEI trig conditions (PRD §6.5) are stubbed
+always-true until the neighbor machine lands in Phase 5. Patterns (PRD §6)
+also mean Phase 1's "track-aware sequencer" generalizes a *pattern-and-track*
+aware store, not just per-track state.
+
 ## Design decisions
 
 Three foundational choices, confirmed before this design was written:
@@ -86,10 +110,13 @@ Machine synth → Filter synth → Amp envelope → Insert FX synth → Master b
 
 - **Machine**: the existing tape/tempo_varispeed/chopped/granular/random_ola/
   pitch_corrected readers, unchanged — or, for tracks 2-8, `neighbor` (see below).
-- **Filter**: analog LP, morphing LP/BP/HP, or comb. One SynthDef per filter type,
-  swapped via the crossfaded synth-replacement pattern already used for warp-mode
-  switching ("Added immediate crossfaded mode switching," per `CHANGELOG.md`) — reuse
-  that mechanism rather than inventing a new one.
+- **Filter**: the filter-machine catalog in PRD §4.2 (Classic, Morphing, their
+  Stereo and Mid/Side variants, Comb, Ladder, Formant). One SynthDef per machine
+  (stereo/MS variants parameterize the mono DSP), swapped via the crossfaded
+  synth-replacement pattern already used for warp-mode switching — reuse that
+  mechanism rather than inventing a new one. Every filter machine carries the
+  independent filter envelope (AHR default / ADSR, mode is a setting); the
+  machine choice itself is a setting, its params are p-lockable.
 - **Amp envelope**: standard attack/hold/release gate, retriggered per step (this
   already exists per-track in spirit via the current slice envelope params; it becomes
   a first-class per-track stage).
@@ -207,8 +234,9 @@ The filter types, envelope, and one insert FX type first, more FX types after.
 Grid/UI to select and edit them, reusing the Phase 0 UI modules.
 
 **Acceptance criteria:**
-- All three filter types (analog LP, morphing LP/BP/HP, comb) exist as separate
-  SynthDefs and switch via the existing crossfaded-replacement pattern.
+- The PRD §4.2 filter machines through at least Comb exist as SynthDefs and
+  switch via the existing crossfaded-replacement pattern (Classic + Morphing
+  are already banked from the 1-track MVP).
 - Amp envelope (attack/hold/release) is audible and adjustable per track.
 - At least one insert FX type is implemented and switchable the same way as filters.
 - FILTER and (per-track) AMP/FX pages let you select and edit all of the above per

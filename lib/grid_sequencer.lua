@@ -2,7 +2,35 @@ local GridSequencer = {}
 GridSequencer.__index = GridSequencer
 
 local Step = include("lib/sequencer/step")
+local TrigConditions = include("lib/sequencer/trig_conditions")  -- PRD §6.5
 local INTRO_CAT_HEX = include("lib/intro_cat_frames")  -- 55 frames of 16x8 grid levels
+
+-- Trig chance/condition/ratchet are p-lockable per step, but they steer the
+-- SEQUENCER, not the engine. They live in a step's param_locks (so the grid
+-- p-lock UI works for free) yet must never be pushed to the engine or carried
+-- forward as note-length holds -- they are read directly per step instead.
+local SEQUENCER_DOMAIN_LOCKS = {
+  trig_chance = true,
+  trig_condition = true,
+  trig_ratchet = true
+}
+
+-- Region/range locks are RESOLVER inputs, never applied params. The three-layer
+-- model (Track / Step-p-lock / Actual): the Track start/end/range params belong
+-- to the user and stay live-editable at all times; a step's region lock rides
+-- param_lock_holds into region_layers/apply_active_range and shadows the Track
+-- values only in the Actual layer while its window is active. These ids are
+-- therefore excluded from the effective_param_locks table handed to
+-- apply_step_param_locks -- otherwise they'd be stashed in the
+-- active_step_lock_bases bookkeeping, freezing the Track params' display and
+-- eating encoder edits during playback (every loop-machine trig locks
+-- loop_start, so the Track region was un-editable whenever trigs played).
+local REGION_LOCKS = {
+  loop_start = true,
+  loop_end = true,
+  range_start = true,
+  range_end = true
+}
 local INTRO_CAT_FPS = 10  -- must match the screen logo fps so the two stay in sync
 
 -- Decode the hex frame table into numeric levels once (INTRO_CAT[frame][row][col]).
@@ -28,6 +56,11 @@ local PAGE_MODE_LABELS = {
 }
 local RATES = {0.125, 0.25, 0.5, 1, 2, 4, 8, 16}
 local STEP_HOLD_SECONDS = 0.25
+-- Pattern-load key (8,5) tap-vs-hold threshold: a press+release shorter than
+-- this with no slot picked latches the overlay open; anything longer (or a
+-- slot pick) is the old momentary-hold behaviour. Mirrors STEP_HOLD_SECONDS'
+-- role for the step row.
+local PATTERN_TAP_SECONDS = 0.25
 local MACHINE_LOOP = 1
 local MACHINE_LOOP_TRIG = 2
 local MACHINE_GRID_SLICE = 3
@@ -74,6 +107,20 @@ local function table_count(t)
     end
   end
   return count
+end
+
+-- Recursive value copy for pattern snapshots: a captured pattern must not alias
+-- the live steps (later edits would mutate the stored snapshot, and vice versa).
+-- Only plain data tables (steps, param_locks, slices) pass through here.
+local function deep_copy(value)
+  if type(value) ~= "table" then
+    return value
+  end
+  local out = {}
+  for k, v in pairs(value) do
+    out[k] = deep_copy(v)
+  end
+  return out
 end
 
 local function rate_label(rate)
@@ -130,12 +177,34 @@ function GridSequencer.new(options)
   self.current_region_end = nil
   self.current_range_start = nil
   self.current_range_end = nil
+  -- Trig conditions / Fill (PRD §6.5). pattern_pass counts sequence loops (for
+  -- A:B and 1st); last_cond_result feeds PRE/!PRE; fill_* drive FILL/!FILL.
+  self.pattern_pass = 1
+  self.last_cond_result = nil
+  self.fill_active = false
+  self.fill_latched = false
+  self.fill_held = false
+  self.ratchet_token = 0
+  -- Pattern system (PRD §6): global_pos tracks the project-wide pattern cycle
+  -- (which may differ from the per-track length under polymeter); pattern_mode
+  -- is the grid pattern-load overlay. pattern_latched/pattern_press_time/
+  -- pattern_selection_made implement the tap-latches / hold-is-momentary
+  -- distinction on the (8,5) key -- see key_pattern()/key_pattern_mode().
+  self.global_pos = 1
+  self.pattern_mode = false
+  self.pattern_latched = false
+  self.pattern_press_time = nil
+  self.pattern_selection_made = false
+  self.crossfade = 0  -- A/B crossfader position (0 = A, 1 = B), PRD §6.6
+  self.scene_glide_target = nil  -- fader-key glide target (0..1) while held
+  self.scene_glide_clock = nil
   self.g.key = function(x, y, z) self:key(x, y, z) end
   return self
 end
 
 function GridSequencer:cleanup()
   self.playing = false
+  self:stop_scene_glide()
   if self.seq_metro ~= nil then
     self.seq_metro:stop()
     self.seq_metro = nil
@@ -178,6 +247,19 @@ end
 
 function GridSequencer:pattern_pages()
   return util.clamp(math.ceil(self:pattern_steps() / 16), 1, 16)
+end
+
+-- Global (project-wide) pattern length: the cycle on which sequential pattern
+-- switches engage and temp-jumps return (PRD §6.4). Falls back to the per-track
+-- length when no distinct global length is configured.
+function GridSequencer:global_length()
+  if self.options.get_global_length ~= nil then
+    local raw = self.options.get_global_length()
+    if raw ~= nil and raw >= 1 then
+      return util.clamp(math.floor(raw + 0.5), 1, 256)
+    end
+  end
+  return self:pattern_steps()
 end
 
 function GridSequencer:loop_division()
@@ -291,6 +373,53 @@ function GridSequencer:pattern_has_trigs()
   return false
 end
 
+-- Snapshot the sequencer's per-pattern state to a plain, deep-copied table
+-- (PRD §6.1). Track params (pattern_steps, machine, filter, ...) live in the
+-- norns params system and are captured by the coordinator; this covers only the
+-- state the sequencer itself owns: the step records, the pattern rate, and which
+-- pages loop. Used by the pattern store and, through it, project save/load (§7).
+function GridSequencer:serialize()
+  local steps = {}
+  for index, record in pairs(self.steps) do
+    if Step.has_content(record) then
+      steps[index] = deep_copy(record)
+    end
+  end
+  local page_loop = {}
+  for page, on in pairs(self.page_loop) do
+    if on then
+      page_loop[page] = true
+    end
+  end
+  return {
+    steps = steps,
+    rate_index = self.rate_index,
+    page_loop = page_loop
+  }
+end
+
+-- Restore a snapshot produced by serialize(). Missing fields fall back to a
+-- blank/default pattern, so an empty table yields an empty sequence.
+function GridSequencer:deserialize(snapshot)
+  snapshot = snapshot or {}
+  self.steps = {}
+  for index, record in pairs(snapshot.steps or {}) do
+    self.steps[index] = deep_copy(record)
+  end
+  self.rate_index = snapshot.rate_index or 4
+  self.page_loop = {}
+  if snapshot.page_loop ~= nil then
+    for page, on in pairs(snapshot.page_loop) do
+      if on then
+        self.page_loop[page] = true
+      end
+    end
+  end
+  if next(self.page_loop) == nil then
+    self.page_loop[1] = true
+  end
+end
+
 function GridSequencer:held_step_index()
   local step = self:first_held_step()
   if step == nil then
@@ -400,9 +529,11 @@ function GridSequencer:clear_step(page, step)
 end
 
 -- Loop-only single-key tap cycling: tapping the same loop key repeatedly while
--- holding a step cycles start-only -> start+end -> start-only. Holding 2+ loop
--- keys at once (held_count > 1) always locks start+end from their min/max, and
--- resets the cycle so the next single-key tap starts fresh.
+-- holding a step cycles start+end -> start-only -> start+end. The FIRST tap of a
+-- key locks BOTH start and end (a tight one-key window is the common case);
+-- tapping the same key again drops the end lock so it follows the track's end.
+-- Holding 2+ loop keys at once (held_count > 1) always locks start+end from
+-- their min/max, and resets the cycle so the next single-key tap starts fresh.
 function GridSequencer:loop_tap_start_only(held_count)
   if held_count > 1 then
     self.loop_tap_key = nil
@@ -411,17 +542,17 @@ function GridSequencer:loop_tap_start_only(held_count)
   end
 
   local current_key = sorted_held_keys(self.loop_holds)[1]
-  if self.loop_tap_key == current_key and self.loop_tap_kind == "start_only" then
-    self.loop_tap_kind = "start_end"
-    return false
-  elseif self.loop_tap_key == current_key and self.loop_tap_kind == "start_end" then
+  if self.loop_tap_key == current_key and self.loop_tap_kind == "start_end" then
     self.loop_tap_kind = "start_only"
     return true
+  elseif self.loop_tap_key == current_key and self.loop_tap_kind == "start_only" then
+    self.loop_tap_kind = "start_end"
+    return false
   end
 
   self.loop_tap_key = current_key
-  self.loop_tap_kind = "start_only"
-  return true
+  self.loop_tap_kind = "start_end"
+  return false
 end
 
 function GridSequencer:lock_held_steps(start_point, end_point, held_count)
@@ -563,8 +694,10 @@ function GridSequencer:set_step_pitch(index, pitch)
   record.param_locks.pitch = pitch
   -- Grid-keyboard pitch entry (rows 5-7), unlike the encoder path, wrote the
   -- lock but never pushed it live -- a held step's stopped preview or Live Step
-  -- Trig hold kept sounding the old pitch until release/re-press.
-  self:refresh_held_step()
+  -- Trig hold kept sounding the old pitch until release/re-press. retrigger =
+  -- true re-auditions the stopped preview at the new pitch (fresh attack);
+  -- ignored during a live-held step so playback keeps its own triggering.
+  self:refresh_held_step(true)
 end
 
 function GridSequencer:apply_step_pitch(record)
@@ -610,12 +743,15 @@ end
 
 -- Re-apply the currently-sounding held step after a lock edit, whichever form
 -- that hold takes: the stopped step preview, or a live-held step (Live Step
--- Trig) during playback.
-function GridSequencer:refresh_held_step()
+-- Trig) during playback. `retrigger` (loop/pitch-key presses while holding a
+-- step) asks the STOPPED preview to re-audition from the top with a fresh amp
+-- attack; it is deliberately ignored during playback, where the sequencer owns
+-- envelope triggering and a live edit must not inject a spurious attack.
+function GridSequencer:refresh_held_step(retrigger)
   if self.live_step_hold then
     self:refresh_live_step()
   else
-    self:refresh_preview_region()
+    self:refresh_preview_region(retrigger)
   end
 end
 
@@ -651,8 +787,12 @@ function GridSequencer:refresh_live_step()
 end
 
 -- Re-apply the currently-previewed step's range, region and pitch so lock edits
--- take effect live during a stopped step preview.
-function GridSequencer:refresh_preview_region()
+-- take effect live during a stopped step preview. `retrigger` (a loop/pitch-key
+-- press while holding the step) additionally re-auditions from the region start
+-- with a fresh amp attack, so the change is heard immediately without releasing
+-- and re-pressing the step. Plain lock/encoder edits pass retrigger = false and
+-- just update the still-sounding preview in place (no machine-gun re-attacks).
+function GridSequencer:refresh_preview_region(retrigger)
   if self.playing or not self.preview_active then
     return
   end
@@ -667,8 +807,13 @@ function GridSequencer:refresh_preview_region()
   local locks = record.param_locks or {}
   self:push_active_range(locks.range_start, locks.range_end)
   local start_point, end_point = self:locked_region(record)
-  self:set_region(start_point, end_point)
   self:apply_step_pitch(record)
+  if retrigger and not is_slice_machine(self:machine()) and self.options.note_on ~= nil then
+    self:set_region_with_phase(start_point, end_point, 0)
+    self.options.note_on(0)
+  else
+    self:set_region(start_point, end_point)
+  end
 end
 
 function GridSequencer:held_param_lock(param_id)
@@ -767,6 +912,376 @@ function GridSequencer:note_seconds(record)
   return math.max(0.01, ((record ~= nil and record.length) or self:default_length()) * self:step_seconds())
 end
 
+-- Effective value of a sequencer-domain field for a step: its own p-lock if
+-- present, else the track-level param (read through the coordinator getter).
+function GridSequencer:step_field(record, lock_id, getter, fallback)
+  if record ~= nil and record.param_locks ~= nil and record.param_locks[lock_id] ~= nil then
+    return record.param_locks[lock_id]
+  end
+  if getter ~= nil then
+    local value = getter()
+    if value ~= nil then
+      return value
+    end
+  end
+  return fallback
+end
+
+-- Ratchet count for a step (1-8). 1 = a single hit (no ratchet).
+function GridSequencer:effective_ratchet(record)
+  local raw = self:step_field(record, "trig_ratchet", self.options.get_trig_ratchet, 1)
+  return util.clamp(math.floor((tonumber(raw) or 1) + 0.5), 1, 8)
+end
+
+-- Swing percentage (50 = straight, 75 = maximum). Applied as a long/short pair
+-- across consecutive steps in step_duration.
+function GridSequencer:swing_amount()
+  local raw = self.options.get_swing ~= nil and self.options.get_swing() or 50
+  return util.clamp(tonumber(raw) or 50, 50, 75)
+end
+
+-- Duration the given step occupies before the next advance. Straight = one step;
+-- swing lengthens odd steps and shortens the following even step by the same
+-- amount, so each odd/even pair still spans two straight steps.
+function GridSequencer:step_duration(index)
+  local base = self:step_seconds()
+  local swing = self:swing_amount()
+  if swing <= 50 then
+    return base
+  end
+  local ratio = swing / 100
+  if index % 2 == 1 then
+    return base * 2 * ratio
+  end
+  return base * 2 * (1 - ratio)
+end
+
+-- The kind (and full definition) of a step's trig condition. Reads the step's
+-- p-lock or the track param; both index into the shared TrigConditions table so
+-- the label shown and the logic run can never diverge.
+function GridSequencer:condition_definition(record)
+  local raw = self:step_field(record, "trig_condition", self.options.get_trig_condition, 1)
+  local idx = util.clamp(math.floor((tonumber(raw) or 1) + 0.5), 1, #TrigConditions)
+  return TrigConditions[idx]
+end
+
+-- Whether a step's CONDITION passes this pass (independent of the chance roll).
+-- Pure read -- no side effects -- so it is safe to call for UI/preview too.
+function GridSequencer:condition_result(record)
+  local def = self:condition_definition(record)
+  local kind = def ~= nil and def.kind or "none"
+  if kind == "none" then
+    return true
+  elseif kind == "ab" then
+    return ((self.pattern_pass - 1) % def.b) + 1 == def.a
+  elseif kind == "fill" then
+    return self.fill_active == true
+  elseif kind == "nfill" then
+    return self.fill_active ~= true
+  elseif kind == "pre" then
+    return self.last_cond_result == true
+  elseif kind == "npre" then
+    return self.last_cond_result ~= true
+  elseif kind == "nei" or kind == "nnei" then
+    -- Neighbor-track conditions: no neighbor exists in the 1-track MVP, so both
+    -- evaluate always-true until the neighbor machine lands (PRD §6.5).
+    return true
+  elseif kind == "first" then
+    return self.pattern_pass == 1
+  end
+  return true
+end
+
+-- Decide whether an active step fires this pass. Both independent p-lockable
+-- fields must pass: the condition AND the chance roll (PRD §6.5). Records the
+-- outcome for a following PRE/!PRE trig, but only for steps that themselves
+-- carry a condition, so a plain trig never breaks the conditional chain.
+function GridSequencer:evaluate_trig(record)
+  local def = self:condition_definition(record)
+  local kind = def ~= nil and def.kind or "none"
+  local fired = self:condition_result(record)
+  if fired then
+    local chance = util.clamp(self:step_field(record, "trig_chance", self.options.get_trig_chance, 100), 0, 100)
+    if chance < 100 then
+      fired = (math.random() * 100) < chance
+    end
+  end
+  if kind ~= "none" then
+    self.last_cond_result = fired
+  end
+  return fired
+end
+
+-- Fire a step's ratchets: the extra sub-step hits after the first. Scheduled on
+-- a tempo clock at even sub-divisions of the step; a token cancels stale runs
+-- when the next step (or a stop) supersedes them.
+function GridSequencer:schedule_ratchets(record, count)
+  if clock == nil or clock.run == nil then
+    return
+  end
+  local machine = self:machine()
+  local interval = self:step_seconds() / count
+  self.ratchet_token = (self.ratchet_token or 0) + 1
+  local token = self.ratchet_token
+  clock.run(function()
+    for _ = 2, count do
+      clock.sleep(interval)
+      if not self.playing or self.ratchet_token ~= token then
+        return
+      end
+      self:retrigger_ratchet(record, machine)
+    end
+  end)
+end
+
+-- One ratchet sub-hit: re-attack the note and re-fire the machine's trigger, the
+-- same dispatch a fresh step would do (minus the region/anchor bookkeeping, which
+-- the sub-hits share with the parent step).
+function GridSequencer:retrigger_ratchet(record, machine)
+  if machine == MACHINE_LOOP or machine == MACHINE_LOOP_TRIG then
+    if self.options.note_on ~= nil and not self:is_ghost(record) then
+      self.options.note_on(self:note_seconds(record))
+    end
+    if machine == MACHINE_LOOP_TRIG then
+      self:trigger_region(record)
+    else
+      local start_point, end_point = self:resolve_active_region()
+      self:set_region_with_phase(start_point, end_point, 0)
+    end
+  elseif is_slice_machine(machine) then
+    self:trigger_step_slices(record)
+  end
+end
+
+-- Fill key (grid 16,6). Plain press = momentary fill while held; FN+press
+-- toggles a latched fill. Active fill = latched OR currently held (PRD §6.5).
+function GridSequencer:key_fill(z)
+  if z == 1 then
+    if self.fn_down then
+      self.fill_latched = not self.fill_latched
+    else
+      self.fill_held = true
+    end
+  else
+    self.fill_held = false
+  end
+  self.fill_active = self.fill_latched or self.fill_held == true
+  self:message(self.fill_active and "Fill On" or "Fill Off")
+end
+
+-- A/B scene crossfader on row 5, cols 9-16 (PRD §6.6):
+--   col 9  = Scene A anchor: HOLD it and turn an encoder to p-lock that param
+--            into scene A (edits write the scene only, like a held step's
+--            p-lock; the live sound doesn't change until the fader moves).
+--            Never moves the fader. FN+anchor stores the WHOLE current state.
+--   cols 10-15 = fader glide keys, targets spread 0..1 across the six keys
+--            (col 10 = full A, col 15 = full B). Holding a key EASES the
+--            crossfade toward its target (exponential approach, ~0.3s to
+--            land) instead of jumping: tap to nudge a little, hold to land.
+--            Release freezes wherever it is.
+--   col 16 = Scene B anchor, same as A.
+-- Row-5 crossfader layout (centered, PRD §6.6): col 10 = Scene A anchor,
+-- cols 11-15 = fader glide keys spread 0..1 (11=0/full A, 13=0.5/center,
+-- 15=1/full B), col 16 = Scene B anchor. Col 9 is unused.
+local SCENE_A_COL, SCENE_B_COL = 10, 16
+local FADER_MIN_COL, FADER_MAX_COL = 11, 15
+local function fader_target(col)
+  return (col - FADER_MIN_COL) / (FADER_MAX_COL - FADER_MIN_COL)
+end
+
+function GridSequencer:key_scene(x, z)
+  local scene = (x == SCENE_A_COL and 1) or (x == SCENE_B_COL and 2) or nil
+  if scene ~= nil then
+    if z == 1 then
+      if self.fn_down then
+        if self.options.capture_scene ~= nil then
+          self.options.capture_scene(scene)
+        end
+        self:message(scene == 1 and "Scene A stored" or "Scene B stored")
+      else
+        -- Anchor press: arm the scene-lock hold. The fader never moves here.
+        if self.options.set_scene_edit ~= nil then
+          self.options.set_scene_edit(scene)
+        end
+        self:message(scene == 1 and "Scene A hold" or "Scene B hold")
+      end
+    else
+      if self.options.set_scene_edit ~= nil then
+        self.options.set_scene_edit(nil)
+      end
+    end
+    return
+  end
+
+  if x < FADER_MIN_COL or x > FADER_MAX_COL then
+    return
+  end
+  if z == 1 then
+    self.scene_glide_target = fader_target(x)
+    -- Force-apply the crossfade at the CURRENT position now, so a param just
+    -- p-locked into a scene snaps into the sound the instant a fader key is
+    -- touched -- even before (or without) the position actually moving.
+    if self.options.set_crossfade ~= nil and self.options.get_crossfade ~= nil then
+      self.options.set_crossfade(self.options.get_crossfade() or 0)
+    end
+    self:start_scene_glide()
+  else
+    -- Released: retarget to another still-held fader key, else stop.
+    local held_target = nil
+    for col = FADER_MIN_COL, FADER_MAX_COL do
+      if self.pressed[col .. ":5"] then
+        held_target = fader_target(col)
+      end
+    end
+    if held_target ~= nil then
+      self.scene_glide_target = held_target
+    else
+      self:stop_scene_glide()
+    end
+  end
+end
+
+-- Ease the crossfade toward scene_glide_target while a fader key is held:
+-- value += (target - value) * rate*dt (exponential approach -- fast over big
+-- distances, easing in as it lands; ~0.33s to fully close). Runs on a clock at
+-- ~30Hz; each step goes through options.set_crossfade, i.e. the `crossfade`
+-- param, so the MASTER-page encoder and LEDs stay in sync.
+local SCENE_GLIDE_HZ = 30
+local SCENE_GLIDE_RATE = 5  -- per-second approach rate (time constant ~0.2s)
+
+-- One eased step of the crossfade toward scene_glide_target. Shared by the
+-- immediate step on a fader-key press (so even a fast TAP moves -- otherwise
+-- the release could beat the 33ms glide tick and nothing would happen) and the
+-- while-held glide clock below.
+function GridSequencer:step_scene_glide()
+  local target = self.scene_glide_target
+  if target == nil or self.options.set_crossfade == nil or self.options.get_crossfade == nil then
+    return
+  end
+  local current = self.options.get_crossfade() or 0
+  local factor = math.min(1, SCENE_GLIDE_RATE / SCENE_GLIDE_HZ)
+  local next_value = current + (target - current) * factor
+  if math.abs(target - next_value) < 0.004 then
+    next_value = target
+  end
+  if next_value ~= current then
+    self.options.set_crossfade(next_value)
+    self:request_redraw()
+  end
+end
+
+function GridSequencer:start_scene_glide()
+  self:step_scene_glide()  -- move immediately so a tap registers
+  if self.scene_glide_clock ~= nil or clock == nil or clock.run == nil then
+    return
+  end
+  self.scene_glide_clock = clock.run(function()
+    while self.scene_glide_target ~= nil do
+      clock.sleep(1 / SCENE_GLIDE_HZ)
+      if self.scene_glide_target == nil then
+        break
+      end
+      self:step_scene_glide()
+    end
+    self.scene_glide_clock = nil
+  end)
+end
+
+function GridSequencer:stop_scene_glide()
+  self.scene_glide_target = nil
+  if self.scene_glide_clock ~= nil and clock ~= nil and clock.cancel ~= nil then
+    clock.cancel(self.scene_glide_clock)
+    self.scene_glide_clock = nil
+  end
+end
+
+-- Pattern-load key (grid 8,5). A quick TAP (press+release inside
+-- PATTERN_TAP_SECONDS with no slot picked) latches the overlay open -- it
+-- stays open after release, and a second tap closes it. A HOLD (press held
+-- past the threshold) is momentary, exactly like the old behaviour: the
+-- overlay closes as soon as the key is released. Picking a slot or renaming
+-- always closes the overlay either way (see key_pattern_mode), which sets
+-- pattern_selection_made so the matching release here doesn't also re-latch.
+function GridSequencer:key_pattern(z)
+  if z == 1 then
+    if self.pattern_latched then
+      -- Already latched open: this press is a "close" tap.
+      self.pattern_latched = false
+      self.pattern_mode = false
+      self.pattern_press_time = nil
+      self:message("Pattern")
+      return
+    end
+    self.pattern_press_time = util.time()
+    self.pattern_selection_made = false
+    self.pattern_mode = true
+    self:message("Pattern")
+    return
+  end
+
+  -- Key-up. A nil press_time means this release has no matching press we
+  -- started here (e.g. FN+(8,5) routed the press to the quantize-mode pop-up
+  -- instead -- see the (8,5) special-case in key()) -- leave any existing
+  -- overlay state untouched.
+  local press_time = self.pattern_press_time
+  if press_time == nil then
+    return
+  end
+  self.pattern_press_time = nil
+  if self.pattern_selection_made then
+    self.pattern_selection_made = false
+    return
+  end
+  local was_quick_tap = (util.time() - press_time) < PATTERN_TAP_SECONDS
+  if was_quick_tap and self.pattern_mode then
+    self.pattern_latched = true
+  else
+    self.pattern_mode = false
+  end
+end
+
+-- Handle a key while the pattern-load overlay is open. Returns true if the key
+-- was consumed by the overlay. Category keys (row 1) are NOT consumed -- they
+-- close the overlay and then act normally.
+function GridSequencer:key_pattern_mode(x, y, z)
+  if y == 1 then
+    self.pattern_mode = false
+    self.pattern_latched = false
+    self.pattern_selection_made = true
+    return false
+  end
+  if z ~= 1 then
+    return true  -- swallow releases of inert keys
+  end
+  if y == 8 then
+    -- Bottom row is the 16 pattern slots; a press loads and exits.
+    if self.options.load_pattern ~= nil then
+      self.options.load_pattern(x)
+    end
+    self.pattern_mode = false
+    self.pattern_latched = false
+    self.pattern_selection_made = true
+    return true
+  end
+  if x == 14 and y == 7 then
+    -- Right arrow (14,7 -- matches lib/input/router.lua's binding) renames the
+    -- current pattern (opens the text dialog, §7.3). Was wrongly on (13,7),
+    -- the Down arrow. Exit the overlay first: the modal dialog takes over the
+    -- grid, so the pattern key's release would otherwise never reach us to
+    -- close it. Works the same via a hold or a latched tap.
+    self.pattern_mode = false
+    self.pattern_latched = false
+    self.pattern_selection_made = true
+    if self.options.rename_pattern ~= nil then
+      self.options.rename_pattern()
+    else
+      self:message("Rename n/a")
+    end
+    return true
+  end
+  return true  -- pitch keys, arrows, octave: inert while the overlay is open
+end
+
 function GridSequencer:clear_param_lock_holds()
   self.param_lock_holds = {}
 end
@@ -790,20 +1305,26 @@ function GridSequencer:effective_param_locks(record)
   local locks = {}
   local has_locks = false
   for lock_id, hold in pairs(self.param_lock_holds) do
-    locks[lock_id] = hold.value
-    has_locks = true
+    if not REGION_LOCKS[lock_id] then
+      locks[lock_id] = hold.value
+      has_locks = true
+    end
   end
 
   if record ~= nil and record.param_locks ~= nil then
     local length_seconds = self:note_seconds(record)
     for lock_id, value in pairs(record.param_locks) do
-      locks[lock_id] = value
-      has_locks = true
-      if lock_id ~= "length" and lock_id ~= "velocity" then
-        self.param_lock_holds[lock_id] = {
-          value = value,
-          expires_at = now + length_seconds
-        }
+      if not SEQUENCER_DOMAIN_LOCKS[lock_id] then
+        if not REGION_LOCKS[lock_id] then
+          locks[lock_id] = value
+          has_locks = true
+        end
+        if lock_id ~= "length" and lock_id ~= "velocity" then
+          self.param_lock_holds[lock_id] = {
+            value = value,
+            expires_at = now + length_seconds
+          }
+        end
       end
     end
   end
@@ -936,6 +1457,20 @@ function GridSequencer:apply_active_range()
   self:push_active_range(range_start, range_end)
 end
 
+-- A Track-layer region/range param was edited while the sequencer is running:
+-- re-resolve and re-push the Actual region through the layered resolver, so the
+-- edit is heard immediately when no step lock is shadowing it, and correctly
+-- deferred (until the lock's window elapses) when one is. The cache is
+-- invalidated first because the engine mapping can change (a range edit
+-- re-folds the same track-space points to different engine points) even when
+-- the resolved region is numerically identical.
+function GridSequencer:refresh_track_region()
+  self.current_region_start = nil
+  self:apply_active_range()
+  local start_point, end_point = self:resolve_active_region()
+  self:set_region(start_point, end_point)
+end
+
 -- Best estimate of the current absolute playback position (0-128) within the
 -- region currently loaded in the engine, used to preserve position across a
 -- region change (Boomerang playhead return, sequencer revert continuity).
@@ -1036,6 +1571,9 @@ function GridSequencer:enter_step(reset_sequence)
     self:clear_param_lock_holds()
     self.seq_anchor = nil
     self.keys_anchor = nil
+    -- A fresh start is pass 1 with no prior conditional result (PRD §6.5).
+    self.pattern_pass = 1
+    self.last_cond_result = nil
   end
 
   -- Live Step Trig: a live-held step owns playback -- sequenced steps advance
@@ -1044,19 +1582,29 @@ function GridSequencer:enter_step(reset_sequence)
     return
   end
 
+  -- Trig conditions: an active step (a trig, or slices on a slice machine) only
+  -- FIRES if its chance roll and its condition both pass. A step that doesn't
+  -- fire behaves exactly like an empty step -- no locks, pitch, note or region
+  -- jump -- so lock_record is nil'd out through the firing-only paths below.
+  local active = record ~= nil and (
+    (is_slice_machine(machine) and table_count(record.slices) > 0)
+    or record.trig == true)
+  local fires = active and self:evaluate_trig(record)
+  local lock_record = fires and record or nil
+
   -- Monophonic: a fresh non-ghost trigger ends the previous note -- clear the
   -- carried holds so unlocked params revert to base before this step's locks
   -- apply. Without this, a step's lock outlives its note-length window when the
   -- length is >= 1 and the next trigger fails to switch it (e.g. sample slot).
   -- Ghost triggers, and Poly mode, carry the previous state forward instead.
-  if not reset_sequence and record ~= nil and record.trig == true
+  if not reset_sequence and fires
     and self:trig_polyphony() == 1 and not self:is_ghost(record) then
     self:clear_param_lock_holds()
   end
   if self.options.apply_step_param_locks ~= nil then
-    self.options.apply_step_param_locks(self:effective_param_locks(record))
+    self.options.apply_step_param_locks(self:effective_param_locks(lock_record))
   end
-  self:apply_step_pitch(record)
+  self:apply_step_pitch(lock_record)
   -- Push the Step Range before any region set, so the region maps through the
   -- correct (Actual) range in the same tick.
   self:apply_active_range()
@@ -1065,7 +1613,7 @@ function GridSequencer:enter_step(reset_sequence)
   -- untouched -- the env_reset semantics). Empty steps send nothing, so the
   -- envelope decays to silence between triggers.
   if (machine == MACHINE_LOOP or machine == MACHINE_LOOP_TRIG)
-    and record ~= nil and record.trig == true and not self:is_ghost(record)
+    and fires and not self:is_ghost(record)
     and self.options.note_on ~= nil then
     self.options.note_on(self:note_seconds(record))
   end
@@ -1075,12 +1623,12 @@ function GridSequencer:enter_step(reset_sequence)
     -- active start (fresh trigger). Every other step re-resolves the layered
     -- region and applies it *without* resetting phase, so an expired step lock
     -- reverts to the track region while the playhead keeps advancing (task #21).
-    local record_locks_region = record ~= nil and record.param_locks ~= nil
+    local record_locks_region = fires and record.param_locks ~= nil
       and (record.param_locks.loop_start ~= nil or record.param_locks.loop_end ~= nil)
     if reset_sequence then
       local start_point, end_point = self:resolve_active_region()
       self:set_region_with_phase(start_point, end_point, 0)
-    elseif record ~= nil and record.trig and record_locks_region then
+    elseif record_locks_region then
       -- A step that locks start/end repositions the playhead. Trig Jump on = warp
       -- to the region start; off = only reposition if the playhead is now outside
       -- the new region, otherwise keep playing (the wall/street model).
@@ -1121,15 +1669,23 @@ function GridSequencer:enter_step(reset_sequence)
       end
     end
   elseif machine == MACHINE_LOOP_TRIG then
-    if record ~= nil and record.trig then
+    if fires then
       self:trigger_region(record)
     else
       local start_point, end_point = self:base_region()
       self:set_region(start_point, end_point)
     end
   elseif is_slice_machine(machine) then
-    if record ~= nil and table_count(record.slices) > 0 then
+    if fires then
       self:trigger_step_slices(record)
+    end
+  end
+
+  -- Ratchets: schedule the extra sub-step hits after the first (PRD §6.5).
+  if fires then
+    local ratchet = self:effective_ratchet(record)
+    if ratchet > 1 then
+      self:schedule_ratchets(record, ratchet)
     end
   end
 end
@@ -1145,6 +1701,7 @@ function GridSequencer:start_sequence(reset_sequence)
   else
     self.seq_remaining_time = nil
     self.play_index = 1
+    self.global_pos = 1
     self:sync_play_page_step()
     self:enter_step(true)
     -- If the pattern has no trigs at all, fire the amp envelope once at start so
@@ -1153,7 +1710,7 @@ function GridSequencer:start_sequence(reset_sequence)
       and self.options.note_on ~= nil then
       self.options.note_on(self:note_seconds(nil))
     end
-    self.next_step_time = util.time() + self:step_seconds()
+    self.next_step_time = util.time() + self:step_duration(self.play_index)
   end
   local seq_metro = self:ensure_sequence_metro()
   if seq_metro ~= nil then
@@ -1177,6 +1734,39 @@ function GridSequencer:pause_sequence()
   self:request_redraw()
 end
 
+-- Clear all transient live state (holds, step-edit flags, param-lock holds,
+-- live-step, anchors, fill, preview). Used by New Project so nothing stays
+-- "held" and un-editable after the reset. Does NOT touch the step records --
+-- the caller reloads those from the fresh/blank pattern.
+function GridSequencer:reset_live_state()
+  self.loop_holds = {}
+  self.slice_holds = {}
+  self.step_holds = {}
+  self.step_press_time = {}
+  self.step_edited = {}
+  self.pressed = {}
+  self.loop_tap_key = nil
+  self.loop_tap_kind = nil
+  self.param_lock_holds = {}
+  self.live_step_hold = false
+  self.live_step_index = nil
+  self.loop_key_programming = {}
+  self.seq_anchor = nil
+  self.keys_anchor = nil
+  self.manual_region = nil
+  self.preview_active = false
+  self.pattern_pass = 1
+  self.last_cond_result = nil
+  self.fill_active = false
+  self.fill_latched = false
+  self.fill_held = false
+  self.pattern_mode = false
+  self.pattern_latched = false
+  self.pattern_press_time = nil
+  self.pattern_selection_made = false
+  self:stop_scene_glide()
+end
+
 function GridSequencer:stop_sequence()
   self.playing = false
   if self.seq_metro ~= nil then
@@ -1189,6 +1779,10 @@ function GridSequencer:stop_sequence()
   self.seq_anchor = nil
   self.keys_anchor = nil
   self.play_index = 1
+  self.global_pos = 1
+  if self.options.clear_pattern_pending ~= nil then
+    self.options.clear_pattern_pending()
+  end
   self:sync_play_page_step()
   self:clear_param_lock_holds()
   self:push_active_range(nil, nil)
@@ -1263,13 +1857,14 @@ function GridSequencer:tick_sequence()
   local guard = 0
   while self.playing and now >= self.next_step_time and guard < 8 do
     self:advance_step()
-    self.next_step_time = self.next_step_time + self:step_seconds()
+    -- The step just entered holds for its swing-adjusted duration (PRD §6.5).
+    self.next_step_time = self.next_step_time + self:step_duration(self.play_index)
     advanced = true
     guard = guard + 1
   end
 
   if advanced and self.next_step_time < now then
-    self.next_step_time = now + self:step_seconds()
+    self.next_step_time = now + self:step_duration(self.play_index)
   end
 
   if self.seq_metro ~= nil then
@@ -1278,12 +1873,57 @@ function GridSequencer:tick_sequence()
 end
 
 function GridSequencer:advance_step()
+  -- Global pattern boundary (PRD §6.4): as the project-wide cycle wraps, a
+  -- pending sequential switch engages or a temp-jump returns. If it does, the
+  -- coordinator re-applies a pattern and re-enters step 1 itself (via
+  -- on_pattern_applied), so this advance is complete.
+  local next_global = (self.global_pos or 1) + 1
+  if next_global > self:global_length() then
+    self.global_pos = 1
+    if self.options.on_global_boundary ~= nil and self.options.on_global_boundary() then
+      self:request_redraw()
+      return
+    end
+  else
+    self.global_pos = next_global
+  end
+
   self.play_index = self.play_index + 1
   if self.play_index > self:pattern_steps() then
     self.play_index = 1
+    -- A new loop of the pattern: bump the pass counter that drives A:B and 1st
+    -- trig conditions (PRD §6.5).
+    self.pattern_pass = (self.pattern_pass or 1) + 1
   end
   self:sync_play_page_step()
   self:enter_step(false)
+  self:request_redraw()
+end
+
+-- The coordinator calls this right after loading a pattern's state into the live
+-- params/sequencer (PRD §6.3). restart = true re-anchors playback at step 1 (a
+-- fresh pattern start); restart = false keeps the current playback position
+-- (Direct Jump), clamped into the new pattern's length.
+function GridSequencer:on_pattern_applied(restart)
+  if restart then
+    self.play_index = 1
+    self.global_pos = 1
+    self.pattern_pass = 1
+    self.last_cond_result = nil
+    self:sync_play_page_step()
+    if self.playing then
+      self:enter_step(true)
+      self.next_step_time = util.time() + self:step_duration(self.play_index)
+    end
+  else
+    if self.play_index > self:pattern_steps() then
+      self.play_index = ((self.play_index - 1) % self:pattern_steps()) + 1
+    end
+    if self.global_pos > self:global_length() then
+      self.global_pos = ((self.global_pos - 1) % self:global_length()) + 1
+    end
+    self:sync_play_page_step()
+  end
   self:request_redraw()
 end
 
@@ -1373,8 +2013,29 @@ function GridSequencer:key(x, y, z)
   local key_id = x .. ":" .. y
   self.pressed[key_id] = z == 1 or nil
 
+  -- Universal input router FIRST: an open modal/focus layer claims YES/NO/arrows
+  -- (and, if blocking, all keys) before any of the grid's own special-cases --
+  -- otherwise the (11,6) YES special-case below would eat YES before a pop-up
+  -- (New Project confirm, project browser) or settings action row could see it.
+  -- With no focus layer active this returns false and the grid behaves as before.
+  if self.options.ui_input ~= nil and self.options.ui_input(x, y, z) then
+    self:redraw()
+    self:request_redraw()
+    return
+  end
+
   if x == 16 and y == 7 then
     self.page_down = z == 1
+    self:redraw()
+    self:request_redraw()
+    return
+  end
+
+  -- FILL (16,6): momentary fill while held, FN+press latches. Handled here (not
+  -- in the z==1-only navigation path) so it sees key release for the momentary
+  -- mode. Gates FILL/!FILL trig conditions (PRD §6.5).
+  if x == 16 and y == 6 then
+    self:key_fill(z)
     self:redraw()
     self:request_redraw()
     return
@@ -1384,6 +2045,37 @@ function GridSequencer:key(x, y, z)
   -- Handled here (not in the z==1-only navigation path) so it sees key release.
   if x == 11 and y == 6 then
     self:key_yes(z)
+    self:redraw()
+    self:request_redraw()
+    return
+  end
+
+  -- PATTERN key (8,5): tap latches / hold is momentary for the pattern-load
+  -- overlay (PRD §6.2, see key_pattern). FN+press instead opens the
+  -- (screen-only) pattern-quantize mode pop-up -- a distinct surface owned by
+  -- the coordinator (elasticat.lua), not this grid overlay. The FN check only
+  -- gates the press (z==1): the release always reaches key_pattern() so an
+  -- overlay opened before FN got held still closes/latches correctly
+  -- (key_pattern() is a safe no-op when no (8,5) press session is in flight).
+  if x == 8 and y == 5 then
+    if z == 1 and self.fn_down then
+      if self.options.open_pattern_quantize_menu ~= nil then
+        self.options.open_pattern_quantize_menu()
+      end
+      self:redraw()
+      self:request_redraw()
+      return
+    end
+    self:key_pattern(z)
+    self:redraw()
+    self:request_redraw()
+    return
+  end
+
+  -- While the pattern-load overlay is open it captures the surface: the bottom
+  -- row selects a pattern, Right arrow renames, category keys exit, everything
+  -- else is inert (PRD §6.2). Category keys fall through so they act normally.
+  if self.pattern_mode and self:key_pattern_mode(x, y, z) then
     self:redraw()
     self:request_redraw()
     return
@@ -1407,6 +2099,8 @@ function GridSequencer:key(x, y, z)
     self:key_step_row(x, z)
   elseif y == 5 and (x == 1 or x == 2) then
     self:key_octave(x, z)
+  elseif y == 5 and x >= 9 and x <= 16 then
+    self:key_scene(x, z)
   elseif self:key_pitch_control(x, y, z) then
     -- handled
   elseif z == 1 then
@@ -1527,6 +2221,16 @@ function GridSequencer:key_octave(x, z)
   if z ~= 1 then
     return
   end
+  -- FN+Octave = RAM Memorize/Recall (PRD §7.2): FN+(1,5) recalls the RAM
+  -- project snapshot, FN+(2,5) memorizes the current state. Playback-safe.
+  if self.fn_down then
+    if x == 1 and self.options.ram_recall ~= nil then
+      self.options.ram_recall()
+    elseif x == 2 and self.options.ram_memorize ~= nil then
+      self.options.ram_memorize()
+    end
+    return
+  end
   if x == 1 then
     self.keyboard_octave = util.clamp(self.keyboard_octave - 1, -2, 2)
   elseif x == 2 then
@@ -1626,13 +2330,16 @@ function GridSequencer:update_preview_state()
   if should_preview and not self.preview_active then
     self.preview_active = true
     self.options.play(true)
-    -- Open the amp envelope so the preview is audible even with a release/finite
-    -- hold. A long gate keeps it sustained while held; play(false) mutes on release.
+    -- Open the amp envelope indefinitely so the preview sustains while held
+    -- (engine noteOff): the matching note_off below closes the gate cleanly.
     if not is_slice_machine(self:machine()) and self.options.note_on ~= nil then
-      self.options.note_on(3600)
+      self.options.note_on(0)
     end
   elseif not should_preview and self.preview_active then
     self.preview_active = false
+    if self.options.note_off ~= nil then
+      self.options.note_off()
+    end
     self.options.play(false)
   end
 end
@@ -1658,7 +2365,17 @@ function GridSequencer:apply_loop_key_region(is_press)
   if key_start ~= nil then
     self.manual_region = { start_point = start_point, end_point = end_point }
     if is_press then
-      self:set_region_with_phase(start_point, end_point, 0)
+      if self.playing then
+        -- Live performance: morph the region around the current playhead WITHOUT
+        -- a phase-0 restart. Snapping the playhead to the region start re-attacks
+        -- the sample and reads as a spurious "envelope trigger" while playing;
+        -- instead keep playing from the current position and only warp to the
+        -- start when the playhead now falls outside the new region. While stopped
+        -- the jump-to-start IS the preview attack we want, so keep it there.
+        self:set_region_within_or_warp(start_point, end_point)
+      else
+        self:set_region_with_phase(start_point, end_point, 0)
+      end
     else
       self:set_region(start_point, end_point)
     end
@@ -1769,7 +2486,10 @@ function GridSequencer:begin_live_step(step)
   self:apply_step_pitch(record)
   self:apply_active_range()
   if not self:is_ghost(record) and self.options.note_on ~= nil then
-    self.options.note_on(3600)  -- held note; the next trigger re-gates the env
+    -- Indefinite hold (engine noteOff, PRD §8): the gate stays open until
+    -- end_live_step sends note_off on key release -- a real ADSR release
+    -- instead of the old 3600s timed-gate hack.
+    self.options.note_on(0)
   end
   local record_locks_region = record.param_locks ~= nil
     and (record.param_locks.loop_start ~= nil or record.param_locks.loop_end ~= nil)
@@ -1786,6 +2506,12 @@ end
 function GridSequencer:end_live_step()
   self.live_step_hold = false
   self.live_step_index = nil
+  -- Close the held note's gate (engine noteOff): the amp/filter envelopes
+  -- enter their release stage NOW, matching the finger lift. Fired before the
+  -- playing check so a stop-while-held never leaves a gate open.
+  if self.options.note_off ~= nil then
+    self.options.note_off()
+  end
   if not self.playing then
     return
   end
@@ -1822,7 +2548,10 @@ function GridSequencer:key_loop_control(x, z)
       if start_point ~= nil then
         self:lock_held_steps(start_point, end_point, held_count)
       end
-      self:refresh_held_step()
+      -- retrigger = true: pressing a loop key while holding a step re-auditions
+      -- the stopped preview from the top (fresh attack) so the new lock is heard
+      -- at once. Ignored during playback (refresh_held_step routes there).
+      self:refresh_held_step(true)
     else
       if self.playing and first_key then
         self.keys_anchor = self:make_anchor()  -- start of a live performance
@@ -2047,8 +2776,44 @@ function GridSequencer:draw_slice_rows()
 end
 
 function GridSequencer:draw_keyboard()
-  self.g:led(1, 5, self:pressed_level(1, 5, self.keyboard_octave < 0 and 9 or 3))
-  self.g:led(2, 5, self:pressed_level(2, 5, self.keyboard_octave > 0 and 9 or 3))
+  if self.fn_down then
+    -- FN held: octave keys read as RAM Recall (1,5) / Memorize (2,5). Recall
+    -- only lights up once a snapshot exists (PRD §7.2).
+    local ram = self.options.ram_has ~= nil and self.options.ram_has()
+    self.g:led(1, 5, self:pressed_level(1, 5, ram and 12 or 3))
+    self.g:led(2, 5, self:pressed_level(2, 5, 12))
+  else
+    self.g:led(1, 5, self:pressed_level(1, 5, self.keyboard_octave < 0 and 9 or 3))
+    self.g:led(2, 5, self:pressed_level(2, 5, self.keyboard_octave > 0 and 9 or 3))
+  end
+  -- Pattern-load key: bright while the overlay is open (PRD §6.2).
+  self.g:led(8, 5, self:pressed_level(8, 5, self.pattern_mode and 15 or 3))
+
+  -- A/B scene crossfader (row 5, centered): A anchor col 10, B anchor col 16
+  -- (bright while held for scene-locking, mid when their scene holds locks, dim
+  -- otherwise); fader keys 11-15 show the position (nearest key bright, its
+  -- neighbor scaled by proximity, so the eased glide reads as a sweep). Col 9
+  -- is unused. Position is global and can move from the MASTER-page encoder, so
+  -- refresh from the coordinator every draw.
+  if self.options.get_crossfade ~= nil then
+    self.crossfade = self.options.get_crossfade()
+  end
+  self.g:led(9, 5, self:pressed_level(9, 5, 0))
+  for x = 10, 16 do
+    local level
+    if x == 10 or x == 16 then
+      local scene = x == 10 and 1 or 2
+      local held = self.pressed[x .. ":5"] == true
+      local has = self.options.scene_has ~= nil and self.options.scene_has(scene)
+      level = held and 15 or (has and 8 or 4)
+    else
+      -- Fader keys 11..15 map 0..1; nearest to the position is brightest.
+      local pos_key = 11 + (self.crossfade or 0) * 4  -- fractional key position
+      local distance = math.abs(x - pos_key)
+      level = distance < 0.5 and 15 or (distance < 1.5 and 6 or 2)
+    end
+    self.g:led(x, 5, self:pressed_level(x, 5, level))
+  end
 
   local current_pitch = self:base_pitch()
   local edit = self:screen_edit()
@@ -2072,10 +2837,19 @@ end
 function GridSequencer:draw_category_keys()
   local current_category = self.options.current_param_category ~= nil and self.options.current_param_category() or nil
   local settings_active = self.options.param_settings_active ~= nil and self.options.param_settings_active() or false
+  local on_subpage = self.options.on_param_subpage ~= nil and self.options.on_param_subpage() or false
+  -- Subpage indicator: the active category's key fades 5 <-> its lit level at
+  -- ~2Hz whenever a sub-page (param page > 1 or settings page > 1) is showing.
+  local fade = 1
+  if on_subpage then
+    local phase = (util.time() * 2) % 1  -- 0..1 at 2Hz
+    fade = phase < 0.5 and (phase * 2) or ((1 - phase) * 2)  -- triangle 0..1..0
+  end
   for x, category in pairs(CATEGORY_KEYS) do
-    local level = category == current_category and 10 or 3
-    if settings_active and category == current_category then
-      level = 14
+    local level = 3
+    if category == current_category then
+      local target = settings_active and 14 or 10
+      level = on_subpage and math.floor(5 + (target - 5) * fade + 0.5) or target
     end
     self.g:led(x, 1, self:pressed_level(x, 1, level))
   end
@@ -2108,15 +2882,23 @@ function GridSequencer:draw_normal_leds()
 
   self:draw_keyboard()
 
+  -- Nav arrows / YES / NO sit at a uniform dim base and only brighten when
+  -- pressed. The page-mode tint (which mode is active) shows ONLY while the
+  -- PAGE key is held -- that's the only time these keys pick a page mode --
+  -- rather than lighting the default "select" indicator all the time.
   self.g:led(11, 6, self:pressed_level(11, 6, 2))
   self.g:led(11, 7, self:pressed_level(11, 7, 2))
-  self.g:led(12, 7, self:pressed_level(12, 7, self.page_mode == "rate" and 8 or 3))
-  self.g:led(13, 7, self:pressed_level(13, 7, self.page_mode == "loop" and 8 or 3))
+  self.g:led(12, 7, self:pressed_level(12, 7, (self.page_down and self.page_mode == "rate") and 8 or 3))
+  self.g:led(13, 7, self:pressed_level(13, 7, (self.page_down and self.page_mode == "loop") and 8 or 3))
   self.g:led(14, 7, self:pressed_level(14, 7, 3))
-  self.g:led(13, 6, self:pressed_level(13, 6, self.page_mode == "select" and 8 or 3))
+  self.g:led(13, 6, self:pressed_level(13, 6, (self.page_down and self.page_mode == "select") and 8 or 3))
   self.g:led(16, 7, self:pressed_level(16, 7, self.page_down and 15 or 5))
+  -- Fill key: bright while fill is engaged (latched or held), dim otherwise.
+  self.g:led(16, 6, self:pressed_level(16, 6, self.fill_active and 15 or 3))
 
-  if self.page_down then
+  if self.pattern_mode then
+    self:draw_pattern_row()
+  elseif self.page_down then
     self:draw_page_row()
   else
     self:draw_step_row()
@@ -2260,6 +3042,27 @@ function GridSequencer:draw_page_row()
     end
     if self.playing and x == self.play_page then
       level = flash_on and 15 or 5
+    end
+    self.g:led(x, 8, level)
+  end
+end
+
+-- Pattern-load overlay row (PRD §6.2): the 16 pattern slots. Current pattern is
+-- bright; a queued (sequential/temp) switch flashes; populated slots read at a
+-- mid level, empty slots dim.
+function GridSequencer:draw_pattern_row()
+  local flash_on = math.floor(util.time() * 4) % 2 == 0
+  local current = self.options.pattern_current ~= nil and self.options.pattern_current() or 1
+  local pending = self.options.pattern_pending ~= nil and self.options.pattern_pending() or nil
+  for x = 1, 16 do
+    local level = 2
+    if self.options.pattern_populated ~= nil and self.options.pattern_populated(x) then
+      level = 6
+    end
+    if x == current then
+      level = 15
+    elseif x == pending then
+      level = flash_on and 12 or 4
     end
     self.g:led(x, 8, level)
   end

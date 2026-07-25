@@ -26,7 +26,13 @@ function Navigation.new(opts)
     group_index_by_page = {},
     settings_layer = false,
     settings_category_index = 1,
-    settings_item_index = {}
+    settings_item_index = {},
+    -- Multi-page settings support (PRD §7.3, in-script Project page): which
+    -- settings page is showing per category. Only "master" has more than one
+    -- today (see lib/pages/model.lua); every other category's settings_pages()
+    -- resolves to a single implicit page, so this index just stays at 1 for
+    -- them.
+    settings_page_index = {}
   }, Navigation)
 end
 
@@ -152,9 +158,40 @@ function Navigation:current_settings_category()
   return CATEGORY_ORDER[self.settings_category_index] or self:current_category()
 end
 
-function Navigation:settings_items()
+-- Multi-page settings (PRD §7.3): a category's `settings` field is either a
+-- flat list of items (every category except master today -- unchanged shape,
+-- unchanged behavior) or a list of {title=?, items=...} pages (master, which
+-- gained a second "PROJECT" page). An item table never has an `.items` key,
+-- so checking for one on the first entry distinguishes the two shapes without
+-- needing every category's model.lua entry to opt in.
+function Navigation:settings_pages(category)
+  local raw = self:category_model(category).settings or {}
+  if #raw > 0 and raw[1].items ~= nil then
+    return raw
+  end
+  return {{items = raw}}
+end
+
+function Navigation:settings_page_count(category)
+  return math.max(1, #self:settings_pages(category))
+end
+
+function Navigation:current_settings_page_index()
   local category = self:current_settings_category()
-  return self:category_model(category).settings or {}
+  local count = self:settings_page_count(category)
+  local index = util.clamp(self.settings_page_index[category] or 1, 1, count)
+  self.settings_page_index[category] = index
+  return index
+end
+
+function Navigation:current_settings_page()
+  local category = self:current_settings_category()
+  local pages = self:settings_pages(category)
+  return pages[self:current_settings_page_index()] or {items = {}}
+end
+
+function Navigation:settings_items()
+  return self:current_settings_page().items or {}
 end
 
 function Navigation:open_param_settings(category)
@@ -165,6 +202,7 @@ function Navigation:open_param_settings(category)
   self.settings_category_index = position
   local settings_category = self:current_settings_category()
   self.settings_item_index[settings_category] = self.settings_item_index[settings_category] or 1
+  self.settings_page_index[settings_category] = self.settings_page_index[settings_category] or 1
   self.show_message(self:category_model(settings_category).title .. " SETTINGS")
   self.request_redraw()
 end
@@ -186,11 +224,58 @@ function Navigation:return_to_param_category(category)
   self.request_redraw()
 end
 
+-- Scrolling the item cursor past the last item of the current settings page
+-- advances to the first item of the next settings page; scrolling before the
+-- first item goes back to the last item of the previous page (wrapping
+-- circularly). This is the ONLY page-advance mechanism (PRD §7.3's "scroll to
+-- last setting, auto-advance") and every input path that already calls this
+-- function gets it for free: the K2/K3 screen keys and E2 encoder
+-- (elasticat.lua's key(n,z)/enc(n,d)) and the grid's up/down arrow buttons
+-- (grid_sequencer.lua's param_settings_select_delta wiring) -- none of those
+-- call sites need to change. Categories with only one settings page (i.e.
+-- every category except master) see settings_page_count() == 1, so this is a
+-- no-op change for them: behavior clamps exactly as before.
+-- Category-key page cycling: advance to the next settings page (wrapping),
+-- landing on its first item -- the same repeat-press gesture as cycling a
+-- category's main pages. No-op for single-page settings categories.
+function Navigation:settings_page_cycle(category)
+  category = category or self:current_settings_category()
+  local count = self:settings_page_count(category)
+  if count < 2 then
+    return
+  end
+  local index = (self:current_settings_page_index() % count) + 1
+  self.settings_page_index[category] = index
+  self.settings_item_index[category] = 1
+  local page = self:settings_pages(category)[index] or {}
+  self.show_message((page.title or self:category_model(category).title) .. " SETTINGS")
+  self.request_redraw()
+end
+
 function Navigation:settings_select_delta(delta)
   local category = self:current_settings_category()
   local items = self:settings_items()
   local count = math.max(1, #items)
-  self.settings_item_index[category] = util.clamp((self.settings_item_index[category] or 1) + delta, 1, count)
+  local current = self.settings_item_index[category] or 1
+  local target = current + delta
+  local page_count = self:settings_page_count(category)
+
+  if page_count > 1 and (target > count or target < 1) then
+    local page_index = self:current_settings_page_index()
+    if target > count then
+      page_index = (page_index % page_count) + 1
+      self.settings_page_index[category] = page_index
+      self.settings_item_index[category] = 1
+    else
+      page_index = ((page_index - 2) % page_count) + 1
+      self.settings_page_index[category] = page_index
+      self.settings_item_index[category] = math.max(1, #self:settings_items())
+    end
+    self.request_redraw()
+    return
+  end
+
+  self.settings_item_index[category] = util.clamp(target, 1, count)
   self.request_redraw()
 end
 
@@ -199,7 +284,33 @@ function Navigation:settings_category_delta(delta)
   self.category_index = self.settings_category_index
   local settings_category = self:current_settings_category()
   self.settings_item_index[settings_category] = self.settings_item_index[settings_category] or 1
+  self.settings_page_index[settings_category] = self.settings_page_index[settings_category] or 1
   self.show_message(self:category_model(settings_category).title .. " SETTINGS")
+  self.request_redraw()
+end
+
+-- E1 walks EVERY settings page across ALL categories linearly, so a norns-only
+-- user can reach every page (notably master's PROJECT page). It advances the
+-- page within the current category; past the last page it rolls into the next
+-- category's first page, and before the first into the previous category's
+-- last page. (Grid users have the category-key shortcuts instead.)
+function Navigation:settings_page_or_category_delta(delta)
+  delta = (delta or 0) >= 0 and 1 or -1
+  local category = self:current_settings_category()
+  local page_count = self:settings_page_count(category)
+  local next_page = self:current_settings_page_index() + delta
+  if next_page >= 1 and next_page <= page_count then
+    self.settings_page_index[category] = next_page
+    self.settings_item_index[category] = 1
+  else
+    self.settings_category_index = ((self.settings_category_index - 1 + delta) % #CATEGORY_ORDER) + 1
+    self.category_index = self.settings_category_index
+    category = self:current_settings_category()
+    self.settings_page_index[category] = delta > 0 and 1 or self:settings_page_count(category)
+    self.settings_item_index[category] = 1
+  end
+  local page = self:current_settings_page()
+  self.show_message((page.title or self:category_model(category).title) .. " SETTINGS")
   self.request_redraw()
 end
 
