@@ -114,12 +114,10 @@ end
 -- Which trailing bottom-row cells a category widget occupies, if any.
 -- Returns first cell, last cell, method name.
 function PageRender:widget_span(category, page_index, items)
-  if category == "amp" and page_index == 1 then
-    -- The envelope IS the interface (owner spec): the env param cells are
-    -- hidden and the whole top row draws the shape, with the selected pair's
-    -- stage points marked for direct E2/E3 editing. PAN/VOL keep cells 7-8.
-    return 1, 4, "draw_amp_env"
-  elseif category == "filter" then
+  -- AMP p1 and FILTER p2 are drawn by draw_amp_page / draw_filter_env_page
+  -- (full low-profile envelope pages), so they never reach the generic cell
+  -- grid and need no widget span here.
+  if category == "filter" then
     if page_index == 2 then
       -- Same direct-editing treatment for the filter envelope; DPTH stays a
       -- real cell in the bottom row.
@@ -443,7 +441,7 @@ local function id_to_stage(id)
   if id == nil then
     return nil
   end
-  local stage = id:gsub("^filter_env_", ""):gsub("^env_", "")
+  local stage = id:gsub("^filter_env_", ""):gsub("^menv_", ""):gsub("^env_", "")
   return ENV_STAGE[stage] and stage or nil
 end
 
@@ -804,13 +802,18 @@ end
 -- render, between a top and bottom low-profile param row. Bars covering the
 -- stage(s) the selected pair edits are brightened (the direct-editing cue that
 -- replaced the old polyline handles).
-function PageRender:draw_filter_env_bars(items, sel_lo)
-  local mode = floor(self.value("filter_env_mode", 2) + 0.5)
-  local a = self:item_value(items, "filter_env_attack", 0)
-  local d = self:item_value(items, "filter_env_decay", 0)
-  local s = self:item_value(items, "filter_env_sustain", 127)
-  local hd = self:item_value(items, "filter_env_hold", 0)
-  local r = self:item_value(items, "filter_env_release", 0)
+-- `prefix` selects which envelope family to read (filter_env_ / env_ / menv_)
+-- and `mode_id` the param that says ADSR vs AHR (nil = always ADSR).
+function PageRender:draw_envelope_bars(items, sel_lo, prefix, mode_id)
+  local mode = mode_id ~= nil and floor(self.value(mode_id, 2) + 0.5) or 1
+  local a = self:item_value(items, prefix .. "attack", 0)
+  local d = self:item_value(items, prefix .. "decay", 0)
+  local s = self:item_value(items, prefix .. "sustain", 127)
+  -- AHR-only, and read only in AHR: the MOD ENV is ADSR-only and registers no
+  -- <prefix>hold param at all, so asking for it unconditionally sent an
+  -- unregistered id down the value resolver.
+  local hd = mode == 2 and self:item_value(items, prefix .. "hold", 0) or 0
+  local r = self:item_value(items, prefix .. "release", 0)
 
   -- Which stages the selected pair is editing (id -> stage name).
   local hot = {}
@@ -849,16 +852,37 @@ end
 -- AHR leaves the 4th blank), items 5-6 the BOTTOM row's cells 3 and 4
 -- (DRIVE, DEPTH) -- kept adjacent in the list so K2/K3 never lands on an
 -- all-blank pair.
-function PageRender:draw_filter_env_page(items, group)
+-- Shared envelope page: 4 low-profile params on top, the envelope drawn on the
+-- filter render's bar grid in the middle, and the remaining items along the
+-- bottom row starting at `bottom_first_cell` (0-3). Used by FILTER p2, AMP and
+-- MOD ENV so all three envelopes look and behave identically.
+function PageRender:draw_envelope_page(items, group, prefix, mode_id, bottom_first_cell)
   local sel_lo = ((group or 1) - 1) * 2 + 1
+  local first_cell = bottom_first_cell or 0
   for i = 1, 4 do
     self:draw_low_profile_cell(items[i], i - 1, i == sel_lo or i == sel_lo + 1, FENV_ROW_TOP_Y)
   end
-  for i = 5, 6 do
-    -- item 5 -> bottom cell index 2, item 6 -> 3 (positions 3 and 4).
-    self:draw_low_profile_cell(items[i], i - 3, i == sel_lo or i == sel_lo + 1, FENV_ROW_BOTTOM_Y)
+  for i = 5, #items do
+    local cell = first_cell + (i - 5)
+    if cell <= 3 then
+      self:draw_low_profile_cell(items[i], cell, i == sel_lo or i == sel_lo + 1, FENV_ROW_BOTTOM_Y)
+    end
   end
-  self:draw_filter_env_bars(items, sel_lo)
+  self:draw_envelope_bars(items, sel_lo, prefix, mode_id)
+end
+
+function PageRender:draw_filter_env_page(items, group)
+  self:draw_envelope_page(items, group, "filter_env_", "filter_env_mode", 2)
+end
+
+-- AMP: bottom row is SND1 / SND2 / PAN / VOL, so it fills all four cells.
+function PageRender:draw_amp_page(items, group)
+  self:draw_envelope_page(items, group, "env_", "env_mode", 0)
+end
+
+-- MOD ENV: always ADSR; bottom row is DEST / DEPTH in cells 3 and 4.
+function PageRender:draw_mod_env_page(items, group)
+  self:draw_envelope_page(items, group, "menv_", nil, 2)
 end
 
 -- Full FILTER page 1: low-profile param row + bar render. The coordinator has

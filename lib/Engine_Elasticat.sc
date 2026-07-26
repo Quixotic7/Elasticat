@@ -228,8 +228,10 @@ Engine_Elasticat : CroneEngine {
 	var lfo2Depth = 0;
 	var lfo2Mode = 0;
 	var menvDest = 0;
-	var menvAttack = 0.01; // seconds (AD envelope for the first stab)
+	var menvAttack = 0.01; // seconds
 	var menvDecay = 0.15;
+	var menvSustain = 0.8; // 0..1
+	var menvRelease = 0.15; // seconds
 	var menvDepth = 0;     // -1..1
 	var lfoTrigCount = 0;  // bumped per step where lfo_reset resolves ON
 	var menvTrigCount = 0; // bumped per step where env_reset resolves ON
@@ -1193,7 +1195,8 @@ Engine_Elasticat : CroneEngine {
 			arg pitchOut=0, cutoffOut=0, resOut=0, ampOut=0, panOut=0, targetBpm=120,
 			lfo1Dest=0, lfo1Wave=0, lfo1Beats=4, lfo1Depth=0, lfo1Mode=0, lfoTrig1=0,
 			lfo2Dest=0, lfo2Wave=0, lfo2Beats=4, lfo2Depth=0, lfo2Mode=0, lfoTrig2=0,
-			menvDest=0, menvAttack=0.01, menvDecay=0.15, menvDepth=0, menvTrig=0,
+			menvDest=0, menvAttack=0.01, menvDecay=0.15, menvSustain=0.8, menvRelease=0.15,
+			menvDepth=0, menvTrig=0, menvGateSeconds=0.5, menvReleaseTrig=0,
 			macro1Base=0, macro1PitchDepth=0, macro1CutoffDepth=0, macro1ResDepth=0, macro1AmpDepth=0, macro1PanDepth=0,
 			macro2Base=0, macro2PitchDepth=0, macro2CutoffDepth=0, macro2ResDepth=0, macro2AmpDepth=0, macro2PanDepth=0,
 			macro3Base=0, macro3PitchDepth=0, macro3CutoffDepth=0, macro3ResDepth=0, macro3AmpDepth=0, macro3PanDepth=0,
@@ -1231,11 +1234,13 @@ Engine_Elasticat : CroneEngine {
 
 			lfo1 = lfoValue.value(lfo1Wave, lfo1Beats, lfo1Mode, lfoTrig1) * lfo1Depth.clip(-1, 1);
 			lfo2 = lfoValue.value(lfo2Wave, lfo2Beats, lfo2Mode, lfoTrig2) * lfo2Depth.clip(-1, 1);
-			// Mod envelope: one-shot AD burst (0..1), retriggered per note where the
-			// step's env_reset resolves ON (the amp env's counter idiom).
-			menv = EnvGen.kr(
-				Env([0, 1, 0], [menvAttack.max(0.0001), menvDecay.max(0.0001)], [-4, -4]),
-				Changed.kr(menvTrig)) * menvDepth.clip(-1, 1);
+			// Mod envelope: a full ADSR (was a one-shot AD burst), reusing the shared
+			// readerAmpEnv graph so it sustains and releases exactly like the amp and
+			// filter envelopes. Retriggered per note where the step's env_reset
+			// resolves ON; its gate follows the note length / noteOff, same as the
+			// amp env. envMode 0 = ADSR.
+			menv = readerAmpEnv.value(0, menvAttack, menvDecay, menvSustain, menvRelease,
+				0, menvTrig, menvGateSeconds, 0, menvReleaseTrig) * menvDepth.clip(-1, 1);
 
 			// Stage 1: each macro's effective value = its base knob plus any
 			// LFO/mod-env whose dest points at it (indices 6..9), clipped 0..1.
@@ -1459,6 +1464,10 @@ Engine_Elasticat : CroneEngine {
 			if(filterSynth.notNil, {
 				filterSynth.set(\envGateSeconds, envNoteSeconds, \envTrig, envTrigCount);
 			});
+			// The mod envelope is a full ADSR now, so it needs the same gate window.
+			if(modSynth.notNil, {
+				modSynth.set(\menvGateSeconds, envNoteSeconds);
+			});
 		});
 		// Note-off (Task 1, PRD S8): closes an indefinitely-held note's ADSR gate
 		// now, so its amp envelope (and the filter envelope, which shares the same
@@ -1474,6 +1483,9 @@ Engine_Elasticat : CroneEngine {
 			});
 			if(filterSynth.notNil, {
 				filterSynth.set(\envReleaseTrig, noteOffTrigCount);
+			});
+			if(modSynth.notNil, {
+				modSynth.set(\menvReleaseTrig, noteOffTrigCount);
 			});
 		});
 		// Force a fresh amp/filter re-attack, for auditioning a stopped step
@@ -1599,6 +1611,8 @@ Engine_Elasticat : CroneEngine {
 		this.addCommand(\menvDest, "i", { arg msg; menvDest = msg[1].asInteger.clip(0, 9); this.setMod(\menvDest, menvDest); });
 		this.addCommand(\menvAttack, "f", { arg msg; menvAttack = msg[1].max(0.0001); this.setMod(\menvAttack, menvAttack); });
 		this.addCommand(\menvDecay, "f", { arg msg; menvDecay = msg[1].max(0.0001); this.setMod(\menvDecay, menvDecay); });
+		this.addCommand(\menvSustain, "f", { arg msg; menvSustain = msg[1].clip(0, 1); this.setMod(\menvSustain, menvSustain); });
+		this.addCommand(\menvRelease, "f", { arg msg; menvRelease = msg[1].max(0.0001); this.setMod(\menvRelease, menvRelease); });
 		this.addCommand(\menvDepth, "f", { arg msg; menvDepth = msg[1].clip(-1, 1); this.setMod(\menvDepth, menvDepth); });
 		// Macros (indexed 1..4) as a mod matrix: base 0..1 (the knob), and a
 		// signed depth per destination (dest 1..5 = pitch/cutoff/res/amp/pan).
@@ -1860,6 +1874,8 @@ Engine_Elasticat : CroneEngine {
 			\menvDest, menvDest,
 			\menvAttack, menvAttack,
 			\menvDecay, menvDecay,
+			\menvSustain, menvSustain,
+			\menvRelease, menvRelease,
 			\menvDepth, menvDepth,
 			\menvTrig, menvTrigCount
 		] ++ this.macroSynthArgs;

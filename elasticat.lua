@@ -1341,27 +1341,45 @@ end
 -- AMP page: layout depends on envelope mode. Top row is the envelope (ADSR or
 -- AHR), bottom row is empty, empty, Pan, Track Volume.
 local function amp_env_items()
+  local env_time = {lockable = true, min = 0, max = 127, step = 1}
+  local env_long = {lockable = true, min = 0, max = 128, step = 1}
   local items
   if param_value_or("env_mode", 2) == 1 then  -- ADSR
     items = {
-      ParamItem.item("env_attack", "ATK", {lockable = true, min = 0, max = 127, step = 1}),
-      ParamItem.item("env_decay", "DEC", {lockable = true, min = 0, max = 127, step = 1}),
-      ParamItem.item("env_sustain", "SUS", {lockable = true, min = 0, max = 127, step = 1}),
-      ParamItem.item("env_release", "REL", {lockable = true, min = 0, max = 127, step = 1})
+      ParamItem.item("env_attack", "ATCK", env_time),
+      ParamItem.item("env_decay", "DECAY", env_time),
+      ParamItem.item("env_sustain", "SUST", env_time),
+      ParamItem.item("env_release", "REL", env_long)
     }
   else  -- AHR (default)
     items = {
-      ParamItem.item("env_attack", "ATK", {lockable = true, min = 0, max = 127, step = 1}),
-      ParamItem.item("env_hold", "HOLD", {lockable = true, min = 0, max = 128, step = 1}),
-      ParamItem.item("env_release", "REL", {lockable = true, min = 0, max = 128, step = 1}),
+      ParamItem.item("env_attack", "ATCK", env_time),
+      ParamItem.item("env_hold", "HOLD", env_long),
+      ParamItem.item("env_release", "REL", env_long),
       ParamItem.blank()
     }
   end
-  table.insert(items, ParamItem.blank())
-  table.insert(items, ParamItem.blank())
-  table.insert(items, ParamItem.item("pan", "PAN", {lockable = true, min = 0, max = 128, step = 1}))
-  table.insert(items, ParamItem.item("amp", "VOL", {lockable = true, min = 0, max = 127, step = 1}))
+  -- Bottom row (all four cells): the track's output stage.
+  items[5] = ParamItem.item("send1_level", "SND 1", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}})
+  items[6] = ParamItem.item("send2_level", "SND 2", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}})
+  items[7] = ParamItem.item("pan", "PAN", {lockable = true, min = 0, max = 128, step = 1, snaps = {0, 32, 64, 96, 128}})
+  items[8] = ParamItem.item("amp", "VOL", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}})
   return items
+end
+
+-- MOD ENV page (MOD category page 3): the mod envelope is a full ADSR now, so
+-- it gets the same treatment as the other envelopes -- stages on top, envelope
+-- render in the middle, DEST/DEPTH in the bottom row's cells 3 and 4.
+elasticat.mod_env_lowprofile_items = function()
+  local env_time = {lockable = true, min = 0, max = 127, step = 1}
+  return {
+    ParamItem.item("menv_attack", "ATCK", env_time),
+    ParamItem.item("menv_decay", "DECAY", env_time),
+    ParamItem.item("menv_sustain", "SUST", env_time),
+    ParamItem.item("menv_release", "REL", env_time),
+    ParamItem.item("menv_dest", "DEST", {lockable = false, options = 10}),
+    ParamItem.item("menv_depth", "DEPTH", {lockable = true, min = 0, max = 128, step = 1, snaps = {0, 32, 64, 96, 128}})
+  }
 end
 
 -- FILTER page 1: the active machine's p-lockable macro row (Type/Cutoff/Res/
@@ -1544,6 +1562,8 @@ local function page_items_for(category, page, page_index)
     return elasticat.filter_lowprofile_items()
   elseif category == "filter" and page_index == 2 then
     return elasticat.filter_env_lowprofile_items()
+  elseif category == "mod" and page_index == 3 then
+    return elasticat.mod_env_lowprofile_items()
   elseif category == "fx" and page_index == 1 then
     return fx_slot_items("fx_insert1_machine", nil)
   elseif category == "fx" and page_index == 3 then
@@ -1706,7 +1726,12 @@ local function visual_param_value(param_id, fallback)
   if active_step_lock_bases[lock_id] ~= nil then
     return active_step_lock_bases[lock_id]
   end
-  return params:lookup_param(ui_id(param_id)) ~= nil and params:get(ui_id(param_id)) or fallback
+  -- param_exists, not a bare lookup_param: this resolver is handed to the page
+  -- renderers, which ask for ids that need not exist on every page (e.g. the
+  -- envelope renderer reads <prefix>hold for all three envelopes, but the mod
+  -- env is ADSR-only and has no menv_hold). An unknown id must read as "use
+  -- the fallback", never throw and blank the page.
+  return elasticat.param_exists(ui_id(param_id)) and params:get(ui_id(param_id)) or fallback
 end
 
 local function loop_phase_rate(start_point, end_point)
@@ -1872,6 +1897,18 @@ local function draw_root_page()
     -- Owner low-profile filter redesign (elasticat-design-images/filterDesign.png).
     draw_page_header(title, page_index)
     page_render:draw_filter_page(items, nav:clamp_current_group(), playing)
+    return
+  end
+
+  if nav:current_category() == "amp" and page_index == 1 then
+    draw_page_header(title, page_index)
+    page_render:draw_amp_page(items, nav:clamp_current_group())
+    return
+  end
+
+  if nav:current_category() == "mod" and page_index == 3 then
+    draw_page_header(title, page_index)
+    page_render:draw_mod_env_page(items, nav:clamp_current_group())
     return
   end
 
@@ -3104,10 +3141,28 @@ function redraw()
   screen.font_face(1)
   screen.font_size(8)
 
+  -- Draw the page defensively. A Lua error inside a page draw used to abort
+  -- redraw() silently: the screen kept whatever frame was drawn last, so the
+  -- page looked like it simply never appeared (and cycling looked like it
+  -- skipped a page). Now the error is shown on the screen and printed once.
+  local ok, err
   if nav.settings_layer then
-    draw_settings_page()
+    ok, err = pcall(draw_settings_page)
   else
-    draw_root_page()
+    ok, err = pcall(draw_root_page)
+  end
+  if not ok then
+    local text = tostring(err)
+    if elasticat.last_draw_error ~= text then
+      elasticat.last_draw_error = text
+      print("elasticat: page draw error: " .. text)
+    end
+    screen.level(15)
+    screen.move(0, 30)
+    screen.text("PAGE ERROR")
+    screen.level(4)
+    screen.move(0, 40)
+    screen.text_trim(text:gsub("^.*/", ""), 128)
   end
 
   -- Pattern-name pop-up + FN+Pattern quantize-mode pop-up: screen-only

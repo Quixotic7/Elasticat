@@ -41,6 +41,10 @@ local page_model = {
           item("live_performance_mode", "LPRF", {binary = true, min = 0, max = 1, step = 1}),
           item("step_preview", "PREV", {binary = true, min = 0, max = 1, step = 1}),
           item("live_step_trig", "LTRG", {binary = true, min = 0, max = 1, step = 1}),
+          -- How many track chains the engine runs (1-8). The row-4 track keys
+          -- report "Track N off" above this count, so it needs to be reachable
+          -- without digging into the norns PARAMS menu.
+          item("active_track_count", "ACTIVE TRACKS", {min = 1, max = 8, step = 1}),
           item("debug", "DBG", {options = 4})
         }
       },
@@ -364,12 +368,17 @@ local page_model = {
         }
       },
       {
+        -- Resolved in page_items_for (elasticat.mod_env_lowprofile_items): a
+        -- full ADSR on top, DEST/DEPTH in the bottom row. This static list is
+        -- the fallback and keeps the ids discoverable.
         title = "MOD ENV",
         items = {
+          item("menv_attack", "ATCK", {lockable = true, min = 0, max = 127, step = 1}),
+          item("menv_decay", "DECAY", {lockable = true, min = 0, max = 127, step = 1}),
+          item("menv_sustain", "SUST", {lockable = true, min = 0, max = 127, step = 1}),
+          item("menv_release", "REL", {lockable = true, min = 0, max = 127, step = 1}),
           item("menv_dest", "DEST", {lockable = false, options = 10}),
-          item("menv_attack", "ATK", {lockable = true, min = 0, max = 127, step = 1}),
-          item("menv_decay", "DEC", {lockable = true, min = 0, max = 127, step = 1}),
-          item("menv_depth", "DEP", {lockable = true, min = 0, max = 128, step = 1, snaps = {0, 32, 64, 96, 128}})
+          item("menv_depth", "DEPTH", {lockable = true, min = 0, max = 128, step = 1, snaps = {0, 32, 64, 96, 128}})
         }
       },
       -- MACRO page: the 4 macro VALUE knobs (0-127, p-lockable). Each macro's

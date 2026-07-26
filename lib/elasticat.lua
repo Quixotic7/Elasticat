@@ -198,6 +198,14 @@ local function trim_bounds(slot)
   return trim_start, trim_end, duration
 end
 
+-- Which track the facade's live-gesture calls (set_loop_region, note_on,
+-- play, set_pitch, trigger_slice, ...) address. 1 = the existing unprefixed
+-- path, byte-for-byte unchanged. Set by the coordinator on track selection.
+-- Declared here, above its first reader (set_active_range), NOT down with the
+-- tr_call helpers: a local is only in scope for code that follows it, so a
+-- later declaration made this read a nil global and threw on every step.
+local engine_track = 1
+
 -- Active Range override: the three-layer model the loop region also uses. Track
 -- Range = the range_start/range_end params (what the Range page edits, never
 -- touched by step locks). Step Range = a triggering step's range lock, pushed
@@ -597,10 +605,6 @@ local TR_COMMAND_ALIASES = {
 }
 local tr_warned = {}
 local track_prefix = "elasticat_"
--- Which track the facade's live-gesture calls (set_loop_region, note_on,
--- play, set_pitch, trigger_slice, ...) address. 1 = the existing unprefixed
--- path, byte-for-byte unchanged. Set by the coordinator on track selection.
-local engine_track = 1
 
 local function tr_command_name(name)
   local candidates = TR_COMMAND_ALIASES[name]
@@ -936,6 +940,7 @@ resend_menv_times = function()
   end
   queue_engine_call(ids.menv_attack, "menvAttack", env_value_to_seconds(params:get(ids.menv_attack)))
   queue_engine_call(ids.menv_decay, "menvDecay", env_value_to_seconds(params:get(ids.menv_decay)))
+  queue_engine_call(ids.menv_release, "menvRelease", env_value_to_seconds(params:get(ids.menv_release)))
 end
 
 -- Coalesced (12Hz) version of update_engine_loop_points -- used when re-mapping
@@ -1307,6 +1312,8 @@ function elasticat.sync_mod()
   engine_call("menvDest", (params:get(ids.menv_dest) or 1) - 1)
   engine_call("menvAttack", env_value_to_seconds(params:get(ids.menv_attack)))
   engine_call("menvDecay", env_value_to_seconds(params:get(ids.menv_decay)))
+  engine_call("menvSustain", util.clamp((params:get(ids.menv_sustain) or 100) / 127, 0, 1))
+  engine_call("menvRelease", env_value_to_seconds(params:get(ids.menv_release)))
   engine_call("menvDepth", ((params:get(ids.menv_depth) or 64) - 64) / 64)
   for m = 1, 4 do
     engine_call("macroBase", m, (params:get(ids["macro" .. m .. "_value"]) or 0) / 127)
@@ -1804,6 +1811,8 @@ function elasticat.params(options)
   ids.menv_dest = param_id(prefix, "menv_dest")
   ids.menv_attack = param_id(prefix, "menv_attack")
   ids.menv_decay = param_id(prefix, "menv_decay")
+  ids.menv_sustain = param_id(prefix, "menv_sustain")
+  ids.menv_release = param_id(prefix, "menv_release")
   ids.menv_depth = param_id(prefix, "menv_depth")
 
   -- 4 macros: each a value knob (p-lockable) + a signed matrix depth to each of
@@ -2031,7 +2040,9 @@ function elasticat.params(options)
   -- (ADSR) forever until the next trigger. Default AHR is 0 / INF / 0 -- an
   -- instant attack that holds full, i.e. a continuous drone.
   add_control(ids.env_release, "env release",
-    cs.new(0, 128, "lin", 1, 0, "", 1 / 128),
+    -- Default 128 = INF: a new project should sustain until note-off rather
+    -- than cutting the tail immediately.
+    cs.new(0, 128, "lin", 1, 128, "", 1 / 128),
     function(x) queue_engine_call(ids.env_release, "envRelease", env_value_to_seconds(x)) end,
     format_env_time)
 
@@ -2676,7 +2687,7 @@ function elasticat.params(options)
   end
 
   -- 14 LFO/mod-env params + 24 macro params (4 x [value + 5 matrix depths]) = 38.
-  params:add_group(param_id(prefix, "group_mod"), "modulation", 38)
+  params:add_group(param_id(prefix, "group_mod"), "modulation", 40)
 
   register_lfo_params({
     dest = ids.lfo1_dest,
@@ -2710,6 +2721,15 @@ function elasticat.params(options)
   add_control(ids.menv_decay, "mod env decay",
     cs.new(0, 127, "lin", 1, 64, "", 1 / 127),
     function(x) queue_engine_call(ids.menv_decay, "menvDecay", env_value_to_seconds(x)) end,
+    format_env_time)
+
+  add_control(ids.menv_sustain, "mod env sustain",
+    cs.new(0, 127, "lin", 1, 100, "", 1 / 127),
+    function(x) queue_engine_call(ids.menv_sustain, "menvSustain", util.clamp(x / 127, 0, 1)) end)
+
+  add_control(ids.menv_release, "mod env release",
+    cs.new(0, 127, "lin", 1, 48, "", 1 / 127),
+    function(x) queue_engine_call(ids.menv_release, "menvRelease", env_value_to_seconds(x)) end,
     format_env_time)
 
   add_control(ids.menv_depth, "mod env depth",
