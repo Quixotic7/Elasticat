@@ -154,7 +154,10 @@ function ProjectStore:serialize()
     patterns = patterns,
     globals = globals,
     pool = pool,
-    pool_slot = pool_slot
+    pool_slot = pool_slot,
+    -- A/B crossfader scenes (PRD §6.6). Without these a saved project lost
+    -- every scene lock -- the morph is part of the project, not the session.
+    scenes = self.opts.capture_scenes ~= nil and self.opts.capture_scenes() or nil
   }
 end
 
@@ -174,6 +177,12 @@ function ProjectStore:deserialize(data)
   end
   if self.pattern_store ~= nil and type(data.patterns) == "table" then
     self.pattern_store:deserialize(data.patterns)
+  end
+  -- A/B scenes. Applied AFTER patterns/globals so the scene bases sit on top of
+  -- the restored values. Projects saved before scenes were stored have no
+  -- `scenes` key: reset to empty rather than inheriting the previous project's.
+  if self.opts.apply_scenes ~= nil then
+    self.opts.apply_scenes(type(data.scenes) == "table" and data.scenes or nil)
   end
 end
 

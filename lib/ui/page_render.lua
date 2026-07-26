@@ -35,6 +35,12 @@ local FILTER_REND_Y = 23       -- bar render region top
 local FILTER_REND_H = 41       -- ... to y=63
 local FILTER_BARS = 42
 local FILTER_BAR_STEP = 3      -- 2px bar + 1px gap; bar i (1..42) at x = 3*i
+-- FILTER ENV page: low-profile params top AND bottom, envelope bars between,
+-- same bar grid/width as the filter render but shorter (y23..y51).
+local FENV_ROW_TOP_Y = 11
+local FENV_ROW_BOTTOM_Y = 53
+local FENV_REND_Y = 23
+local FENV_REND_H = 29
 
 -- FX slot pages (fx category pages 1/3/4/5): identity-banner label + the
 -- machine-selector param each page's widget reads. Page 2 (SENDS) has its own
@@ -617,7 +623,7 @@ end
 
 -- One low-profile param cell (owner redesign). `index` 0-3 places it in the
 -- 4-up row at y = FILTER_ROW_Y.
-function PageRender:draw_low_profile_cell(item, index, selected)
+function PageRender:draw_low_profile_cell(item, index, selected, row_y)
   if item == nil or item.blank then
     return
   end
@@ -630,7 +636,7 @@ function PageRender:draw_low_profile_cell(item, index, selected)
   local locked = pv:item_locked(item)
   LowProfile.draw({
     x = LowProfile.cell_x(index),
-    y = FILTER_ROW_Y,
+    y = row_y or FILTER_ROW_Y,
     label = item.short or item.id,
     display_value = tostring(pv:item_display_value(item) or ""),
     editing = pv:item_value_flashing(item),
@@ -710,6 +716,149 @@ function PageRender:draw_filter_bars(items, playing)
   screen.level(12)
   for _, b in ipairs(bright) do screen.rect(b.x, b.top, 2, b.h) end
   screen.fill()
+end
+
+-- Envelope amplitude (0..1) at normalized time u (0..1), for the bar render.
+-- Stage widths mirror draw_env_shape's proportions so the bars read like the
+-- old polyline. Returns amp, stage -- the stage name lets the caller brighten
+-- the region the selected K2/K3 pair is editing.
+-- AHR treats hold/release >= 128 as INF (holds to the end of the window).
+-- Envelope as an explicit list of BARS ({amp, stage} per bar). Allocating bar
+-- counts directly -- rather than normalizing stage times -- is what lets the
+-- render honour hard visual rules that proportional scaling cannot:
+--   * ATTACK is never narrower than 1 bar, so a 0 attack still shows the
+--     instant jump to peak instead of rendering nothing.
+--   * ATTACK+DECAY together never exceed half the width, and RELEASE never
+--     exceeds the other half, so a long release stops squeezing the attack.
+--   * SUSTAIN keeps at least 1 bar (it is a level; it needs somewhere to sit).
+--   * A stage set to 0 gets 0 bars = a genuine cliff. With every AHR stage at
+--     0 only the single attack bar renders -- no phantom release slope.
+local function env_bars(mode, a, d, s, hd, r, n)
+  local half = floor(n / 2)
+  local sus = min(max(s / 127, 0), 1)
+  local function span(v, maxv)
+    return floor((v / maxv) * half + 0.5)
+  end
+
+  local out = {}
+  -- Sample each stage at k = i/count, so a stage ENDS exactly on its target
+  -- and never repeats the value the previous stage already drew. A 1-bar
+  -- attack therefore lands straight on the peak (k = 1), and a decay/release
+  -- starts descending immediately instead of echoing the peak for a bar.
+  local function push(count, from, to, stage)
+    for i = 1, count do
+      local k = i / count
+      out[#out + 1] = {amp = from + ((to - from) * k), stage = stage}
+    end
+  end
+
+  if mode == 1 then  -- ADSR
+    local a_b, d_b = span(a, 127), span(d, 127)
+    if a_b + d_b > half then           -- keep attack+decay inside the left half
+      local scale = half / (a_b + d_b)
+      a_b, d_b = floor(a_b * scale), floor(d_b * scale)
+    end
+    a_b = max(1, a_b)                  -- attack always visible
+    local r_b = (r >= 128) and 0 or min(span(r, 127), half)
+    local s_b = n - a_b - d_b - r_b
+    if s_b < 1 then                    -- sustain keeps at least one bar
+      local need = 1 - s_b
+      local take = min(need, r_b); r_b = r_b - take; need = need - take
+      if need > 0 then
+        take = min(need, d_b); d_b = d_b - take; need = need - take
+      end
+      if need > 0 then a_b = max(1, a_b - need) end
+      s_b = n - a_b - d_b - r_b
+    end
+    push(a_b, 0, 1, "attack")
+    push(d_b, 1, sus, "decay")
+    push(s_b, sus, sus, "sustain")
+    push(r_b, sus, 0, "release")
+  else  -- AHR
+    local a_b = max(1, min(span(a, 127), half))
+    if hd >= 128 then                  -- INF hold: stays open to the end
+      push(a_b, 0, 1, "attack")
+      push(n - a_b, 1, 1, "hold")
+    elseif r >= 128 then               -- INF release: holds after the hold
+      local h_b = min(span(hd, 128), n - a_b)
+      push(a_b, 0, 1, "attack")
+      push(h_b, 1, 1, "hold")
+      push(n - a_b - h_b, 1, 1, "release")
+    else
+      local h_b = min(span(hd, 128), half)
+      local r_b = min(span(r, 128), half)
+      push(a_b, 0, 1, "attack")
+      push(h_b, 1, 1, "hold")
+      push(r_b, 1, 0, "release")
+      -- Anything left is past the end of the envelope: silence, not a slope.
+    end
+  end
+
+  while #out > n do
+    out[#out] = nil
+  end
+  return out
+end
+
+-- FILTER ENV page: the envelope drawn on the same 2px-bar grid as the filter
+-- render, between a top and bottom low-profile param row. Bars covering the
+-- stage(s) the selected pair edits are brightened (the direct-editing cue that
+-- replaced the old polyline handles).
+function PageRender:draw_filter_env_bars(items, sel_lo)
+  local mode = floor(self.value("filter_env_mode", 2) + 0.5)
+  local a = self:item_value(items, "filter_env_attack", 0)
+  local d = self:item_value(items, "filter_env_decay", 0)
+  local s = self:item_value(items, "filter_env_sustain", 127)
+  local hd = self:item_value(items, "filter_env_hold", 0)
+  local r = self:item_value(items, "filter_env_release", 0)
+
+  -- Which stages the selected pair is editing (id -> stage name).
+  local hot = {}
+  for i = sel_lo, sel_lo + 1 do
+    local it = items[i]
+    local stage = it ~= nil and id_to_stage(it.id) or nil
+    if stage ~= nil then
+      hot[stage] = true
+    end
+  end
+
+  local base = FENV_REND_Y + FENV_REND_H - 1
+  local bars = env_bars(mode, a, d, s, hd, r, FILTER_BARS)
+  local dim, bright = {}, {}
+  for i = 1, #bars do
+    local bar = bars[i]
+    local bh = floor(min(max(bar.amp, 0), 1) * (FENV_REND_H - 1) + 0.5)
+    if bh >= 1 then
+      local dest = hot[bar.stage] and bright or dim
+      dest[#dest + 1] = {x = FILTER_BAR_STEP * i, top = base - bh + 1, h = bh}
+    end
+  end
+
+  screen.level(6)
+  for _, b in ipairs(dim) do screen.rect(b.x, b.top, 2, b.h) end
+  screen.fill()
+  screen.level(12)
+  for _, b in ipairs(bright) do screen.rect(b.x, b.top, 2, b.h) end
+  screen.fill()
+
+  -- No ADSR/AHR label here: it overlapped the bars and the shape already says
+  -- which envelope type is active.
+end
+
+-- Full FILTER page 2. items 1-4 fill the TOP low-profile row (the env stages;
+-- AHR leaves the 4th blank), items 5-6 the BOTTOM row's cells 3 and 4
+-- (DRIVE, DEPTH) -- kept adjacent in the list so K2/K3 never lands on an
+-- all-blank pair.
+function PageRender:draw_filter_env_page(items, group)
+  local sel_lo = ((group or 1) - 1) * 2 + 1
+  for i = 1, 4 do
+    self:draw_low_profile_cell(items[i], i - 1, i == sel_lo or i == sel_lo + 1, FENV_ROW_TOP_Y)
+  end
+  for i = 5, 6 do
+    -- item 5 -> bottom cell index 2, item 6 -> 3 (positions 3 and 4).
+    self:draw_low_profile_cell(items[i], i - 3, i == sel_lo or i == sel_lo + 1, FENV_ROW_BOTTOM_Y)
+  end
+  self:draw_filter_env_bars(items, sel_lo)
 end
 
 -- Full FILTER page 1: low-profile param row + bar render. The coordinator has

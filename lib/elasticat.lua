@@ -433,6 +433,13 @@ end
 -- /elasticat/mod. Stored here so the UI's "actual value" bars and the filter
 -- render can follow LFOs / mod-env / macros during playback.
 local mod_live = {pitch = 0, cutoff = 0, res = 0, amp = 0, pan = 0}
+-- The filter envelope's own cutoff contribution, in SEMITONES. It is applied
+-- inside the filter synth (not on a mod bus), so it arrives on its own feed.
+local filter_env_semitones = 0
+
+function elasticat.set_filter_env_mod(semitones)
+  filter_env_semitones = tonumber(semitones) or 0
+end
 
 function elasticat.set_mod_values(pitch, cutoff, res, amp, pan)
   mod_live.pitch = tonumber(pitch) or 0
@@ -471,7 +478,12 @@ function elasticat.mod_offset_for(suffix)
   if key == nil then
     return 0
   end
-  return (mod_live[key] or 0) * (MOD_UNIT_SCALE[suffix] or 0)
+  local offset = (mod_live[key] or 0) * (MOD_UNIT_SCALE[suffix] or 0)
+  if suffix == "filter_cutoff" then
+    -- Fold in the filter envelope's own sweep (already in semitones).
+    offset = offset + (filter_env_semitones * CUTOFF_UNITS_PER_SEMITONE)
+  end
+  return offset
 end
 
 -- Multiplicative amp modulation (tremolo), for the VOL bar.

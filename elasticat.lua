@@ -91,7 +91,8 @@ local quiet_osc_paths = {
   ["/elasticat/transport"] = true,
   ["/elasticat/pool/slot/active"] = true,
   -- 15Hz live-modulation feed: never log it (it would flood maiden).
-  ["/elasticat/mod"] = true
+  ["/elasticat/mod"] = true,
+  ["/elasticat/filterEnv"] = true
 }
 local status = {
   phase = 0,
@@ -99,8 +100,38 @@ local status = {
   frames = 0,
   amp_l = 0,
   amp_r = 0,
-  derived_bpm = 0
+  derived_bpm = 0,
+  menu_was_active = false
 }
+
+-- Leaving the norns system menu with K1 hands the script no key-UP for that
+-- press (the menu consumed it), so FN stayed latched on until you pressed and
+-- released K1 again. Called every redraw tick: on the menu->script transition,
+-- clear both FN mirrors. Lives on the module table because the main chunk is
+-- at LuaJIT's 200-local ceiling and init() at its 60-upvalue ceiling -- the
+-- redraw metro reaches it through the existing `elasticat` upvalue.
+-- ---- Quick undo (grid NO key) ---------------------------------------------
+-- Records the state BEFORE a change so NO can put it back. Two kinds:
+--   param     -- one param's previous value (encoder edits, settings edits)
+--   crossfade -- every morph param's previous value + the fader position, so
+--                one press undoes a whole crossfader move. Without this,
+--                brushing the crossfader with scenes mapped silently
+--                overwrote the values you had just dialed in.
+-- Gesture-coalesced by the Undo module, so a continuous encoder turn or fader
+-- glide is ONE undo step, not one per detent/tick.
+elasticat.undo = include("lib/undo").new({now = util.time})
+
+elasticat.sync_menu_fn_state = function()
+  local menu_active = norns.menu ~= nil and norns.menu.status() == true
+  if status.menu_was_active and not menu_active then
+    alt = false
+    if grid_ui ~= nil then
+      grid_ui.fn_down = false
+    end
+    redraw_pending = true
+  end
+  status.menu_was_active = menu_active
+end
 local phase_report_ignore_until = 0
 local active_step_lock_bases = {}
 local active_step_lock_ids = {}
@@ -729,6 +760,81 @@ end
 -- (below) can cheaply reject non-morphable params -- notably `crossfade`
 -- itself (PRD §6.6 requirement 2 put it on the same MASTER page as other
 -- morphable controls): a scene must never capture the fader that morphs it.
+-- Snapshot the value of one param before it is edited.
+elasticat.undo_record_param = function(item)
+  local suffix = item ~= nil and item.id or nil
+  if suffix == nil or item.blank or elasticat.undo == nil then
+    return
+  end
+  local full_id = ui_id(suffix)
+  if not elasticat.param_exists(full_id) then
+    return
+  end
+  elasticat.undo:record("param:" .. full_id, function()
+    local ok, value = pcall(function() return params:get(full_id) end)
+    if not ok or type(value) ~= "number" then
+      return nil
+    end
+    return {kind = "param", label = item.short or suffix,
+            values = {[full_id] = value}}
+  end)
+end
+
+-- Snapshot every morph target + the fader position before a crossfade move.
+elasticat.undo_record_crossfade = function()
+  if elasticat.undo == nil or scene_store == nil then
+    return
+  end
+  elasticat.undo:record("crossfade", function()
+    local values = {}
+    for _, suffix in ipairs(morph_param_suffixes()) do
+      local full_id = id(suffix)
+      if elasticat.param_exists(full_id) then
+        local ok, value = pcall(function() return params:get(full_id) end)
+        if ok and type(value) == "number" then
+          values[full_id] = value
+        end
+      end
+    end
+    return {kind = "crossfade", label = "XFADE", values = values,
+            position = scene_store:position_value()}
+  end)
+end
+
+-- NO key: undo the most recent recorded change.
+elasticat.undo_apply = function()
+  local entry = elasticat.undo ~= nil and elasticat.undo:pop() or nil
+  if entry == nil then
+    show_message("Nothing to undo")
+    return
+  end
+  -- Crossfade: put the fader back first (that re-morphs from the scenes), then
+  -- overwrite with the captured values so the restore is exact even if a scene
+  -- base changed in between.
+  if entry.kind == "crossfade" and entry.position ~= nil and scene_store ~= nil then
+    scene_store:apply(entry.position)
+  end
+  for full_id, value in pairs(entry.values or {}) do
+    if elasticat.param_exists(full_id) then
+      params:set(full_id, value)
+      -- Follow the scene base too. The low-profile cell's VALUE bar reads the
+      -- scene base when one exists (that is what keeps it still under the
+      -- crossfader), so without this the value came back but its bar didn't.
+      if scene_store ~= nil and full_id:sub(1, #PREFIX) == PREFIX then
+        scene_store:update_base(full_id:sub(#PREFIX + 1), value)
+      end
+    end
+  end
+  -- Step-level entries (p-locks, trig toggles, cut/paste, copy/paste scopes)
+  -- restore through the sequencer, which owns the step records.
+  if entry.steps ~= nil and grid_ui ~= nil and grid_ui.restore_steps ~= nil then
+    grid_ui:restore_steps(entry.steps, entry.track)
+  end
+  show_message("Undo " .. (entry.label or ""))
+  request_redraw()
+end
+
+
 local morph_suffix_set_cache = nil
 local function is_morph_suffix(suffix)
   if morph_suffix_set_cache == nil then
@@ -1305,8 +1411,14 @@ elasticat.param_display_values = function(item, raw)
     end
   else
     -- Live modulation (LFOs / mod env / macros), fed from the engine at 15Hz.
-    -- Skipped while a macro key is held so the assign preview above owns the
+    -- ONLY while the transport is running: LFOs free-run in the engine, so
+    -- while stopped this made the actual bar wobble under a param you were
+    -- barely nudging. Stopped, the bar shows only the crossfade/macro layers
+    -- above. Skipped while a macro key is held so the assign preview owns the
     -- bar. AMP is multiplicative in the engine, everything else an offset.
+    if not playing then
+      return base, actual, modulated
+    end
     if suffix == "amp" then
       local factor = elasticat.mod_amp_factor()
       if math.abs(factor - 1) > 0.001 then
@@ -1342,6 +1454,36 @@ elasticat.filter_lowprofile_items = function()
     third,
     ParamItem.item("filter_env_depth", "DEPTH", {lockable = true, min = 0, max = 128, step = 1, snaps = {0, 32, 64, 96, 128}})
   }
+end
+
+-- FILTER page 2 (envelope), low-profile redesign. Items 1-4 are the TOP row --
+-- ATCK/DECAY/SUST/REL for ADSR, ATCK/HOLD/REL + blank for AHR -- and items 5-6
+-- are DRIVE/DEPTH, which the renderer places at the BOTTOM row's cells 3 and 4.
+-- Keeping them adjacent in the list (rather than padding to index 7/8) means
+-- K2/K3 never lands on an all-blank pair.
+elasticat.filter_env_lowprofile_items = function()
+  -- Safe to share now that ParamItem.item copies its opts (it used to alias
+  -- every item that shared one table into a single item).
+  local env_time = {lockable = true, min = 0, max = 127, step = 1}
+  local items
+  if param_value_or("filter_env_mode", 2) == 1 then  -- ADSR
+    items = {
+      ParamItem.item("filter_env_attack", "ATCK", env_time),
+      ParamItem.item("filter_env_decay", "DECAY", env_time),
+      ParamItem.item("filter_env_sustain", "SUST", env_time),
+      ParamItem.item("filter_env_release", "REL", {lockable = true, min = 0, max = 128, step = 1})
+    }
+  else  -- AHR
+    items = {
+      ParamItem.item("filter_env_attack", "ATCK", env_time),
+      ParamItem.item("filter_env_hold", "HOLD", {lockable = true, min = 0, max = 128, step = 1}),
+      ParamItem.item("filter_env_release", "REL", {lockable = true, min = 0, max = 128, step = 1}),
+      ParamItem.blank()
+    }
+  end
+  items[5] = ParamItem.item("filter_drive", "DRIVE", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}})
+  items[6] = ParamItem.item("filter_env_depth", "DEPTH", {lockable = true, min = 0, max = 128, step = 1, snaps = {0, 32, 64, 96, 128}})
+  return items
 end
 
 -- FX pages: each FX slot's active machine's p-lockable row (Drive/Mix, Delay's
@@ -1401,7 +1543,7 @@ local function page_items_for(category, page, page_index)
   elseif category == "filter" and page_index == 1 then
     return elasticat.filter_lowprofile_items()
   elseif category == "filter" and page_index == 2 then
-    return filter_env_items()
+    return elasticat.filter_env_lowprofile_items()
   elseif category == "fx" and page_index == 1 then
     return fx_slot_items("fx_insert1_machine", nil)
   elseif category == "fx" and page_index == 3 then
@@ -1519,6 +1661,7 @@ local function settings_delta_value(delta)
     return
   end
   local current = param_values:item_raw_value(param_item)
+  elasticat.undo_record_param(param_item)
   param_values:apply_item_value(param_item, param_values:adjusted_value(param_item, current, delta, false))
   param_values:flash_item_value(param_item)
   show_message(param_values:item_long_name(param_item) .. " " .. param_values:item_display_value(param_item))
@@ -1729,6 +1872,14 @@ local function draw_root_page()
     -- Owner low-profile filter redesign (elasticat-design-images/filterDesign.png).
     draw_page_header(title, page_index)
     page_render:draw_filter_page(items, nav:clamp_current_group(), playing)
+    return
+  end
+
+  if nav:current_category() == "filter" and page_index == 2 then
+    -- Filter envelope, same low-profile treatment: params top and bottom,
+    -- envelope drawn on the filter render's 2px bar grid between them.
+    draw_page_header(title, page_index)
+    page_render:draw_filter_env_page(items, nav:clamp_current_group())
     return
   end
 
@@ -2091,6 +2242,8 @@ local function start_redraw_metro()
   end
 
   redraw_metro = metro.init(function()
+    -- Un-stick FN if the user just exited the norns menu with K1 (see above).
+    elasticat.sync_menu_fn_state()
     -- Play the launch intro (screen logo + grid sweep) before the normal UI.
     if intro_active then
       local elapsed = util.time() - intro_start
@@ -2197,7 +2350,12 @@ function init()
     -- scene_store is assigned further down in this same init(); by the time a
     -- user can move the param (grid or encoder) init() has already finished,
     -- so the upvalue is populated (same idiom as on_project_load above).
-    on_crossfade = function(x) if scene_store ~= nil then scene_store:apply(x / 128) end end,
+    on_crossfade = function(x)
+      if scene_store ~= nil then
+        elasticat.undo_record_crossfade()
+        scene_store:apply(x / 128)
+      end
+    end,
     -- Phase 1 track scaffolding: active_track_count changed -- snap the grid's
     -- selected track back inside the new count and refresh the row-4 LEDs.
     on_active_track_count = function(_)
@@ -2358,6 +2516,7 @@ function init()
       -- just p-locked into a scene is pushed live the moment the fader is
       -- touched -- the param action's change-detection would otherwise skip it.
       if scene_store ~= nil then
+        elasticat.undo_record_crossfade()
         scene_store:apply(t)
       end
       -- Sync the MASTER-page display param SILENTLY (3rd arg true = no action):
@@ -2566,6 +2725,17 @@ function init()
     close_param_settings = function()
       nav:close_param_settings()
     end,
+    -- Grid NO outside menus: quick undo (it has no other job there).
+    undo = function()
+      elasticat.undo_apply()
+    end,
+    -- Step-scope undo: the sequencer owns the records, so it builds the
+    -- snapshot and we just hold it on the shared undo stack.
+    undo_record = function(key, build)
+      if elasticat.undo ~= nil then
+        elasticat.undo:record(key, build)
+      end
+    end,
     return_to_param_category = function(category)
       nav:return_to_param_category(category)
     end,
@@ -2616,6 +2786,23 @@ function init()
     apply_globals = apply_global_state,
     capture_pool = capture_pool_state,
     apply_pool = apply_pool_state,
+    -- A/B crossfader scenes travel with the project (PRD §6.6).
+    capture_scenes = function()
+      return scene_store ~= nil and scene_store:serialize() or nil
+    end,
+    apply_scenes = function(snapshot)
+      if scene_store == nil then
+        return
+      end
+      if snapshot ~= nil then
+        scene_store:deserialize(snapshot)
+        -- Re-apply the restored crossfade position so the loaded project SOUNDS
+        -- like it did when saved, not like its unblended pattern values.
+        scene_store:apply(scene_store:position_value())
+      else
+        scene_store:reset()  -- pre-scenes project: start clean, don't inherit
+      end
+    end,
     default_name = "untitled"
   })
   project_loading = true
@@ -2658,6 +2845,9 @@ function init()
         -- Live mod-bus values (pitch/cutoff/res/amp/pan, -1..1) at 15Hz: the
         -- UI's "actual value" bars and the filter render read these.
         elasticat.set_mod_values(args[1], args[2], args[3], args[4], args[5])
+      elseif path == "/elasticat/filterEnv" then
+        -- Filter-envelope cutoff contribution (semitones), 15Hz.
+        elasticat.set_filter_env_mod(args[1])
       elseif path == "/elasticat/transport" then
         if phase_reports_allowed() then
           set_visual_phase(args[1])
@@ -2889,12 +3079,14 @@ function enc(n, d)
     local left = nav:current_group_items()
     -- Held A/B anchor: the edit p-locks into that scene instead (PRD §6.6).
     if not scene_edit_item(left, d) then
+      elasticat.undo_record_param(left)
       param_values:delta_item(left, d)
       scene_base_follow(left)
     end
   elseif n == 3 then
     local _, right = nav:current_group_items()
     if not scene_edit_item(right, d) then
+      elasticat.undo_record_param(right)
       param_values:delta_item(right, d)
       scene_base_follow(right)
     end

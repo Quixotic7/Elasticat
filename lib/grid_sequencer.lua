@@ -272,6 +272,9 @@ function GridSequencer.new(options)
   -- copying at one scope never clobbers another (Tonverk §6.6).
   self.clipboard = {steps = nil, page = nil, pattern = nil}
   self.macro_hold = nil  -- which macro key (1-4) is held; routes E2/E3 to it
+  self.stop_held = false -- STOP held = CUT/PASTE modifier (see cut_paste_step)
+  self.stop_used = false -- ... and whether this hold shuffled any steps
+  self.cut_buffer = nil  -- the step content cut out, waiting to be pasted
   self.scene_glide_target = nil  -- fader-key glide target (0..1) while held
   self.scene_glide_metro = nil   -- reused metro that eases toward it while held
   self.g.key = function(x, y, z) self:key(x, y, z) end
@@ -634,6 +637,7 @@ end
 
 function GridSequencer:lock_held_steps(start_point, end_point, held_count)
   local did_lock = false
+  self:record_step_undo("region", self:held_step_indices(), "region")
   local machine = self:machine()
   local start_only = machine == MACHINE_LOOP and self:loop_tap_start_only(held_count)
   for step, held in pairs(self.step_holds) do
@@ -794,6 +798,7 @@ end
 
 function GridSequencer:set_held_param_lock(param_id, value)
   local did_lock = false
+  self:record_step_undo("plock:" .. tostring(param_id), self:held_step_indices(), param_id)
   for step, held in pairs(self.step_holds) do
     if held then
       local index = self:step_index(self.selected_page, step)
@@ -2237,6 +2242,11 @@ function GridSequencer:held_step_is_ghost()
 end
 
 function GridSequencer:screen_status()
+  -- CUT/PASTE mode owns the header while STOP is held, so the mode is never
+  -- silent -- it says whether the next step tap will cut or paste.
+  if self.stop_held then
+    return self.cut_buffer ~= nil and "CUT/PASTE - paste" or "CUT/PASTE - cut"
+  end
   if self.manual_region ~= nil then
     return "temp " .. format_region(self.manual_region.start_point, self.manual_region.end_point)
   end
@@ -2559,9 +2569,11 @@ function GridSequencer:key_category(category)
         self.options.close_param_settings()
       end
     else
-      if self.options.select_param_category ~= nil then
-        self.options.select_param_category(category)
-      end
+      -- While the settings layer is open a category key acts ONLY on settings:
+      -- switch to that category's settings, or (same category) cycle its
+      -- settings pages -- open_param_settings does both. It must NOT also call
+      -- select_param_category: that cycles the category's MAIN page underneath,
+      -- so leaving settings landed you on a different page than you came from.
       if self.options.open_param_settings ~= nil then
         self.options.open_param_settings(category)
       end
@@ -2571,6 +2583,93 @@ function GridSequencer:key_category(category)
   elseif self.options.select_param_category ~= nil then
     self.options.select_param_category(category)
   end
+end
+
+-- ---- Undo support for step edits ------------------------------------------
+-- Snapshot the given step INDICES of the selected track. `false` marks a step
+-- that was empty, so restoring can clear it again rather than leaving whatever
+-- the edit created.
+function GridSequencer:capture_steps(indices)
+  local snapshot = {}
+  for _, index in ipairs(indices) do
+    local record = self.seq.steps[index]
+    snapshot[index] = record ~= nil and deep_copy(record) or false
+  end
+  return snapshot
+end
+
+function GridSequencer:restore_steps(snapshot, track)
+  local state = (track ~= nil and self.tracks[track]) or self.seq
+  if state == nil or snapshot == nil then
+    return
+  end
+  for index, record in pairs(snapshot) do
+    state.steps[index] = (record ~= false) and deep_copy(record) or nil
+  end
+  self:refresh_held_step()
+  self:request_redraw()
+end
+
+-- Record a step-scope undo entry (gesture-coalesced by `key`, so holding a
+-- step and sweeping an encoder is one undo step). Built lazily -- the snapshot
+-- only happens when a new gesture actually starts.
+function GridSequencer:record_step_undo(key, indices, label)
+  if self.options.undo_record == nil or #indices == 0 then
+    return
+  end
+  local track = self.track
+  self.options.undo_record(key, function()
+    return {kind = "steps", label = label, track = track,
+            steps = self:capture_steps(indices)}
+  end)
+end
+
+-- Every step index on the selected page (for page/pattern scope entries).
+function GridSequencer:page_step_indices(page)
+  local indices = {}
+  for step = 1, 16 do
+    indices[#indices + 1] = self:step_index(page or self.selected_page, step)
+  end
+  return indices
+end
+
+function GridSequencer:held_step_indices()
+  local indices = {}
+  for step, held in pairs(self.step_holds) do
+    if held then
+      indices[#indices + 1] = self:step_index(self.selected_page, step)
+    end
+  end
+  return indices
+end
+
+-- ---- Cut / Paste mode (hold STOP) -----------------------------------------
+-- Hold STOP and tap steps to shuffle them around: tapping a step that has
+-- content CUTS it (copied to the buffer, then cleared); tapping an empty step
+-- PASTES the buffer there. The buffer survives a paste, so repeatedly tapping
+-- empty steps keeps dropping the same step in. Tapping another step with
+-- content cuts that one instead (replacing the buffer).
+function GridSequencer:cut_paste_step(step)
+  local index = self:step_index(self.selected_page, step)
+  local record = self.seq.steps[index]
+  local has_content = record ~= nil and Step.has_content(record)
+
+  self:record_step_undo("cutpaste:" .. index, {index},
+    has_content and "cut" or "paste")
+
+  if has_content then
+    self.cut_buffer = deep_copy(record)
+    self.seq.steps[index] = nil
+    self.step_edited[step] = true
+    self:message(string.format("Cut step %02d", step))
+  elseif self.cut_buffer ~= nil then
+    self.seq.steps[index] = deep_copy(self.cut_buffer)
+    self.step_edited[step] = true
+    self:message(string.format("Paste step %02d", step))
+  else
+    self:message("Nothing cut")
+  end
+  self:request_redraw()
 end
 
 -- ---- Copy / Clear / Paste (Tonverk manual §6.6/§10.10.4/§19) ---------------
@@ -2610,6 +2709,19 @@ function GridSequencer:paste_on_held_steps()
     self:message("Nothing copied")
     return
   end
+  -- Snapshot every step the paste can land on (anchor + each entry's offset).
+  local touched = {}
+  for step, down in pairs(self.step_holds) do
+    if down then
+      for _, entry in ipairs(entries) do
+        local target = step + entry.offset
+        if target >= 1 and target <= 16 then
+          touched[#touched + 1] = self:step_index(self.selected_page, target)
+        end
+      end
+    end
+  end
+  self:record_step_undo("paste_steps", touched, "paste")
   local pasted = 0
   for step, down in pairs(self.step_holds) do
     if down then
@@ -2666,6 +2778,7 @@ function GridSequencer:paste_selected_page()
     self:message("Nothing copied")
     return
   end
+  self:record_step_undo("paste_page", self:page_step_indices(), "paste page")
   for step = 1, 16 do
     self.seq.steps[self:step_index(self.selected_page, step)] =
       page[step] ~= nil and deep_copy(page[step]) or nil
@@ -2674,6 +2787,7 @@ function GridSequencer:paste_selected_page()
 end
 
 function GridSequencer:clear_selected_page()
+  self:record_step_undo("clear_page", self:page_step_indices(), "clear page")
   for step = 1, 16 do
     self.seq.steps[self:step_index(self.selected_page, step)] = nil
   end
@@ -2719,6 +2833,30 @@ function GridSequencer:key_controls(x, z)
     self.fn_down = z == 1
     return
   end
+
+  -- STOP doubles as the CUT/PASTE modifier (hold it, tap steps). Its transport
+  -- action therefore fires on RELEASE, and only if the hold wasn't used to
+  -- shuffle steps -- so a tap still stops, but shuffling never kills playback.
+  if x == 5 and not any_keys(self.step_holds) then
+    if z == 1 then
+      self.stop_held = true
+      self.stop_used = false
+      self:request_redraw()
+      return
+    end
+    self.stop_held = false
+    local used = self.stop_used
+    self.stop_used = false
+    self:request_redraw()
+    if used then
+      return
+    end
+    if self.options.set_playing ~= nil then
+      self.options.set_playing(false, true)
+    end
+    return
+  end
+
   if z ~= 1 or (x ~= 3 and x ~= 4 and x ~= 5) then
     return
   end
@@ -2801,6 +2939,16 @@ function GridSequencer:key_navigation(x, y)
       if self.options.param_settings_value_delta ~= nil then
         self.options.param_settings_value_delta(1)
       end
+    end
+    return
+  end
+
+  -- NO outside the settings layer / menus: quick undo. It has no other job
+  -- here, and it is the escape hatch for "I brushed the crossfader and lost
+  -- the values I had just dialed in".
+  if x == 11 and y == 7 then
+    if self.options.undo ~= nil then
+      self.options.undo()
     end
     return
   end
@@ -3223,6 +3371,14 @@ function GridSequencer:key_slice_control(x, y, z)
 end
 
 function GridSequencer:key_step_row(x, z)
+  -- CUT/PASTE mode (STOP held) owns the step row entirely.
+  if self.stop_held then
+    if z == 1 then
+      self.stop_used = true
+      self:cut_paste_step(x)
+    end
+    return
+  end
   if z == 1 then
     self.step_holds[x] = true
     self.step_press_time[x] = util.time()
@@ -3266,6 +3422,10 @@ function GridSequencer:key_step_row(x, z)
     self.loop_tap_key = nil
     self.loop_tap_kind = nil
     if was_quick_press and not was_edited then
+      -- Snapshot BEFORE the toggle so undo can bring back a step you just
+      -- tapped away (the whole record, p-locks included).
+      local index = self:step_index(self.selected_page, x)
+      self:record_step_undo("toggle:" .. index, {index}, "step " .. string.format("%02d", x))
       if self.fn_down then
         self:toggle_ghost_step(self.selected_page, x)
       else
@@ -3483,7 +3643,9 @@ function GridSequencer:draw_normal_leds()
   self.g:led(1, 1, self:pressed_level(1, 1, 3))
   self.g:led(3, 1, self:pressed_level(3, 1, self.recording and 12 or 3))
   self.g:led(4, 1, self:pressed_level(4, 1, self.playing and 13 or 4))
-  self.g:led(5, 1, self:pressed_level(5, 1, self.playing and 4 or 13))
+  -- STOP is full-bright while held as the CUT/PASTE modifier.
+  self.g:led(5, 1, self:pressed_level(5, 1,
+    self.stop_held and 15 or (self.playing and 4 or 13)))
   self:draw_category_keys()
 
   if is_slice_machine(self:machine()) then

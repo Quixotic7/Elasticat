@@ -22,6 +22,7 @@ Engine_Elasticat : CroneEngine {
 	var scriptAddress;
 	var statusResponder;
 	var modResponder;      // live mod-bus values -> script (~15Hz UI feed)
+	var filterEnvResponder; // filter-env cutoff contribution -> script (15Hz)
 	var transportResponder;
 	var modeSynthNames;
 	var modeNames;
@@ -428,6 +429,13 @@ Engine_Elasticat : CroneEngine {
 			]);
 		}, path: '/elasticat/modRaw', srcID: server.addr);
 
+		// Filter-envelope cutoff contribution (semitones) -> script, so the UI can
+		// show the filter's own envelope sweeping the render.
+		filterEnvResponder = OSCFunc({
+			arg msg;
+			scriptAddress.sendBundle(0, ["/elasticat/filterEnv", msg[3].asFloat]);
+		}, path: '/elasticat/filterEnvRaw', srcID: server.addr);
+
 		// Voices (transport + readers + slices) live in sourceGroup and sum onto
 		// fxBus; the global filter reads fxBus in filterGroup (after sourceGroup)
 		// and writes into insertBus; Insert 1 reads insertBus in insertGroup
@@ -522,6 +530,12 @@ Engine_Elasticat : CroneEngine {
 			// (36 semitones) on top -- both exponential, summed in semitones.
 			fc = (Lag.kr(cutoff.clip(20, 20000), 0.01)
 				* ((envDepth.clip(-1, 1) * fenv * 72) + (In.kr(cutoffModBus, 1).clip(-1, 1) * 36)).midiratio).clip(20, 20000);
+			// Report the FILTER ENVELOPE's own cutoff contribution (in semitones)
+			// to the script at 15Hz. It is applied here rather than on a mod bus,
+			// so the UI's filter render/actual-value bars could not see it
+			// otherwise. Only one filter synth runs at a time, so this fires once.
+			SendReply.kr(Impulse.kr(15), '/elasticat/filterEnvRaw',
+				[envDepth.clip(-1, 1) * fenv * 72]);
 			// RES destination: -1..1 mod adds +/-0.5 to the 0..1 resonance.
 			resMod = (res.clip(0, 1) + (In.kr(resModBus, 1).clip(-1, 1) * 0.5)).clip(0, 1);
 			rq = Lag.kr((1 - (resMod * 0.98)).clip(0.02, 1), 0.01);
@@ -3166,6 +3180,7 @@ Engine_Elasticat : CroneEngine {
 		this.releaseAllSlices;
 		if(statusResponder.notNil, { statusResponder.free; });
 		if(modResponder.notNil, { modResponder.free; });
+		if(filterEnvResponder.notNil, { filterEnvResponder.free; });
 		if(transportResponder.notNil, { transportResponder.free; });
 		if(previewSynth.notNil, { previewSynth.free; });
 		if(modSynth.notNil, { modSynth.free; });

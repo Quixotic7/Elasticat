@@ -27,7 +27,7 @@ keys. `-` = unused/reserved.
 | 1,1 | FN | Hold = modifier (= norns K1). |
 | 3,1 | REC | Toggle record-armed indicator. With a scope held (below): COPY. |
 | 4,1 | PLAY | Toggle play/pause, no reset. With a scope held: CLEAR. |
-| 5,1 | STOP | Stop, reset to step 1. With a scope held: PASTE. |
+| 5,1 | STOP | Tap = stop + reset to step 1 (fires on release). **Hold = CUT/PASTE mode** (below). With a step held: PASTE. |
 | 7,1 | MST | MASTER category. |
 | 8,1 | FILE | FILE category. |
 | 9,1 | PAT | PATTERN category. |
@@ -83,7 +83,7 @@ once: start+end from their span.
 | 13,6 | UP | Settings nav up; with PAGE held = Page-Select mode. |
 | 16,6 | FILL | Hold = momentary Fill. FN+press = latch Fill on/off. |
 | 1,7-8,7 | C D E F G A B C+1 | White keys (one octave + root above). |
-| 11,7 | NO | Cancel (= K2). |
+| 11,7 | NO | Cancel in menus/dialogs (= K2). **Outside menus: quick UNDO** — see below. |
 | 12,7 | LEFT | Settings nav left/value-; with PAGE held = Pattern-Rate mode. |
 | 13,7 | DOWN | Settings nav down; with PAGE held = Page-Loop mode. |
 | 14,7 | RIGHT | Settings nav right/value+/confirm-on-action-row; with PAGE held = back to Page-Select. **Also**: while the pattern-load overlay is open, renames the current pattern. |
@@ -100,6 +100,41 @@ once: start+end from their span.
 | Hold + `K2`/`K3` | Clear one param's lock on that step. |
 | While PATN overlay open | Press a slot (1-16) to load that pattern. |
 | While PAGE (16,7) held | Pick page / toggle page-loop / pick rate, per the active overlay mode. |
+
+## Quick undo (NO key)
+
+Outside menus and dialogs the **NO** key (`11,7`) undoes the last value
+change — press it again to keep stepping back (16 deep).
+
+| Undoes | Restores |
+|---|---|
+| A crossfader move | every morphed parameter *and* the fader position, as they were before the move |
+| A parameter edit (encoder, any page, incl. settings) | that parameter's value before you started turning |
+| A step tapped on/off | the whole step record, parameter locks included |
+| A parameter lock (hold step + encoder / loop / pitch key) | the step's locks as they were |
+| CUT/PASTE, and copy-paste-clear of steps / pages | the affected steps |
+
+Undo works per **gesture**, not per detent: turning cutoff from 20 to 90 in
+one motion undoes straight back to 20, and a whole fader glide is a single
+step. Pausing for about a second starts a new gesture.
+
+This is the safety net for the crossfader: with scenes mapped, brushing the
+fader overwrites the values you had dialed in — NO puts them back.
+
+## CUT / PASTE mode (hold STOP)
+
+Hold **STOP** and tap steps to shuffle them around quickly. The header shows
+`CUT/PASTE` and whether the next tap will cut or paste.
+
+| Tap a step that… | Does |
+|---|---|
+| has a trig | **cuts** it — copied to the buffer, then cleared |
+| is empty | **pastes** the buffer there (the buffer stays, so you can keep dropping it) |
+
+Tapping another step that has a trig cuts that one instead, replacing the
+buffer. STOP's own transport action fires on **release**, and is skipped if the
+hold was used to shuffle — so a tap still stops, but shuffling never kills
+playback. NO undoes each cut and paste.
 
 ## Copy / Clear / Paste (Elektron-style)
 
