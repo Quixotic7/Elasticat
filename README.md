@@ -96,6 +96,19 @@ y8      1    2    3    4    5    6    7    8    9   10   11   12   13   14   15 
 | PAGE | `16,7` | Hold down to turn the step row into a page-mode overlay: pick which param page plays (Page Select), which pages loop during playback (Page Loop), or the per-page playback rate (Pattern Rate) using the up/left/down arrows above, then tap a step-row key to apply. |
 | Step row | row `y=8` | The 16 steps of the current param page. Quick tap = toggle a trig on/off. FN + quick tap = toggle a **ghost** trig (carries state forward without re-triggering). Hold a step, then turn `E2`/`E3` (or press loop/pitch keys) to parameter-lock it. Hold a step + norns `K2`/`K3` clears one lock; hold FN(`K1`) + `K2`/`K3` clears that parameter's locks across the whole pattern. |
 
+## Copy, clear, and paste
+
+Like the Elektron boxes, the REC/PLAY/STOP keys double as **COPY / CLEAR /
+PASTE** while a scope is held — each scope keeps its own buffer:
+
+- **Steps** — hold one or more steps + REC copies them (with their p-locks);
+  hold a destination step + STOP pastes, preserving the copied steps'
+  spacing; hold a step + PLAY clears its p-locks but keeps the trig.
+- **Sequencer page** — hold PAGE + REC/PLAY/STOP copies/clears/pastes the
+  selected page.
+- **Pattern** — FN + REC/PLAY/STOP copies/clears/pastes the whole pattern
+  (clear asks for confirmation and wipes trigs only).
+
 ## Norns keys and encoders
 
 | Control | Action |
@@ -333,7 +346,9 @@ place before or after Insert 1 — send levels live on FX page 2 as SEND1/SEND2
 and are p-lockable, so you can throw individual steps at a reverb or delay),
 and a **Master** insert on the final output (it colors everything, send
 returns included). Every slot picks from the same machine list, chosen in FX
-settings:
+settings, and each slot's knobs get their own FX page — Insert 1 on page 1,
+Send 1/2 on pages 3/4, Master on page 5 — showing whatever the active machine
+offers (all p-lockable):
 
 - **None** — passthrough (default; costs nothing).
 - **Drive** — tanh-style clip/saturation.

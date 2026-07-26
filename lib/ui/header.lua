@@ -111,6 +111,17 @@ function Header.draw(opts)
 
   if opts.ghost then
     Header.draw_ghost_icon(math.floor(Header.SEPARATOR_X / 2))
+  elseif opts.muted then
+    -- MUTED: invert the track-number cell (dark block, light number) -- the
+    -- standard mixer cue. A muted track is silent at the filter's amp stage,
+    -- which is downstream of the meter, so without this the screen looked
+    -- completely normal while nothing reached the outputs.
+    screen.level(0)
+    screen.rect(0, 0, Header.SEPARATOR_X, Header.HEIGHT)
+    screen.fill()
+    screen.level(Header.BACKGROUND_LEVEL)
+    screen.move(math.floor(Header.SEPARATOR_X / 2), 7)
+    screen.text_center(tostring(opts.track or 1))
   else
     screen.level(0)
     screen.move(math.floor(Header.SEPARATOR_X / 2), 7)

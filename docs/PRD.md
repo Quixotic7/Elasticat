@@ -326,12 +326,23 @@ Checklist (order within the list ≈ suggested build order):
       (drive, delay, reverb, lofi)
 - [x] Engine `noteOff` (live-held note release gates the ADSR properly)
 - [x] `tempo_varispeed` pitch implemented (rate-coupled drift on the transport phase)
-- [ ] CPU verified ≤ ~25% with filter + 3 FX active
+- [x] CPU verified ≤ ~25% with filter + 3 FX active. (Hardware-measured:
+      Loop + Morph filter + Lofi insert + Delay/Drive sends + Reverb master =
+      18-19%; PC warp ~20%; +norns system reverb 25%; +compressor 20-21%.)
 - [x] A `dust`-ready release: docs/README for strangers, sane defaults (README + docs/CONTROLS.md shipped)
+- [x] **Copy/Clear/Paste** (Tonverk-style, added to MVP scope): REC/PLAY/STOP
+      as COPY/CLEAR/PASTE with step / sequencer-page / pattern scopes, one
+      buffer per scope (see docs/CONTROLS.md). Param-page scope deferred to
+      the tracks era.
+- [x] **2 LFOs + 1 Mod Envelope** (pulled into MVP scope by owner): SC-side
+      mod bus routing to pitch/cutoff/res/amp/pan, Elektron-style params on
+      MOD pages 1-3 (DEST/WAVE/SPD/DEP/MODE x2, DEST/ATK/DEC/DEP), tempo-
+      synced rates, `lfo_reset`/`env_reset` trig locks made real (ghosts
+      carry modulation forward). First stab -- awaiting hardware ears.
 
-Explicitly **not** MVP: multitrack, mod matrix/LFOs, neighbor/input machines,
+Explicitly **not** MVP: multitrack, full mod matrix, neighbor/input machines,
 comb/ladder/formant filters, Tier-2/3 FX, convolution, MIDI mapping,
-sampling/resampling (§9).
+sampling/resampling (§9). (2 LFOs + 1 mod envelope moved INTO MVP above.)
 
 ## 9. Feature backlog (post-MVP)
 

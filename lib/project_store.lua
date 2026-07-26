@@ -235,26 +235,59 @@ function ProjectStore:load_temp()
 end
 
 -- Saved projects in the projects directory: {name=<display name, no
--- extension>, path=<full path>, filename=<basename>}, sorted by filename.
--- util.scandir is a norns stdlib function (used by fileselect and many
--- scripts); guarded so this degrades to an empty list rather than erroring
--- if it's ever unavailable (e.g. in a stub/test environment).
-function ProjectStore.list()
+-- extension>, path=<full path>, filename=<basename>}. `sort` = "date" orders
+-- newest-modified first (default, so the Load menu shows recent work on top);
+-- "name" orders alphabetically. Date order uses one `ls -t` shell call
+-- (util.os_capture) and falls back to name order where that isn't available
+-- (e.g. a stub/test environment) so this never errors.
+function ProjectStore.list(sort)
   local dir = ProjectStore.projects_dir()
-  local out = {}
-  if util.scandir == nil then
+  local ext = ProjectStore.EXTENSION
+  local ext_len = #ext
+  local filenames
+
+  if sort == "date" and util.os_capture ~= nil then
+    -- ls -t: directory contents sorted by mtime, newest first. RAW output is
+    -- required: norns' util.os_capture collapses newlines to spaces unless
+    -- raw=true, which turned the whole listing into one space-joined string
+    -- (so only a single bogus entry survived the .eproj filter).
+    filenames = {}
+    local raw = util.os_capture("ls -t " .. dir .. " 2>/dev/null", true) or ""
+    for line in raw:gmatch("[^\r\n]+") do
+      filenames[#filenames + 1] = line
+    end
+  else
+    if util.scandir == nil then
+      return {}
+    end
+    filenames = util.scandir(dir) or {}
+    table.sort(filenames)  -- name order
+  end
+
+  local function collect(list)
+    local out = {}
+    for _, filename in ipairs(list) do
+      if filename:sub(-ext_len) == ext then
+        out[#out + 1] = {
+          name = filename:sub(1, #filename - ext_len),
+          path = dir .. filename,
+          filename = filename
+        }
+      end
+    end
     return out
   end
-  local entries = util.scandir(dir) or {}
-  table.sort(entries)
-  local ext_len = #ProjectStore.EXTENSION
-  for _, filename in ipairs(entries) do
-    if filename:sub(-ext_len) == ProjectStore.EXTENSION then
-      out[#out + 1] = {
-        name = filename:sub(1, #filename - ext_len),
-        path = dir .. filename,
-        filename = filename
-      }
+
+  local out = collect(filenames)
+  -- Safety net: if the date path yielded fewer projects than the directory
+  -- actually holds (a shell/capture quirk), fall back to the name listing --
+  -- a sort order should never be able to HIDE projects.
+  if sort == "date" and util.scandir ~= nil then
+    local alpha = util.scandir(dir) or {}
+    table.sort(alpha)
+    local fallback = collect(alpha)
+    if #fallback > #out then
+      return fallback
     end
   end
   return out

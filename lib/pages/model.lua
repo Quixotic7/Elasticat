@@ -276,10 +276,8 @@ local page_model = {
       },
       {
         -- Page 2: SENDS (PRD SS3/SS8). Send 1/2 levels are the continuous,
-        -- p-lockable controls; each send's own FX machine + knobs live in the
-        -- normal params menu (registered in lib/elasticat.lua), not on the
-        -- grid, to keep this page tight -- same reasoning as Insert 1's Drive/
-        -- Mix row being the only grid-level FX exposure today.
+        -- p-lockable send amounts; each send's own FX knobs get their own page
+        -- below (SEND1 FX / SEND2 FX), keeping this page a tight mix row.
         title = "SENDS",
         items = {
           item("send1_level", "SND1", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}}),
@@ -290,6 +288,32 @@ local page_model = {
           blank(),
           blank(),
           blank()
+        }
+      },
+      {
+        -- Pages 3-5: Send 1 / Send 2 / Master insert machine rows, resolved per
+        -- each slot's machine setting in page_items_for (elasticat.lua's
+        -- fx_slot_items) with ids namespaced send1_/send2_/master_. These
+        -- static lists are the DRIVE-default fallbacks, same as page 1; a slot
+        -- on NONE resolves to no items and draws as the blank "empty" page.
+        title = "SEND1 FX",
+        items = {
+          item("send1_fx_drive", "DRIV", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}}),
+          item("send1_fx_mix", "MIX", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}})
+        }
+      },
+      {
+        title = "SEND2 FX",
+        items = {
+          item("send2_fx_drive", "DRIV", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}}),
+          item("send2_fx_mix", "MIX", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}})
+        }
+      },
+      {
+        title = "MASTER FX",
+        items = {
+          item("master_fx_drive", "DRIV", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}}),
+          item("master_fx_mix", "MIX", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}})
         }
       }
     },
@@ -307,8 +331,60 @@ local page_model = {
   },
   mod = {
     title = "MOD",
+    -- 2 LFOs + 1 mod envelope (engine-side; see Engine_Elasticat.sc's
+    -- \elasticatMod). DEP is the standard bipolar 0-128 (64 = off/center),
+    -- SPD a tempo-synced musical division, DEST routes to the engine's
+    -- per-destination mod buses. DEST/WAVE/MODE are not lockable in this
+    -- first stab; DEP/SPD/ATK/DEC are.
     pages = {
-      {title = "MOD", items = {}}
+      {
+        title = "LFO 1",
+        items = {
+          item("lfo1_dest", "DEST", {lockable = false, options = 10}),
+          item("lfo1_wave", "WAVE", {lockable = false, options = 6}),
+          item("lfo1_speed", "SPD", {lockable = true, options = 10}),
+          item("lfo1_depth", "DEP", {lockable = true, min = 0, max = 128, step = 1, snaps = {0, 32, 64, 96, 128}}),
+          item("lfo1_mode", "MODE", {lockable = false, options = 4}),
+          blank(),
+          blank(),
+          blank()
+        }
+      },
+      {
+        title = "LFO 2",
+        items = {
+          item("lfo2_dest", "DEST", {lockable = false, options = 10}),
+          item("lfo2_wave", "WAVE", {lockable = false, options = 6}),
+          item("lfo2_speed", "SPD", {lockable = true, options = 10}),
+          item("lfo2_depth", "DEP", {lockable = true, min = 0, max = 128, step = 1, snaps = {0, 32, 64, 96, 128}}),
+          item("lfo2_mode", "MODE", {lockable = false, options = 4}),
+          blank(),
+          blank(),
+          blank()
+        }
+      },
+      {
+        title = "MOD ENV",
+        items = {
+          item("menv_dest", "DEST", {lockable = false, options = 10}),
+          item("menv_attack", "ATK", {lockable = true, min = 0, max = 127, step = 1}),
+          item("menv_decay", "DEC", {lockable = true, min = 0, max = 127, step = 1}),
+          item("menv_depth", "DEP", {lockable = true, min = 0, max = 128, step = 1, snaps = {0, 32, 64, 96, 128}})
+        }
+      },
+      -- MACRO page: the 4 macro VALUE knobs (0-127, p-lockable). Each macro's
+      -- mod matrix (its signed depth to each destination) is assigned by the
+      -- gesture -- hold the macro's grid key (row 4, cols 1-4) and turn a
+      -- destination param -- not edited here, so this page is just the drivers.
+      {
+        title = "MACROS",
+        items = {
+          item("macro1_value", "M1", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}}),
+          item("macro2_value", "M2", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}}),
+          item("macro3_value", "M3", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}}),
+          item("macro4_value", "M4", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}})
+        }
+      }
     },
     settings = {}
   }

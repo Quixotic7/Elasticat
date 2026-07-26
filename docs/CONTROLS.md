@@ -10,7 +10,7 @@ y\x     1    2    3    4    5    6    7    8    9   10   11   12   13   14   15 
 y1     FN    -  REC PLAY STOP    -  MST FILE  PAT    - TRIG  SRC FILT  AMP   FX  MOD
 y2      1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16
 y3     17   18   19   20   21   22   23   24   25   26   27   28   29   30   31   32
-y4      -    -    -    -    -    -    -    -    -    -    -    -    -    -    -    -
+y4    MC1  MC2  MC3  MC4    -    -    -   T1   T2   T3   T4   T5   T6   T7   T8    -
 y5   OCT- OCT+    -    -    -    -    - PATN SC-A  xf1  xf2  xf3  xf4  xf5  xf6 SC-B
 y6      -   C#   D#    -   F#   G#   A#    -    -    -  YES    -   UP    -    - FILL
 y7      C    D    E    F    G    A    B  C+1    -    -   NO LEFT DOWN RGHT    - PAGE
@@ -25,9 +25,9 @@ keys. `-` = unused/reserved.
 | x,y | Key | Action |
 |---|---|---|
 | 1,1 | FN | Hold = modifier (= norns K1). |
-| 3,1 | REC | Toggle record-armed indicator. |
-| 4,1 | PLAY | Toggle play/pause, no reset. |
-| 5,1 | STOP | Stop, reset to step 1. |
+| 3,1 | REC | Toggle record-armed indicator. With a scope held (below): COPY. |
+| 4,1 | PLAY | Toggle play/pause, no reset. With a scope held: CLEAR. |
+| 5,1 | STOP | Stop, reset to step 1. With a scope held: PASTE. |
 | 7,1 | MST | MASTER category. |
 | 8,1 | FILE | FILE category. |
 | 9,1 | PAT | PATTERN category. |
@@ -54,6 +54,13 @@ Hold a step first, then press loop keys, to lock that step's region instead
 of moving the live one. One key: the first tap locks start+end; tap the same
 key again for start-only (end follows the track). Two or more keys held at
 once: start+end from their span.
+
+## Grid: row 4 — macros & tracks
+
+| x,y | Key | Action |
+|---|---|---|
+| 1,4-4,4 | MC1-MC4 | Macro keys (mod matrix). Hold + turn a destination param's encoder = dial that macro's signed depth to it. LED brightness tracks the macro's value. |
+| 8,4-15,4 | T1-T8 | Track select (up to ACTIVE TRACKS). Press = select; FN+press = mute. |
 
 ## Grid: row 5 — octave, pattern load, scenes
 
@@ -93,6 +100,22 @@ once: start+end from their span.
 | Hold + `K2`/`K3` | Clear one param's lock on that step. |
 | While PATN overlay open | Press a slot (1-16) to load that pattern. |
 | While PAGE (16,7) held | Pick page / toggle page-loop / pick rate, per the active overlay mode. |
+
+## Copy / Clear / Paste (Elektron-style)
+
+REC/PLAY/STOP double as COPY/CLEAR/PASTE while a scope modifier is held.
+Each scope keeps its own buffer, so a copied step never overwrites a copied
+pattern.
+
+| Scope | Copy | Clear | Paste |
+|---|---|---|---|
+| Step(s) | hold step(s) + REC | hold step + PLAY (removes p-locks, keeps the trig) | hold step + STOP |
+| Sequencer page | hold PAGE + REC (selected page) | hold PAGE + PLAY | hold PAGE + STOP |
+| Pattern | FN + REC | FN + PLAY (confirm popup; wipes trigs only) | FN + STOP |
+
+Multi-step copy: hold several steps and press REC — pasting onto a held step
+places the copies in the same relation to each other (steps that would land
+past the page edge are dropped).
 
 ## Norns panel
 
@@ -156,13 +179,15 @@ region start if it would otherwise fall outside the new region.
 
 ## FX slots
 
-| Slot | Where | Machine setting |
-|------|-------|-----------------|
-| Insert 1 | filter output -> master bus | FX settings > MACH |
-| Send 1 / Send 2 | fed by the send tap (FX settings > SEND TAP: pre- or post-Insert-1); levels on FX page 2 (SEND1/SEND2, p-lockable) | FX settings > SEND1/SEND2 MACH |
-| Master | master bus -> output (colors everything, send returns included) | FX settings > MASTER MACH |
+| Slot | Where | Machine setting | Knobs |
+|------|-------|-----------------|-------|
+| Insert 1 | filter output -> master bus | FX settings > MACH | FX page 1 |
+| Send 1 / Send 2 | fed by the send tap (FX settings > SEND TAP: pre- or post-Insert-1); levels on FX page 2 (SEND1/SEND2, p-lockable) | FX settings > SEND1/SEND2 MACH | FX pages 3/4 (SEND1 FX / SEND2 FX) |
+| Master | master bus -> output (colors everything, send returns included) | FX settings > MASTER MACH | FX page 5 (MASTER FX) |
 
-All four slots pick from the same machine list below (None = passthrough, free).
+All four slots pick from the same machine list below (None = passthrough,
+free). Each slot's page shows its active machine's knobs (a slot on None shows
+an empty page); all knobs are p-lockable and scene-morphable.
 
 ## FX machines (any slot)
 
@@ -173,6 +198,40 @@ All four slots pick from the same machine list below (None = passthrough, free).
 | 3 | Delay | TIME (beat division), FBK, TONE, MIX |
 | 4 | Reverb | SIZE, DAMP, MIX |
 | 5 | Lofi | BITS, RATE, MIX |
+
+## MOD pages (2 LFOs + mod envelope + 4 macros)
+
+| Page | Params |
+|---|---|
+| LFO 1 / LFO 2 | DEST (off/pitch/cutoff/res/amp/pan/**macro 1-4**), WAVE (sine/tri/saw/rsaw/sqr/rand), SPD (8 bar ... 1/64, tempo-synced), DEP (bipolar, 64 = off), MODE (free/trig/one/hold) |
+| MOD ENV | DEST (same list, incl. macros), ATK, DEC, DEP (bipolar) -- an AD burst per note |
+| MACROS | the 4 macro VALUE knobs (0-127, p-lockable). Each macro's mod matrix is assigned by the grid gesture below, not on this page. |
+
+DEP/SPD/ATK/DEC and every macro VAL/DEP are p-lockable. TRIG/ONE/HOLD LFO
+modes retrigger per step when the step's `LRST` (lfo_reset) resolves on; the
+mod envelope retriggers per step when `ERST` (env_reset) resolves on. Ghost
+steps retrigger nothing -- they ride the running modulation.
+
+### Macros (a per-macro mod matrix)
+
+Each of the 4 macros is its own **mod matrix**: a VALUE knob (0-127) times a
+signed depth to any of the modulation destinations (pitch, filter cutoff,
+filter res, amp/vol, pan). The macro contributes VALUE x depth to each
+destination it's assigned to, summing with the LFOs/mod-env. An LFO or the mod
+envelope can also **target a macro** (set its DEST to MACRO 1-4) to move the
+macro's VALUE -- so one macro can push many params at once, itself driven by a
+knob, an LFO, or a p-lock.
+
+**Assign a macro (the matrix):** hold its grid key (row 4, cols 1-4), then turn
+a **destination param's encoder** on its page -- `E2` for the selected pair's
+left param, `E3` for the right. That dials the macro's signed depth to that
+destination (turn up = positive, down = negative; center = off). Repeat on
+different params to build the matrix. Turning a non-modulatable param while a
+macro is held does nothing (it never edits the value).
+
+**Drive a macro (the VALUE):** on the MACROS page (p-lockable per step), or by
+pointing an LFO/mod-env's DEST at MACRO 1-4. The grid-key LED brightness tracks
+the value.
 
 ## Pattern change quantization (PATTERN settings)
 

@@ -298,6 +298,15 @@ function SourcePage:draw_waveform(opts)
   -- only when the shade actually changes (at the range boundaries), NOT once per
   -- column -- 127 screen.level calls per frame floods the norns screen command
   -- buffer and stalls the redraw metro (froze screen+grid together previously).
+  -- Which span renders bright. The SAMPLE EDITOR (File page) is deliberately
+  -- detached from the track: it shades the TRIM window (start..end) only, so
+  -- the editor never reflects the track's Range page. Every other view shades
+  -- the Actual Range that's playing.
+  local shade_lo, shade_hi = active_lo, active_hi
+  if opts.sample_edit then
+    shade_lo, shade_hi = trim_lo, trim_hi
+  end
+
   local current_level = nil
   for column = 0, width - 1 do
     local fraction = view_lo + ((view_hi - view_lo) * (column / math.max(1, width - 1)))
@@ -306,7 +315,7 @@ function SourcePage:draw_waveform(opts)
     local amp = math.max(1, math.floor((height / 2) * peak))
     local top = util.clamp(center - amp, y0, y0 + height - 1)
     local bottom = util.clamp(center + amp, y0, y0 + height - 1)
-    local level = (fraction >= active_lo and fraction <= active_hi) and 6 or 2
+    local level = (fraction >= shade_lo and fraction <= shade_hi) and 6 or 2
     if level ~= current_level then
       screen.level(level)
       current_level = level

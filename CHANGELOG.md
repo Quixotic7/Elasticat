@@ -1,5 +1,12 @@
 # Changelog
 
+## Elektron-style param page rendering (FILTER/AMP/FX visual overhaul)
+
+- New `lib/ui/page_render.lua` replaces the bare label+value cells on every generic K2/K3-pair param page (master/pattern/trig/source machine+warp/filter/amp/fx/mod) with a Digitakt-inspired layout: a faintly framed 2x4 cell grid, small dim label over a bright value per cell, a 2px position bar under every ranged value (bipolar params like PAN/MRPH/BAL/DPTH/XFD fill from center), a bright outline around the selected K2/K3 pair, label-chip inversion for held p-locks/scene locks, and value-chip inversion as the momentary edit flash. Rendering only -- the interaction model (K2/K3 pair select, E2/E3 edit, E1 page, grid category keys) is unchanged.
+- Per-category widgets fill each page's unused cell space: FILTER p1 draws the active machine's response curve (type/morph shape, cutoff position, resonance peak, stereo/MS balance as a dim ghost curve, machine name tag), FILTER p2 draws the filter envelope (AHR/ADSR, height scaled by DEPTH, negative depth hangs downward), AMP draws the amp envelope (AHR/ADSR incl. INF hold/release as flat-to-edge), FX p1 shows the Insert 1 machine name as a large banner (NONE reads BYPASS), FX p2 shows Send 1/2 machine names with live level bars.
+- Widget geometry reads through `ParamValues:item_raw_value`, so held step p-locks and scene locks move the curve/envelope live.
+- Cell drawing is level-batched into passes (never per-cell `screen.level`, guarding against the historical redraw-metro freeze) and curves are <=23-point polylines; `bin/test-elasticat-lua` gains a render sweep that drives every category/page/machine/env-mode/filter-type through a recording screen stub and asserts the per-frame `screen.level` call count stays bounded.
+
 ## Sample metadata writes deferred instead of timer-throttled
 
 - Replaced the timer-based throttle for trim/bpm/steps/gain sidecar writes with a dirty-flag approach: edits just mark the slot dirty and update the screen/engine live, with the actual disk write (sidecar file + pool-state snapshot) deferred until the sample slot changes, the page/category navigates away, or the script exits. Keeps scrubbing an encoder from ever triggering disk I/O per tick.

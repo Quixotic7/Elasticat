@@ -16,6 +16,7 @@ local FilterRegistry = include("lib/filter_modes/registry")
 local FxRegistry = include("lib/fx_modes/registry")
 local WavReader = include("lib/wav_reader")
 local ScriptState = include("lib/script_state")
+local ParamsSpec = include("lib/tracks/params_spec")
 local Navigation = include("lib/pages/navigation")
 local ParamValues = include("lib/ui/param_values")
 local SourcePage = include("lib/ui/source_page")
@@ -88,7 +89,9 @@ local param_values = nil
 local quiet_osc_paths = {
   ["/elasticat/status"] = true,
   ["/elasticat/transport"] = true,
-  ["/elasticat/pool/slot/active"] = true
+  ["/elasticat/pool/slot/active"] = true,
+  -- 15Hz live-modulation feed: never log it (it would flood maiden).
+  ["/elasticat/mod"] = true
 }
 local status = {
   phase = 0,
@@ -126,6 +129,46 @@ end
 
 local function id(name)
   return PREFIX .. name
+end
+
+-- Safe param-existence check. norns' params:lookup_param() ERRORS on an unknown
+-- string id rather than returning nil, so guarding a set() with
+-- `lookup_param(x) ~= nil` throws whenever saved data references a param that no
+-- longer exists (e.g. a project/temp file written before a param was renamed or
+-- removed). pcall makes the "does it exist?" question never throw.
+-- Defined on the module table (not a new file-scope local): the main chunk is
+-- at LuaJIT's 200-local ceiling and init() at its 60-upvalue ceiling, so
+-- everything reaches this through the existing `elasticat` upvalue.
+elasticat.param_exists = function(full_id)
+  local ok, p = pcall(params.lookup_param, params, full_id)
+  return ok and p ~= nil
+end
+
+-- ---- Phase 1 track scaffolding: selected-track id funnel -------------------
+-- (docs/PHASE1_CONTRACT.md). elasticat.selected_track is which track the whole
+-- EDITING surface (steps, params, pages) addresses. ui_id maps a bare suffix to
+-- the selected track's param id: track 1 (or a non-per-track suffix) stays the
+-- plain id() -- so with track 1 selected every path below is byte-for-byte the
+-- existing single-track behavior. Serialization/capture paths deliberately keep
+-- using raw id(): pattern/project snapshots enumerate every registered id
+-- (including t<N>_*) and must never re-map a suffix through the selection.
+-- Hung on the module table (like ui_open_confirm) so init()'s closures reach
+-- them through the already-captured `elasticat` upvalue: init sits AT LuaJIT's
+-- 60-upvalue limit, a fresh local capture pushes it over.
+elasticat.selected_track = 1
+
+local function ui_id(name)
+  return PREFIX .. ParamsSpec.track_suffix(elasticat.selected_track or 1, name)
+end
+elasticat.ui_id = ui_id
+
+-- Track selection (grid row 4). Updates the id funnel and points the engine
+-- facade's live-gesture calls (region/pitch/note/play) at the track's chain.
+elasticat.select_ui_track = function(track)
+  elasticat.selected_track = util.clamp(math.floor((tonumber(track) or 1) + 0.5), 1, ParamsSpec.TRACK_COUNT_MAX)
+  if elasticat.set_engine_track ~= nil then
+    elasticat.set_engine_track(elasticat.selected_track)
+  end
 end
 
 local script_state = ScriptState.new({id = id, elasticat = elasticat})
@@ -232,8 +275,12 @@ local function visible_message()
   return ui_message
 end
 
+-- Selected-track-aware param read: per-track suffixes resolve through ui_id
+-- (track 1 = the plain id, so single-track behavior is unchanged); global
+-- suffixes pass through untouched. The capture/apply paths never use this for
+-- per-track suffixes -- they enumerate full registered ids via id().
 local function param_value_or(param_id, default)
-  local full_id = id(param_id)
+  local full_id = ui_id(param_id)
   if params:lookup_param(full_id) ~= nil then
     return params:get(full_id)
   end
@@ -271,8 +318,17 @@ local PATTERN_GLOBAL_SUFFIXES = {
   -- apply path calls params:set() unconditionally and would otherwise re-fire
   -- a trigger's action (e.g. "load project") on every pattern switch.
   project_auto_name = true,
-  project_load = true, project_save = true, project_save_as = true, project_new = true
+  project_load = true, project_save = true, project_save_as = true, project_new = true,
+  -- Phase 1 track scaffolding: the active track count is project-global (like
+  -- the sample pool -- it describes the project's shape, not one pattern).
+  active_track_count = true
 }
+-- Per-track play state mirrors track 1's `play` (global partition): a pattern
+-- switch must never start/stop tracks. Mutes stay per-pattern (Elektron-style
+-- pattern mutes) by NOT being listed here.
+for track = 2, ParamsSpec.TRACK_COUNT_MAX do
+  PATTERN_GLOBAL_SUFFIXES["t" .. track .. "_play"] = true
+end
 
 -- Editor preferences (PRD §7): settings that belong to the EDITOR, not to any
 -- project -- how the app behaves, not the music. They are excluded from both
@@ -338,7 +394,7 @@ local function apply_pattern_state(snapshot, restart)
   applying_pattern_state = true
   for suffix, value in pairs(snapshot.params or {}) do
     local full_id = id(suffix)
-    if params:lookup_param(full_id) ~= nil then
+    if elasticat.param_exists(full_id) then
       params:set(full_id, value)  -- fire actions so the engine follows the pattern
       -- Scene-locked params' bases follow the pattern's baseline, so the
       -- crossfader re-apply below morphs against THIS pattern's values.
@@ -375,9 +431,12 @@ end
 -- an empty sequence.
 local function blank_pattern_state()
   local snapshot = capture_pattern_state()
+  -- Old single-track sequencer format on purpose: GridSequencer:deserialize
+  -- loads it into track 1 and blanks tracks 2-8 (a never-populated slot is a
+  -- blank pattern on EVERY track).
   snapshot.sequencer = {
     steps = {},
-    rate_index = grid_ui ~= nil and grid_ui.rate_index or 4,
+    rate_index = grid_ui ~= nil and grid_ui.seq ~= nil and grid_ui.seq.rate_index or 4,
     page_loop = {[1] = true}
   }
   return snapshot
@@ -498,6 +557,9 @@ local function open_confirm(prompt, on_yes)
   })
   request_redraw()
 end
+-- Hung on the module table so init()'s options closures can reach it through
+-- the existing `elasticat` upvalue instead of a new one (60-upvalue limit).
+elasticat.ui_open_confirm = open_confirm
 
 local function draw_confirm()
   if not confirm_open then
@@ -534,6 +596,7 @@ end
 local project_browser_open = false
 local project_browser_entries = {}
 local project_browser_index = 1
+local project_browser_sort = "date"  -- "date" (newest first) | "name"; E1 toggles
 
 local function close_project_browser()
   project_browser_open = false
@@ -554,6 +617,13 @@ local function load_selected_project()
     project_loading = true
     local ok = project_store:load(entry.path)
     project_loading = false
+    if ok then
+      -- Replace the temp work snapshot NOW: temp means "resume where you left
+      -- off", and where you left off is this freshly loaded project. Without
+      -- this, temp only refreshed on the debounced edit autosave, so a
+      -- load -> play/stop -> script reload resurrected the PREVIOUS session.
+      project_store:save_temp()
+    end
     show_message(ok and ("Loaded " .. project_store:current_name()) or "Load failed")
   end
 end
@@ -563,7 +633,7 @@ local function open_project_browser()
     return
   end
   util.make_dir(ProjectStore.projects_dir())
-  project_browser_entries = ProjectStore.list()
+  project_browser_entries = ProjectStore.list(project_browser_sort)
   if #project_browser_entries == 0 then
     show_message("No saved projects")
     return
@@ -581,6 +651,11 @@ local function open_project_browser()
         project_browser_index = (project_browser_index % n) + 1
       elseif action == "select_delta" then
         project_browser_index = util.clamp(project_browser_index + (value or 0), 1, n)
+      elseif action == "page_delta" then
+        -- E1 toggles the sort order (date <-> name) and re-lists.
+        project_browser_sort = (project_browser_sort == "date") and "name" or "date"
+        project_browser_entries = ProjectStore.list(project_browser_sort)
+        project_browser_index = 1
       elseif action == "confirm" or action == "right" then
         load_selected_project()
       elseif action == "cancel" or action == "left" then
@@ -603,8 +678,12 @@ local function draw_project_browser()
   screen.rect(0, 0, 128, 11)
   screen.fill()
   screen.level(15)
-  screen.move(64, 8)
-  screen.text_center("LOAD PROJECT")
+  screen.move(4, 8)
+  screen.text("LOAD PROJECT")
+  -- Sort indicator (E1 toggles date <-> name).
+  screen.level(9)
+  screen.move(124, 8)
+  screen.text_right("E1:" .. (project_browser_sort == "date" and "DATE" or "NAME"))
 
   local n = #project_browser_entries
   local first = util.clamp(project_browser_index - 2, 1, math.max(1, n - 4))
@@ -775,7 +854,7 @@ local function apply_global_state(values)
   end
   for suffix, value in pairs(values) do
     local full_id = id(suffix)
-    if params:lookup_param(full_id) ~= nil then
+    if elasticat.param_exists(full_id) then
       params:set(full_id, value)
     end
   end
@@ -933,7 +1012,7 @@ local function reset_project_state()
       -- project (e.g. auto-name mode must not snap back to "none").
       if not EDITOR_PREF_SUFFIXES[suffix] then
         local full_id = id(suffix)
-        if params:lookup_param(full_id) ~= nil then
+        if elasticat.param_exists(full_id) then
           params:set(full_id, value)
         end
       end
@@ -949,7 +1028,7 @@ end
 local function save_editor_prefs()
   local values = {}
   for suffix in pairs(EDITOR_PREF_SUFFIXES) do
-    if params:lookup_param(id(suffix)) ~= nil then
+    if elasticat.param_exists(id(suffix)) then
       values[suffix] = params:get(id(suffix))
     end
   end
@@ -967,7 +1046,7 @@ local function load_editor_prefs()
     return
   end
   for suffix, value in pairs(values) do
-    if EDITOR_PREF_SUFFIXES[suffix] and params:lookup_param(id(suffix)) ~= nil then
+    if EDITOR_PREF_SUFFIXES[suffix] and elasticat.param_exists(id(suffix)) then
       params:set(id(suffix), value)
     end
   end
@@ -1067,6 +1146,10 @@ local function do_project_new()
     local name = ProjectStore.generate_name(param_value_or("project_auto_name", 1)) or "untitled"
     project_store:set_name(name)
     project_store.path = nil
+    -- Replace the temp work snapshot with the blank slate (same reasoning as
+    -- project load): a script reload right after New Project should resume the
+    -- new empty project, not resurrect the previous session.
+    project_store:save_temp()
     show_message("New project " .. name .. " (unsaved)")
     request_redraw()
   end)
@@ -1182,11 +1265,96 @@ local function filter_machine_items()
   return FilterRegistry.source_items(param_value_or("filter_machine", 1), ParamItem)
 end
 
--- FX page 1: Insert 1's active machine's p-lockable row (Drive/Mix, Delay's
--- Time/Feedback/Tone/Mix, etc.). Machine is a setting, so this list changes
--- when fx_insert1_machine changes -- same dynamic pattern as FILTER/WARP.
-local function fx_insert1_items()
-  return FxRegistry.source_items(param_value_or("fx_insert1_machine", 1), ParamItem)
+-- FILTER page 1 (owner low-profile redesign): a curated 4 -- CUT, RES, the
+-- machine's morph knob (morphing family) or TYPE (classic), and the filter
+-- envelope DEPTH (pulled onto this page though the full env lives on page 2).
+-- These 4 are what the low-profile row + bar render draw and what K2/K3 edit.
+-- Low-profile cells draw TWO values: the base track value (the bar that must
+-- hold still) and the "actual" value after everything acting on it. Returns
+-- base_raw, actual_raw, modulated.
+--   crossfader -- scene_store applies the morph by writing the live param, so
+--     the live value IS the actual; the untouched track value is the scene
+--     base it stashed. Without this the base bar moved with the fader.
+--   macro assign -- while a macro key is held, preview current +/- that
+--     macro's depth to this destination, so you can see what you're dialing.
+-- (Live LFO/env modulation joins here once the engine reports mod-bus values.)
+elasticat.param_display_values = function(item, raw)
+  local base, actual, modulated = raw, raw, false
+  if type(raw) ~= "number" or item == nil or item.id == nil then
+    return base, actual, false
+  end
+  local suffix = item.id
+
+  local bases = scene_store ~= nil and scene_store.bases or nil
+  if bases ~= nil and type(bases[suffix]) == "number" then
+    base = bases[suffix]
+    if math.abs(actual - base) > 0.0001 then
+      modulated = true
+    end
+  end
+
+  local held = (grid_ui ~= nil and grid_ui.held_macro ~= nil) and grid_ui:held_macro() or nil
+  if held ~= nil and elasticat.macro_dest_for_param ~= nil then
+    local dest = elasticat.macro_dest_for_param(suffix)
+    local pid = dest ~= nil and elasticat.macro_depth_id(held, dest) or nil
+    if pid ~= nil and elasticat.param_exists(pid) then
+      local depth = ((params:get(pid) or 64) - 64) / 64  -- -1..1
+      local span = (item.max or 127) - (item.min or 0)
+      actual = actual + (depth * span)
+      modulated = true
+    end
+  else
+    -- Live modulation (LFOs / mod env / macros), fed from the engine at 15Hz.
+    -- Skipped while a macro key is held so the assign preview above owns the
+    -- bar. AMP is multiplicative in the engine, everything else an offset.
+    if suffix == "amp" then
+      local factor = elasticat.mod_amp_factor()
+      if math.abs(factor - 1) > 0.001 then
+        actual = actual * factor
+        modulated = true
+      end
+    else
+      local offset = elasticat.mod_offset_for(suffix)
+      if math.abs(offset) > 0.001 then
+        actual = actual + offset
+        modulated = true
+      end
+    end
+  end
+
+  return base, actual, modulated
+end
+
+-- (Drive/Balance remain in the norns PARAMS menu for now -- a follow-up page.)
+-- On the module table (not a new local): the main chunk is at LuaJIT's
+-- 200-local ceiling (see elasticat.param_exists).
+elasticat.filter_lowprofile_items = function()
+  local morphing = math.floor(param_value_or("filter_machine", 1) + 0.5) % 2 == 0
+  local third
+  if morphing then
+    third = ParamItem.item("filter_morph", "MORPH", {lockable = true, min = 0, max = 128, step = 1, snaps = {0, 32, 64, 96, 128}})
+  else
+    third = ParamItem.item("filter_type", "TYPE", {lockable = true, options = 4})
+  end
+  return {
+    ParamItem.item("filter_cutoff", "CUT", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}}),
+    ParamItem.item("filter_res", "RES", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}}),
+    third,
+    ParamItem.item("filter_env_depth", "DEPTH", {lockable = true, min = 0, max = 128, step = 1, snaps = {0, 32, 64, 96, 128}})
+  }
+end
+
+-- FX pages: each FX slot's active machine's p-lockable row (Drive/Mix, Delay's
+-- Time/Feedback/Tone/Mix, etc.). Machine is a setting, so a slot's list changes
+-- when its machine selector changes -- same dynamic pattern as FILTER/WARP.
+-- One helper serves all four slots (Insert 1 / Send 1 / Send 2 / Master):
+-- `machine_suffix` names the slot's machine selector param and `prefix`
+-- namespaces the item ids per slot (nil for Insert 1's original unprefixed
+-- ids; "send1_"/"send2_"/"master_" match the params registered in
+-- lib/elasticat.lua). NONE returns no items, which draw_root_page renders as
+-- the blank "empty" page.
+local function fx_slot_items(machine_suffix, item_prefix)
+  return FxRegistry.source_items(param_value_or(machine_suffix, 1), ParamItem, item_prefix)
 end
 
 -- FILTER page 2: the filter envelope, laid out by its (independent) mode -- ADSR
@@ -1231,11 +1399,17 @@ local function page_items_for(category, page, page_index)
   if category == "amp" and page_index == 1 then
     return amp_env_items()
   elseif category == "filter" and page_index == 1 then
-    return filter_machine_items()
+    return elasticat.filter_lowprofile_items()
   elseif category == "filter" and page_index == 2 then
     return filter_env_items()
   elseif category == "fx" and page_index == 1 then
-    return fx_insert1_items()
+    return fx_slot_items("fx_insert1_machine", nil)
+  elseif category == "fx" and page_index == 3 then
+    return fx_slot_items("send1_machine", "send1_")
+  elseif category == "fx" and page_index == 4 then
+    return fx_slot_items("send2_machine", "send2_")
+  elseif category == "fx" and page_index == 5 then
+    return fx_slot_items("master_fx_machine", "master_")
   elseif category == "trig" and page_index == 3 then
     return trig_machine_items()
   elseif category == "source" and page_index == 1 then
@@ -1268,7 +1442,9 @@ nav = Navigation.new({
 })
 
 param_values = ParamValues.new({
-  id = id,
+  -- Selected-track id funnel (Phase 1): per-track suffixes resolve to the
+  -- selected track's params; everything else passes through unchanged.
+  id = ui_id,
   show_message = show_message,
   sample_name = sample_name,
   param_value_or = param_value_or,
@@ -1372,7 +1548,7 @@ local function active_region()
   if grid_ui ~= nil and grid_ui.active_region ~= nil then
     return grid_ui:active_region()
   end
-  return params:get(id("loop_start")) or 0, params:get(id("loop_end")) or 128
+  return params:get(ui_id("loop_start")) or 0, params:get(ui_id("loop_end")) or 128
 end
 
 local function visual_param_value(param_id, fallback)
@@ -1387,12 +1563,12 @@ local function visual_param_value(param_id, fallback)
   if active_step_lock_bases[lock_id] ~= nil then
     return active_step_lock_bases[lock_id]
   end
-  return params:lookup_param(id(param_id)) ~= nil and params:get(id(param_id)) or fallback
+  return params:lookup_param(ui_id(param_id)) ~= nil and params:get(ui_id(param_id)) or fallback
 end
 
 local function loop_phase_rate(start_point, end_point)
-  start_point = start_point or params:get(id("loop_start")) or 0
-  end_point = end_point or params:get(id("loop_end")) or 128
+  start_point = start_point or params:get(ui_id("loop_start")) or 0
+  end_point = end_point or params:get(ui_id("loop_end")) or 128
   -- Rate must reflect the region *as played* -- range + trim mapped -- not the
   -- Track width, or a narrowed range makes the playhead crawl (looks like it
   -- doesn't match the audio).
@@ -1412,20 +1588,20 @@ local function loop_phase_rate(start_point, end_point)
   -- Every other warp mode reads the tempo-locked transport phase, so pitch does
   -- NOT change its playhead rate -- using source_bpm*pitch there made the visual
   -- playhead speed up (e.g. PC mode) while the audio stayed put.
-  local mode = params:lookup_param(id("mode")) ~= nil and params:get(id("mode")) or 1
-  if params:get(id("machine")) == 1 and mode == 1 then
+  local mode = params:lookup_param(ui_id("mode")) ~= nil and params:get(ui_id("mode")) or 1
+  if params:get(ui_id("machine")) == 1 and mode == 1 then
     local active_bpm = elasticat.active_bpm ~= nil and elasticat.active_bpm() or params:get(id("sample_bpm"))
     local bpm = status.derived_bpm > 0 and status.derived_bpm or active_bpm
-    local pitch_ratio = math.pow(2, (params:get(id("pitch")) or 0) / 12)
+    local pitch_ratio = math.pow(2, (params:get(ui_id("pitch")) or 0) / 12)
     return (bpm / 60 / loop_beats) * pitch_ratio
   end
 
   local base_rate = (params:get(id("target_bpm")) or 120) / 60 / loop_beats
-  if params:get(id("machine")) == 1 and mode == 2 then
+  if params:get(ui_id("machine")) == 1 and mode == 2 then
     -- tempo_varispeed now varispeeds audio-side too (pitch drifts the read
     -- position off the transport, PRD §8): scale the visual playhead the same
     -- way so it tracks what's heard.
-    return base_rate * math.pow(2, (params:get(id("pitch")) or 0) / 12)
+    return base_rate * math.pow(2, (params:get(ui_id("pitch")) or 0) / 12)
   end
   return base_rate
 end
@@ -1433,7 +1609,7 @@ end
 -- +1 forward, -1 when loop reverse is on, so the visual playhead travels the
 -- same direction as the audio.
 local function playhead_direction()
-  if params:lookup_param(id("loop_reverse")) ~= nil and params:get(id("loop_reverse")) == 1 then
+  if params:lookup_param(ui_id("loop_reverse")) ~= nil and params:get(ui_id("loop_reverse")) == 1 then
     return -1
   end
   return 1
@@ -1477,8 +1653,11 @@ local function draw_page_header(title, page_number)
   end
 
   Header.draw({
-    track = 1,
+    track = elasticat.selected_track or 1,
     ghost = ghost,
+    -- A muted track is silent downstream of the meter, so the header says so.
+    muted = grid_ui ~= nil and grid_ui.track_muted ~= nil
+      and grid_ui:track_muted(elasticat.selected_track or 1) or false,
     message = visible_message() or grid_status or title or "ELASTICAT",
     tempo = param_value_or("target_bpm", 120),
     amp_l = status.amp_l,
@@ -1487,15 +1666,21 @@ local function draw_page_header(title, page_number)
   })
 end
 
-local function draw_selection_corner(x, y, width, height, corner)
-  ParamRenderer.draw_selection_corner(x, y, width, height, corner)
-end
-
-local function draw_param_cell(param_item, x, y, corner)
-  ParamRenderer.draw_param_cell(param_item, x, y, corner,
-    function(pi) return param_values:item_locked(pi) end,
-    function(pi) return param_values:item_display_value(pi) end)
-end
+-- Elektron-style renderer for the generic param pages (lib/ui/page_render.lua):
+-- 2x4 label/value/bar cells + per-category widgets (filter curve, env sketches,
+-- FX identity). Pure rendering -- it reads through param_values/param_value_or
+-- only. Constructed at file scope (like source_page below) to stay clear of
+-- init()'s 60-upvalue limit.
+local page_render = include("lib/ui/page_render").new({
+  param_values = param_values,
+  value = param_value_or,
+  display_values = function(item, raw) return elasticat.param_display_values(item, raw) end,
+  mod_offsets = function()
+    return elasticat.mod_offset_for("filter_cutoff"), elasticat.mod_offset_for("filter_res")
+  end,
+  filter_names = FilterRegistry.names(),
+  fx_names = FxRegistry.names()
+})
 
 local source_page = SourcePage.new({
   elasticat = elasticat,
@@ -1512,7 +1697,9 @@ local source_page = SourcePage.new({
   get_playing = function() return playing end,
   display_phase = display_phase,
   visual_param_value = visual_param_value,
-  id = id,
+  -- Selected-track id funnel (Phase 1): the source page's per-track reads
+  -- (slice_count) follow the selection; globals pass through unchanged.
+  id = ui_id,
   get_alt = fn_active,
   get_last_trim_focus = function() return last_trim_focus end
 })
@@ -1538,29 +1725,15 @@ local function draw_root_page()
     return
   end
 
-  draw_page_header(title, page_index)
-  if #items == 0 then
-    screen.level(4)
-    screen.move(0, 34)
-    screen.text("empty")
+  if nav:current_category() == "filter" and page_index == 1 then
+    -- Owner low-profile filter redesign (elasticat-design-images/filterDesign.png).
+    draw_page_header(title, page_index)
+    page_render:draw_filter_page(items, nav:clamp_current_group(), playing)
     return
   end
 
-  local selected_start = ((nav:clamp_current_group() - 1) * 2) + 1
-  for i, param_item in ipairs(items) do
-    local column = (i - 1) % 4
-    local row = math.floor((i - 1) / 4)
-    local x = column * 32
-    local y = row == 0 and 18 or 44
-    local corner = nil
-    if i == selected_start then
-      corner = "tl"
-    elseif i == selected_start + 1 then
-      corner = "br"
-    end
-    draw_param_cell(param_item, x, y, corner)
-  end
-
+  draw_page_header(title, page_index)
+  page_render:draw(nav:current_category(), page_index, items, nav:clamp_current_group())
 end
 
 -- ---- PROJECT settings page (master settings, page 2; PRD §7) --------------
@@ -1712,13 +1885,19 @@ local function draw_settings_page()
       screen.move(0, y)
       screen.text(index == selected and ">" or " ")
       screen.move(10, y)
-      -- Action rows show only a small "[ ]" on the right, so their label gets
-      -- the wide column (fits "NEW PROJECT"); the status row keeps room for the
-      -- project name, ordinary rows keep room for their value.
-      local action_row = param_item.project_row ~= nil and param_item.project_row ~= "status"
-      screen.text_trim(param_item.short or param_item.id, action_row and 100 or 42)
-      screen.move(128, y)
-      screen.text_right(project_settings_row_value(param_item))
+      if param_item.project_row == "status" then
+        -- The name row shows ONLY the project name (+ unsaved "*"), full
+        -- width -- a "PROJECT" label collided with long names.
+        screen.text_trim(project_settings_row_value(param_item), 118)
+      else
+        -- Action rows show only a small "[ ]" on the right, so their label
+        -- gets the wide column (fits "NEW PROJECT"); ordinary rows keep room
+        -- for their value.
+        local action_row = param_item.project_row ~= nil
+        screen.text_trim(param_item.short or param_item.id, action_row and 100 or 42)
+        screen.move(128, y)
+        screen.text_right(project_settings_row_value(param_item))
+      end
     end
   end
 end
@@ -1747,7 +1926,9 @@ set_playing = function(state, reset_transport)
   params:set(id("play"), playing and 1 or 0, true)
   print("elasticat: K3/play state " .. tostring(playing and 1 or 0))
   if not reset_transport then
-    elasticat.play(playing and machine_is_continuous())
+    -- all_tracks: the master transport drives track 1 exactly as before PLUS
+    -- every other active track's chain (each gated on its own machine).
+    elasticat.play(playing and machine_is_continuous(), true)
   end
   if grid_ui ~= nil then
     grid_ui:set_transport(playing, reset_transport)
@@ -2016,7 +2197,15 @@ function init()
     -- scene_store is assigned further down in this same init(); by the time a
     -- user can move the param (grid or encoder) init() has already finished,
     -- so the upvalue is populated (same idiom as on_project_load above).
-    on_crossfade = function(x) if scene_store ~= nil then scene_store:apply(x / 128) end end
+    on_crossfade = function(x) if scene_store ~= nil then scene_store:apply(x / 128) end end,
+    -- Phase 1 track scaffolding: active_track_count changed -- snap the grid's
+    -- selected track back inside the new count and refresh the row-4 LEDs.
+    on_active_track_count = function(_)
+      if grid_ui ~= nil and grid_ui.clamp_track_selection ~= nil then
+        grid_ui:clamp_track_selection()
+      end
+      request_redraw()
+    end
   })
   -- Capture factory defaults now, while every param is still at its registered
   -- default (before any pset / temp-project load overrides them) so New Project
@@ -2038,8 +2227,16 @@ function init()
   })
   scene_store = SceneStore.new({
     morph_ids = morph_param_suffixes,
-    get_value = function(suffix) return params:get(id(suffix)) end,
-    set_value = function(suffix, value) params:set(id(suffix), value) end
+    -- Guarded so a scene that referenced a since-removed param (e.g. the old
+    -- macro depth morph targets) is skipped instead of throwing on load.
+    get_value = function(suffix)
+      local fid = id(suffix)
+      return elasticat.param_exists(fid) and params:get(fid) or nil
+    end,
+    set_value = function(suffix, value)
+      local fid = id(suffix)
+      if elasticat.param_exists(fid) then params:set(fid, value) end
+    end
   })
   text_entry = TextEntry.new({})
   grid_ui = GridSequencer.new({
@@ -2058,17 +2255,43 @@ function init()
     note_off = function()
       elasticat.note_off()
     end,
+    -- Modulation retrigger (2 LFOs + mod env, MOD category): fired per step
+    -- where lfo_reset / env_reset resolve ON (see enter_step). Reaches the
+    -- engine facade through the existing `elasticat` upvalue -- no new init()
+    -- locals (LuaJIT 60-upvalue limit).
+    mod_trig = function(lfo_on, env_on)
+      elasticat.mod_trig(lfo_on, env_on)
+    end,
+    -- Macro key LEDs read the live macro value (0-127) for their brightness.
+    get_macro_value = function(macro)
+      local vid = id("macro" .. macro .. "_value")
+      return params:lookup_param(vid) ~= nil and params:get(vid) or 0
+    end,
     retrig_note = function(seconds)
       elasticat.retrig_note(seconds)
     end,
+    -- Copy/Clear/Paste pattern scope (FN+REC/PLAY/STOP on the grid): buffer =
+    -- the same whole-pattern snapshot the pattern slots use; paste re-applies
+    -- it to the live state without restarting the transport. Clear runs behind
+    -- the standard YES/NO confirm popup.
+    copy_pattern_state = capture_pattern_state,
+    paste_pattern_state = function(snapshot)
+      apply_pattern_state(snapshot, false)
+    end,
+    open_confirm = function(prompt, on_yes)
+      elasticat.ui_open_confirm(prompt, on_yes)
+    end,
+    -- NB: per-track getters below read through elasticat.ui_id -- the selected
+    -- track's params (track 1 = the plain ids, unchanged). Global params keep
+    -- plain id(); elasticat.ui_id passes non-per-track suffixes through anyway.
     base_region = function()
-      return params:get(id("loop_start")), params:get(id("loop_end"))
+      return params:get(elasticat.ui_id("loop_start")), params:get(elasticat.ui_id("loop_end"))
     end,
     get_machine = function()
-      return params:get(id("machine"))
+      return params:get(elasticat.ui_id("machine"))
     end,
     get_pattern_steps = function()
-      return params:get(id("pattern_steps"))
+      return params:get(elasticat.ui_id("pattern_steps"))
     end,
     get_global_length = function()
       return param_value_or("global_pattern_length", nil)
@@ -2191,22 +2414,22 @@ function init()
       elasticat.set_active_range(range_start, range_end)
     end,
     reset_default = function(reset_id)
-      return params:lookup_param(id(reset_id)) ~= nil and params:get(id(reset_id)) == 1
+      return params:lookup_param(elasticat.ui_id(reset_id)) ~= nil and params:get(elasticat.ui_id(reset_id)) == 1
     end,
     get_trig_jump = function()
-      return params:lookup_param(id("trig_jump")) ~= nil and params:get(id("trig_jump")) == 1
+      return params:lookup_param(elasticat.ui_id("trig_jump")) ~= nil and params:get(elasticat.ui_id("trig_jump")) == 1
     end,
     get_trig_release = function()
-      return params:lookup_param(id("trig_release")) ~= nil and params:get(id("trig_release")) or 1
+      return params:lookup_param(elasticat.ui_id("trig_release")) ~= nil and params:get(elasticat.ui_id("trig_release")) or 1
     end,
     get_trig_chance = function()
-      return params:lookup_param(id("trig_chance")) ~= nil and params:get(id("trig_chance")) or 100
+      return params:lookup_param(elasticat.ui_id("trig_chance")) ~= nil and params:get(elasticat.ui_id("trig_chance")) or 100
     end,
     get_trig_condition = function()
-      return params:lookup_param(id("trig_condition")) ~= nil and params:get(id("trig_condition")) or 1
+      return params:lookup_param(elasticat.ui_id("trig_condition")) ~= nil and params:get(elasticat.ui_id("trig_condition")) or 1
     end,
     get_trig_ratchet = function()
-      return params:lookup_param(id("trig_ratchet")) ~= nil and params:get(id("trig_ratchet")) or 1
+      return params:lookup_param(elasticat.ui_id("trig_ratchet")) ~= nil and params:get(elasticat.ui_id("trig_ratchet")) or 1
     end,
     get_swing = function()
       return params:lookup_param(id("swing")) ~= nil and params:get(id("swing")) or 50
@@ -2215,25 +2438,27 @@ function init()
       return params:lookup_param(id("live_step_trig")) ~= nil and params:get(id("live_step_trig")) == 1
     end,
     get_slice_count = function()
-      return params:get(id("slice_count"))
+      return params:get(elasticat.ui_id("slice_count"))
     end,
     get_slice_index = function()
-      return params:get(id("slice_index"))
+      return params:get(elasticat.ui_id("slice_index"))
     end,
     get_slice_play_mode = function()
-      return params:get(id("slice_play_mode"))
+      return params:get(elasticat.ui_id("slice_play_mode"))
     end,
     get_slice_polyphony = function()
-      return params:get(id("slice_polyphony"))
+      return params:get(elasticat.ui_id("slice_polyphony"))
     end,
     get_hold_to_step = function()
-      return params:get(id("slice_hold_to_step")) == 1
+      return params:get(elasticat.ui_id("slice_hold_to_step")) == 1
     end,
     get_slice_hold = function()
-      return params:get(id("slice_hold"))
+      return params:get(elasticat.ui_id("slice_hold"))
     end,
     get_slice_range = function(slice)
-      if params:get(id("machine")) == 4 then
+      -- Razor split tables stay shared with track 1 in Phase 1 (see
+      -- lib/tracks/params_spec.lua), so their ids stay plain.
+      if params:get(elasticat.ui_id("machine")) == 4 then
         local start_point = params:get(id(string.format("razor_%02d_start", slice)))
         local end_point = params:get(id(string.format("razor_%02d_end", slice)))
         if end_point <= start_point then
@@ -2241,9 +2466,9 @@ function init()
         end
         return start_point, end_point
       end
-      local count = math.max(1, params:get(id("slice_count")))
-      local loop_start = params:get(id("loop_start"))
-      local loop_end = params:get(id("loop_end"))
+      local count = math.max(1, params:get(elasticat.ui_id("slice_count")))
+      local loop_start = params:get(elasticat.ui_id("loop_start"))
+      local loop_end = params:get(elasticat.ui_id("loop_end"))
       local width = (loop_end - loop_start) / count
       return loop_start + ((slice - 1) * width), loop_start + (slice * width)
     end,
@@ -2257,13 +2482,13 @@ function init()
       return param_value_or("default_length", default_trig_length)
     end,
     base_pitch = function()
-      return params:get(id("pitch"))
+      return params:get(elasticat.ui_id("pitch"))
     end,
     set_pitch = function(pitch)
       elasticat.set_pitch(pitch)
     end,
     set_pitch_param = function(pitch)
-      params:set(id("pitch"), pitch)
+      params:set(elasticat.ui_id("pitch"), pitch)
     end,
     trigger_region = function(start_point, end_point, options)
       trigger_loop_region(start_point, end_point, options)
@@ -2273,8 +2498,8 @@ function init()
         slice,
         start_point,
         end_point,
-        params:get(id("slice_play_mode")) - 1,
-        params:get(id("slice_reverse")) == 1,
+        params:get(elasticat.ui_id("slice_play_mode")) - 1,
+        params:get(elasticat.ui_id("slice_reverse")) == 1,
         options.velocity,
         options.length_seconds,
         options.pitch
@@ -2351,6 +2576,29 @@ function init()
       nav:settings_select_delta(delta)
     end,
     param_settings_value_delta = settings_delta_value,
+    -- Phase 1 track scaffolding: row-4 track select/mute keys + background
+    -- track advancement (all callbacks reach the engine facade through the
+    -- already-captured `elasticat` upvalue -- init() is AT the 60-upvalue
+    -- limit, so no new locals may be referenced here).
+    get_active_track_count = function()
+      return param_value_or("active_track_count", 1)
+    end,
+    on_track_selected = function(track)
+      elasticat.select_ui_track(track)
+      request_redraw()
+    end,
+    get_track_muted = function(track)
+      return elasticat.track_muted(track) == true
+    end,
+    set_track_mute = function(track, on)
+      elasticat.set_track_mute(track, on)
+    end,
+    get_track_param = function(track, suffix)
+      return elasticat.track_param_value(track, suffix)
+    end,
+    track_step = function(track, record)
+      elasticat.track_step(track, record)
+    end,
     phase = display_phase,
     position_at_region = position_at_region,
     show_message = show_message,
@@ -2406,6 +2654,10 @@ function init()
         if status.derived_bpm > 0 then
           params:set(id("source_bpm"), status.derived_bpm, true)
         end
+      elseif path == "/elasticat/mod" then
+        -- Live mod-bus values (pitch/cutoff/res/amp/pan, -1..1) at 15Hz: the
+        -- UI's "actual value" bars and the filter render read these.
+        elasticat.set_mod_values(args[1], args[2], args[3], args[4], args[5])
       elseif path == "/elasticat/transport" then
         if phase_reports_allowed() then
           set_visual_phase(args[1])
@@ -2445,6 +2697,8 @@ function init()
   elasticat.sync_amp_env()  -- push env/pan/vol defaults (their actions don't fire on add)
   elasticat.sync_filter()   -- push filter machine/params defaults (same reasoning)
   elasticat.sync_fx()       -- push fx insert 1 machine/params defaults (same reasoning)
+  elasticat.sync_mod()      -- push LFO/mod-env defaults (same reasoning)
+  elasticat.sync_tracks()   -- push active track count + tracks 2-8 params (Phase 1)
   start_intro()
   start_redraw_metro()
   redraw()
@@ -2591,6 +2845,31 @@ function enc(n, d)
   -- Universal input router: an open modal layer consumes encoder actions
   -- (E2 = select_delta) before the base UI sees them.
   if input_router:enc(n, d) then
+    request_redraw()
+    return
+  end
+
+  -- Held macro key (grid row 4, cols 1-4) = mod-matrix assign mode: turning a
+  -- destination param's encoder (E2 = the selected pair's left param, E3 =
+  -- right) dials that macro's SIGNED depth to that destination. Turning a param
+  -- that isn't a modulation destination just says so -- it never edits the
+  -- param value while a macro is held. The macro's own VALUE is driven from the
+  -- MACROS page (or an LFO targeting it).
+  local held_macro = (grid_ui ~= nil and grid_ui.held_macro ~= nil) and grid_ui:held_macro() or nil
+  if held_macro ~= nil and (n == 2 or n == 3) then
+    local left, right = nav:current_group_items()
+    local target = (n == 2) and left or right
+    local dest = target ~= nil and elasticat.macro_dest_for_param(target.id) or nil
+    if dest ~= nil then
+      local pid = elasticat.macro_depth_id(held_macro, dest)
+      if pid ~= nil and params:lookup_param(pid) ~= nil then
+        params:set(pid, util.clamp((params:get(pid) or 64) + d, 0, 128))
+        show_message(string.format("M%d %s %+d", held_macro,
+          target.short or dest.key, (params:get(pid) or 64) - 64))
+      end
+    else
+      show_message(string.format("M%d: turn a mod dest", held_macro))
+    end
     request_redraw()
     return
   end

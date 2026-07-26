@@ -141,15 +141,94 @@ local function is_slice_machine(machine)
   return machine == MACHINE_GRID_SLICE or machine == MACHINE_RAZOR_SLICE
 end
 
+-- ---- Phase 1 track scaffolding (docs/PHASE1_CONTRACT.md) -------------------
+-- Per-track sequence state: the fields that used to live directly on self
+-- (steps, page_loop, rate_index, play position, condition-pass bookkeeping,
+-- step timing) become one table per track in self.tracks[1..8]. self.track is
+-- the selected track and self.seq is a direct reference to its state table --
+-- every existing code path reads/writes "the selected track" through self.seq,
+-- so the step/lock logic is not forked per track. During playback ALL tracks
+-- up to active_track_count advance, each with its own pattern position/rate
+-- (see tick_background_tracks); only the selected track is edited/displayed.
+local TRACK_COUNT_MAX = 8
+
+local function blank_track_state()
+  return {
+    steps = {},
+    page_loop = {[1] = true},
+    rate_index = 4,
+    play_index = 1,
+    play_page = 1,
+    play_step = 1,
+    -- Trig conditions / Fill (PRD §6.5), per track: pattern_pass counts THIS
+    -- track's sequence loops; last_cond_result feeds its PRE/!PRE chain.
+    pattern_pass = 1,
+    last_cond_result = nil,
+    -- Step timing, per track (each track has its own rate).
+    next_step_time = nil,
+    remaining_time = nil
+  }
+end
+
+-- One track's pattern-owned state -> a plain deep-copied snapshot table (the
+-- exact shape the old single-track serialize() produced).
+local function serialize_track(state)
+  local steps = {}
+  for index, record in pairs(state.steps) do
+    if Step.has_content(record) then
+      steps[index] = deep_copy(record)
+    end
+  end
+  local page_loop = {}
+  for page, on in pairs(state.page_loop) do
+    if on then
+      page_loop[page] = true
+    end
+  end
+  return {
+    steps = steps,
+    rate_index = state.rate_index,
+    page_loop = page_loop
+  }
+end
+
+-- Restore one track's pattern-owned state from a snapshot (or nil -> blank).
+-- Transport-owned fields (play position, pass counters, timing) are NOT part
+-- of a pattern snapshot; the caller preserves or resets them.
+local function deserialize_track(snapshot)
+  local state = blank_track_state()
+  snapshot = snapshot or {}
+  for index, record in pairs(snapshot.steps or {}) do
+    state.steps[index] = deep_copy(record)
+  end
+  state.rate_index = snapshot.rate_index or 4
+  state.page_loop = {}
+  for page, on in pairs(snapshot.page_loop or {}) do
+    if on then
+      state.page_loop[page] = true
+    end
+  end
+  if next(state.page_loop) == nil then
+    state.page_loop[1] = true
+  end
+  return state
+end
+
 function GridSequencer.new(options)
   local self = setmetatable({}, GridSequencer)
   self.options = options or {}
   self.g = grid.connect()
+  -- Per-track sequence state (Phase 1 track scaffolding): self.seq aliases the
+  -- selected track's table, so with track 1 selected (the default) everything
+  -- below behaves exactly as the old single-track fields did.
+  self.tracks = {}
+  for track = 1, TRACK_COUNT_MAX do
+    self.tracks[track] = blank_track_state()
+  end
+  self.track = 1
+  self.seq = self.tracks[1]
   self.page_mode = "select"
   self.selected_page = 1
-  self.play_page = 1
-  self.play_step = 1
-  self.play_index = 1
   self.playing = false
   self.recording = false
   self.fn_down = false
@@ -164,23 +243,16 @@ function GridSequencer.new(options)
   self.step_holds = {}
   self.step_press_time = {}
   self.step_edited = {}
-  self.page_loop = {}
-  self.page_loop[1] = true
-  self.rate_index = 4
-  self.steps = {}
+  -- steps/page_loop/rate_index and the step timing live in self.seq (per track).
   self.manual_region = nil
   self.seq_metro = nil
-  self.next_step_time = nil
-  self.seq_remaining_time = nil
   self.param_lock_holds = {}
   self.current_region_start = nil
   self.current_region_end = nil
   self.current_range_start = nil
   self.current_range_end = nil
-  -- Trig conditions / Fill (PRD §6.5). pattern_pass counts sequence loops (for
-  -- A:B and 1st); last_cond_result feeds PRE/!PRE; fill_* drive FILL/!FILL.
-  self.pattern_pass = 1
-  self.last_cond_result = nil
+  -- Fill (PRD §6.5) is a live performance gesture, shared across tracks; the
+  -- per-track pattern_pass/last_cond_result live in self.seq.
   self.fill_active = false
   self.fill_latched = false
   self.fill_held = false
@@ -196,6 +268,10 @@ function GridSequencer.new(options)
   self.pattern_press_time = nil
   self.pattern_selection_made = false
   self.crossfade = 0  -- A/B crossfader position (0 = A, 1 = B), PRD §6.6
+  -- Copy/Clear/Paste buffers, one per scope (steps / page / pattern) so
+  -- copying at one scope never clobbers another (Tonverk §6.6).
+  self.clipboard = {steps = nil, page = nil, pattern = nil}
+  self.macro_hold = nil  -- which macro key (1-4) is held; routes E2/E3 to it
   self.scene_glide_target = nil  -- fader-key glide target (0..1) while held
   self.scene_glide_metro = nil   -- reused metro that eases toward it while held
   self.g.key = function(x, y, z) self:key(x, y, z) end
@@ -341,14 +417,14 @@ function GridSequencer:index_to_page_step(index)
 end
 
 function GridSequencer:sync_play_page_step()
-  self.play_page, self.play_step = self:index_to_page_step(self.play_index)
+  self.seq.play_page, self.seq.play_step = self:index_to_page_step(self.seq.play_index)
 end
 
 function GridSequencer:step_record(index, create)
-  if self.steps[index] == nil and create then
-    self.steps[index] = Step.new()
+  if self.seq.steps[index] == nil and create then
+    self.seq.steps[index] = Step.new()
   end
-  return self.steps[index]
+  return self.seq.steps[index]
 end
 
 function GridSequencer:step_record_for_page_step(page, step, create)
@@ -365,7 +441,7 @@ function GridSequencer:first_held_step()
 end
 
 function GridSequencer:pattern_has_trigs()
-  for _, record in pairs(self.steps) do
+  for _, record in pairs(self.seq.steps) do
     if record ~= nil and record.trig == true then
       return true
     end
@@ -377,47 +453,48 @@ end
 -- (PRD §6.1). Track params (pattern_steps, machine, filter, ...) live in the
 -- norns params system and are captured by the coordinator; this covers only the
 -- state the sequencer itself owns: the step records, the pattern rate, and which
--- pages loop. Used by the pattern store and, through it, project save/load (§7).
+-- pages loop -- now for EVERY track (contract: pattern slots capture/apply ALL
+-- tracks' sequences). The top-level steps/rate_index/page_loop mirror track 1
+-- so a pre-multitrack script reading a new snapshot still gets track 1.
 function GridSequencer:serialize()
-  local steps = {}
-  for index, record in pairs(self.steps) do
-    if Step.has_content(record) then
-      steps[index] = deep_copy(record)
-    end
-  end
-  local page_loop = {}
-  for page, on in pairs(self.page_loop) do
-    if on then
-      page_loop[page] = true
-    end
+  local tracks = {}
+  for track = 1, TRACK_COUNT_MAX do
+    tracks[track] = serialize_track(self.tracks[track])
   end
   return {
-    steps = steps,
-    rate_index = self.rate_index,
-    page_loop = page_loop
+    steps = tracks[1].steps,
+    rate_index = tracks[1].rate_index,
+    page_loop = tracks[1].page_loop,
+    tracks = tracks
   }
 end
 
 -- Restore a snapshot produced by serialize(). Missing fields fall back to a
--- blank/default pattern, so an empty table yields an empty sequence.
+-- blank/default pattern, so an empty table yields an empty sequence. OLD
+-- single-track snapshots (no `tracks` key -- every pre-Phase-1 pattern and
+-- project) load into track 1 and blank tracks 2-8 (compat is binding). The
+-- play position / pass counters / step timing are transport state, not pattern
+-- state: they carry over exactly as they did before this was track-aware (the
+-- coordinator's on_pattern_applied decides whether to re-anchor).
 function GridSequencer:deserialize(snapshot)
   snapshot = snapshot or {}
-  self.steps = {}
-  for index, record in pairs(snapshot.steps or {}) do
-    self.steps[index] = deep_copy(record)
+  local tracks = snapshot.tracks
+  if tracks == nil then
+    tracks = {[1] = snapshot}
   end
-  self.rate_index = snapshot.rate_index or 4
-  self.page_loop = {}
-  if snapshot.page_loop ~= nil then
-    for page, on in pairs(snapshot.page_loop) do
-      if on then
-        self.page_loop[page] = true
-      end
-    end
+  for track = 1, TRACK_COUNT_MAX do
+    local old = self.tracks[track]
+    local state = deserialize_track(tracks[track])
+    state.play_index = old.play_index
+    state.play_page = old.play_page
+    state.play_step = old.play_step
+    state.pattern_pass = old.pattern_pass
+    state.last_cond_result = old.last_cond_result
+    state.next_step_time = old.next_step_time
+    state.remaining_time = old.remaining_time
+    self.tracks[track] = state
   end
-  if next(self.page_loop) == nil then
-    self.page_loop[1] = true
-  end
+  self.seq = self.tracks[self.track]
 end
 
 function GridSequencer:held_step_index()
@@ -525,7 +602,7 @@ function GridSequencer:set_step_lock(page, step, start_point, end_point, start_o
 end
 
 function GridSequencer:clear_step(page, step)
-  self.steps[self:step_index(page, step)] = nil
+  self.seq.steps[self:step_index(page, step)] = nil
 end
 
 -- Loop-only single-key tap cycling: tapping the same loop key repeatedly while
@@ -573,7 +650,9 @@ function GridSequencer:lock_held_steps(start_point, end_point, held_count)
 end
 
 -- A reset flag is active for a step when the step p-locks it on, or (no lock)
--- the track default is on. Env/LFO/Filter resets are placeholders for now.
+-- the track default is on. lfo_reset gates the LFO retrigger (TRIG/ONE/HOLD
+-- modes) and env_reset the mod-envelope retrigger (see mod_trig in
+-- enter_step); filter_reset remains a placeholder.
 function GridSequencer:reset_active(record, reset_id)
   local locks = record ~= nil and record.param_locks or nil
   if locks ~= nil and locks[reset_id] ~= nil then
@@ -634,7 +713,7 @@ function GridSequencer:toggle_step(page, step)
   local index = self:step_index(page, step)
   local record = self:step_record(index, false)
   if Step.has_content(record) then
-    self.steps[index] = nil
+    self.seq.steps[index] = nil
     self:message(string.format("Step %02d Clear", step))
     return
   end
@@ -872,7 +951,7 @@ end
 
 function GridSequencer:clear_all_param_locks(param_id)
   local did_clear = false
-  for _, record in pairs(self.steps) do
+  for _, record in pairs(self.seq.steps) do
     if record.param_locks ~= nil and record.param_locks[param_id] ~= nil then
       record.param_locks[param_id] = nil
       did_clear = true
@@ -891,8 +970,11 @@ function GridSequencer:clear_all_param_locks(param_id)
   return did_clear
 end
 
-function GridSequencer:current_rate()
-  return RATES[self.rate_index] or 1
+-- `state` (optional, default = the selected track) lets the background-track
+-- advancement reuse the exact same logic without forking it -- same for
+-- step_seconds/step_duration/condition_result/evaluate_trig below.
+function GridSequencer:current_rate(state)
+  return RATES[(state or self.seq).rate_index] or 1
 end
 
 function GridSequencer:current_bpm()
@@ -905,8 +987,8 @@ function GridSequencer:current_bpm()
   return 120
 end
 
-function GridSequencer:step_seconds()
-  return 60 / self:current_bpm() / 4 / self:current_rate()
+function GridSequencer:step_seconds(state)
+  return 60 / self:current_bpm() / 4 / self:current_rate(state)
 end
 
 function GridSequencer:note_seconds(record)
@@ -950,8 +1032,8 @@ end
 -- Duration the given step occupies before the next advance. Straight = one step;
 -- swing lengthens odd steps and shortens the following even step by the same
 -- amount, so each odd/even pair still spans two straight steps.
-function GridSequencer:step_duration(index)
-  local base = self:step_seconds()
+function GridSequencer:step_duration(index, state)
+  local base = self:step_seconds(state)
   local swing = self:swing_amount()
   if swing <= 50 then
     return base
@@ -966,35 +1048,40 @@ end
 -- The kind (and full definition) of a step's trig condition. Reads the step's
 -- p-lock or the track param; both index into the shared TrigConditions table so
 -- the label shown and the logic run can never diverge.
-function GridSequencer:condition_definition(record)
-  local raw = self:step_field(record, "trig_condition", self.options.get_trig_condition, 1)
+-- `cond_getter` (optional) overrides the track-level fallback param read --
+-- background tracks pass their own track's getter; nil = the selected track's.
+function GridSequencer:condition_definition(record, cond_getter)
+  local raw = self:step_field(record, "trig_condition", cond_getter or self.options.get_trig_condition, 1)
   local idx = util.clamp(math.floor((tonumber(raw) or 1) + 0.5), 1, #TrigConditions)
   return TrigConditions[idx]
 end
 
 -- Whether a step's CONDITION passes this pass (independent of the chance roll).
 -- Pure read -- no side effects -- so it is safe to call for UI/preview too.
-function GridSequencer:condition_result(record)
-  local def = self:condition_definition(record)
+-- Fill is a shared live gesture; pattern_pass/last_cond_result are per track
+-- (`state`, default = the selected track).
+function GridSequencer:condition_result(record, state, cond_getter)
+  state = state or self.seq
+  local def = self:condition_definition(record, cond_getter)
   local kind = def ~= nil and def.kind or "none"
   if kind == "none" then
     return true
   elseif kind == "ab" then
-    return ((self.pattern_pass - 1) % def.b) + 1 == def.a
+    return ((state.pattern_pass - 1) % def.b) + 1 == def.a
   elseif kind == "fill" then
     return self.fill_active == true
   elseif kind == "nfill" then
     return self.fill_active ~= true
   elseif kind == "pre" then
-    return self.last_cond_result == true
+    return state.last_cond_result == true
   elseif kind == "npre" then
-    return self.last_cond_result ~= true
+    return state.last_cond_result ~= true
   elseif kind == "nei" or kind == "nnei" then
-    -- Neighbor-track conditions: no neighbor exists in the 1-track MVP, so both
-    -- evaluate always-true until the neighbor machine lands (PRD §6.5).
+    -- Neighbor-track conditions: no neighbor routing exists until Phase 5, so
+    -- both evaluate always-true until the neighbor machine lands (PRD §6.5).
     return true
   elseif kind == "first" then
-    return self.pattern_pass == 1
+    return state.pattern_pass == 1
   end
   return true
 end
@@ -1003,18 +1090,20 @@ end
 -- fields must pass: the condition AND the chance roll (PRD §6.5). Records the
 -- outcome for a following PRE/!PRE trig, but only for steps that themselves
 -- carry a condition, so a plain trig never breaks the conditional chain.
-function GridSequencer:evaluate_trig(record)
-  local def = self:condition_definition(record)
+function GridSequencer:evaluate_trig(record, state, cond_getter, chance_getter)
+  state = state or self.seq
+  local def = self:condition_definition(record, cond_getter)
   local kind = def ~= nil and def.kind or "none"
-  local fired = self:condition_result(record)
+  local fired = self:condition_result(record, state, cond_getter)
   if fired then
-    local chance = util.clamp(self:step_field(record, "trig_chance", self.options.get_trig_chance, 100), 0, 100)
+    local chance = util.clamp(
+      self:step_field(record, "trig_chance", chance_getter or self.options.get_trig_chance, 100), 0, 100)
     if chance < 100 then
       fired = (math.random() * 100) < chance
     end
   end
   if kind ~= "none" then
-    self.last_cond_result = fired
+    state.last_cond_result = fired
   end
   return fired
 end
@@ -1045,6 +1134,13 @@ end
 -- same dispatch a fresh step would do (minus the region/anchor bookkeeping, which
 -- the sub-hits share with the parent step).
 function GridSequencer:retrigger_ratchet(record, machine)
+  -- Sub-hits re-fire the mod sources the same as the parent step, so a
+  -- ratcheted note keeps its per-note LFO/mod-env articulation.
+  if self.options.mod_trig ~= nil then
+    self.options.mod_trig(
+      self:reset_active(record, "lfo_reset"),
+      self:reset_active(record, "env_reset"))
+  end
   if machine == MACHINE_LOOP or machine == MACHINE_LOOP_TRIG then
     if self.options.note_on ~= nil and not self:is_ghost(record) then
       self.options.note_on(self:note_seconds(record))
@@ -1350,7 +1446,19 @@ function GridSequencer:effective_param_locks(record)
 end
 
 function GridSequencer:metro_interval()
-  return util.clamp(self:step_seconds() / 2, 0.005, 0.05)
+  -- The one sequence metro serves every active track: tick fast enough for the
+  -- fastest track's rate (with one track this reduces to the old expression).
+  local fastest = self:step_seconds()
+  local count = self:active_track_count()
+  for track = 1, count do
+    if track ~= self.track then
+      local seconds = self:step_seconds(self.tracks[track])
+      if seconds < fastest then
+        fastest = seconds
+      end
+    end
+  end
+  return util.clamp(fastest / 2, 0.005, 0.05)
 end
 
 function GridSequencer:ensure_sequence_metro()
@@ -1581,7 +1689,7 @@ function GridSequencer:trigger_step_slices(record)
 end
 
 function GridSequencer:enter_step(reset_sequence)
-  local record = self:step_record(self.play_index, false)
+  local record = self:step_record(self.seq.play_index, false)
   local machine = self:machine()
 
   if reset_sequence then
@@ -1589,8 +1697,8 @@ function GridSequencer:enter_step(reset_sequence)
     self.seq_anchor = nil
     self.keys_anchor = nil
     -- A fresh start is pass 1 with no prior conditional result (PRD §6.5).
-    self.pattern_pass = 1
-    self.last_cond_result = nil
+    self.seq.pattern_pass = 1
+    self.seq.last_cond_result = nil
   end
 
   -- Live Step Trig: a live-held step owns playback -- sequenced steps advance
@@ -1633,6 +1741,17 @@ function GridSequencer:enter_step(reset_sequence)
     and fires and not self:is_ghost(record)
     and self.options.note_on ~= nil then
     self.options.note_on(self:note_seconds(record))
+  end
+
+  -- Retrigger the modulation sources (2 LFOs + mod env) on every firing step
+  -- where the corresponding reset resolves ON: lfo_reset gates the LFO trig
+  -- counters (only TRIG/ONE/HOLD LFO modes react), env_reset the mod
+  -- envelope's. Ghost steps resolve both off (existing ghost semantics), so
+  -- they carry the running modulation forward untouched.
+  if fires and self.options.mod_trig ~= nil then
+    self.options.mod_trig(
+      self:reset_active(record, "lfo_reset"),
+      self:reset_active(record, "env_reset"))
   end
 
   if machine == MACHINE_LOOP then
@@ -1712,12 +1831,14 @@ function GridSequencer:start_sequence(reset_sequence)
     self.seq_metro:stop()
   end
   self.playing = true
-  if self.seq_remaining_time ~= nil and not reset_sequence then
-    self.next_step_time = util.time() + self.seq_remaining_time
-    self.seq_remaining_time = nil
+  -- Fresh start (vs. resume-from-pause): the branch below that re-enters step 1.
+  local fresh_start = reset_sequence or self.seq.remaining_time == nil
+  if self.seq.remaining_time ~= nil and not reset_sequence then
+    self.seq.next_step_time = util.time() + self.seq.remaining_time
+    self.seq.remaining_time = nil
   else
-    self.seq_remaining_time = nil
-    self.play_index = 1
+    self.seq.remaining_time = nil
+    self.seq.play_index = 1
     self.global_pos = 1
     self:sync_play_page_step()
     self:enter_step(true)
@@ -1726,9 +1847,14 @@ function GridSequencer:start_sequence(reset_sequence)
     if not is_slice_machine(self:machine()) and not self:pattern_has_trigs()
       and self.options.note_on ~= nil then
       self.options.note_on(self:note_seconds(nil))
+      -- The droning no-trig start counts as one note for the mod sources too.
+      if self.options.mod_trig ~= nil then
+        self.options.mod_trig(true, true)
+      end
     end
-    self.next_step_time = util.time() + self:step_duration(self.play_index)
+    self.seq.next_step_time = util.time() + self:step_duration(self.seq.play_index)
   end
+  self:prime_background_tracks(fresh_start)
   local seq_metro = self:ensure_sequence_metro()
   if seq_metro ~= nil then
     seq_metro:start(self:metro_interval(), -1)
@@ -1736,15 +1862,50 @@ function GridSequencer:start_sequence(reset_sequence)
   self:request_redraw()
 end
 
+-- Phase 1 track scaffolding: ready every non-selected active track for
+-- playback. reset = re-anchor at step 1 and fire it (the same treatment the
+-- selected track just got from enter_step(true)); otherwise leave their
+-- positions alone -- a paused track resumes from its parked remaining_time in
+-- tick_background_tracks.
+function GridSequencer:prime_background_tracks(reset)
+  local now = util.time()
+  local count = self:active_track_count()
+  for track = 1, count do
+    if track ~= self.track then
+      local state = self.tracks[track]
+      if reset then
+        state.play_index = 1
+        state.play_page, state.play_step = self:index_to_page_step(1)
+        state.pattern_pass = 1
+        state.last_cond_result = nil
+        state.remaining_time = nil
+        self:enter_background_step(track, state)
+        state.next_step_time = now + self:step_duration(state.play_index, state)
+      end
+    end
+  end
+end
+
 function GridSequencer:pause_sequence()
   self.playing = false
   if self.seq_metro ~= nil then
     self.seq_metro:stop()
   end
-  if self.next_step_time ~= nil then
-    self.seq_remaining_time = math.max(0.001, self.next_step_time - util.time())
+  if self.seq.next_step_time ~= nil then
+    self.seq.remaining_time = math.max(0.001, self.seq.next_step_time - util.time())
   end
-  self.next_step_time = nil
+  self.seq.next_step_time = nil
+  -- Park every background track's step timing the same way, so resume keeps
+  -- their relative phase.
+  for track = 1, TRACK_COUNT_MAX do
+    if track ~= self.track then
+      local state = self.tracks[track]
+      if state.next_step_time ~= nil then
+        state.remaining_time = math.max(0.001, state.next_step_time - util.time())
+      end
+      state.next_step_time = nil
+    end
+  end
   if self.options.release_all_slices ~= nil then
     self.options.release_all_slices()
   end
@@ -1772,8 +1933,8 @@ function GridSequencer:reset_live_state()
   self.keys_anchor = nil
   self.manual_region = nil
   self.preview_active = false
-  self.pattern_pass = 1
-  self.last_cond_result = nil
+  self.seq.pattern_pass = 1
+  self.seq.last_cond_result = nil
   self.fill_active = false
   self.fill_latched = false
   self.fill_held = false
@@ -1789,13 +1950,21 @@ function GridSequencer:stop_sequence()
   if self.seq_metro ~= nil then
     self.seq_metro:stop()
   end
-  self.next_step_time = nil
-  self.seq_remaining_time = nil
   self.live_step_hold = false
   self.live_step_index = nil
   self.seq_anchor = nil
   self.keys_anchor = nil
-  self.play_index = 1
+  -- Stop re-anchors EVERY track at step 1 (selected included -- self.seq is
+  -- one of these), matching the old single-track reset.
+  for track = 1, TRACK_COUNT_MAX do
+    local state = self.tracks[track]
+    state.next_step_time = nil
+    state.remaining_time = nil
+    state.play_index = 1
+    state.play_page, state.play_step = self:index_to_page_step(1)
+    state.pattern_pass = 1
+    state.last_cond_result = nil
+  end
   self.global_pos = 1
   if self.options.clear_pattern_pending ~= nil then
     self.options.clear_pattern_pending()
@@ -1834,8 +2003,8 @@ function GridSequencer:tick_sequence()
   end
 
   local now = util.time()
-  if self.next_step_time == nil then
-    self.next_step_time = now + self:step_seconds()
+  if self.seq.next_step_time == nil then
+    self.seq.next_step_time = now + self:step_seconds()
   end
 
   local had_region_hold = self.param_lock_holds.loop_start ~= nil
@@ -1872,20 +2041,98 @@ function GridSequencer:tick_sequence()
 
   local advanced = false
   local guard = 0
-  while self.playing and now >= self.next_step_time and guard < 8 do
+  while self.playing and now >= self.seq.next_step_time and guard < 8 do
     self:advance_step()
     -- The step just entered holds for its swing-adjusted duration (PRD §6.5).
-    self.next_step_time = self.next_step_time + self:step_duration(self.play_index)
+    self.seq.next_step_time = self.seq.next_step_time + self:step_duration(self.seq.play_index)
     advanced = true
     guard = guard + 1
   end
 
-  if advanced and self.next_step_time < now then
-    self.next_step_time = now + self:step_duration(self.play_index)
+  if advanced and self.seq.next_step_time < now then
+    self.seq.next_step_time = now + self:step_duration(self.seq.play_index)
   end
+
+  -- Phase 1 track scaffolding: every other active track advances on its own
+  -- position/rate (only the selected track is edited/displayed above).
+  self:tick_background_tracks(now)
 
   if self.seq_metro ~= nil then
     self.seq_metro.time = self:metro_interval()
+  end
+end
+
+-- ---- Background (non-selected) track advancement ---------------------------
+-- Each active track keeps its own play position, pass counter and step timing
+-- in self.tracks[t]; the shared primitives (step_duration/evaluate_trig) take
+-- the track's state/getters instead of being forked. A firing step is handed
+-- to the coordinator (options.track_step), which pushes its pitch/region locks
+-- to that track's engine chain (tr-prefixed commands; graceful no-ops until
+-- the engine half lands).
+function GridSequencer:track_param(track, suffix)
+  if self.options.get_track_param == nil then
+    return nil
+  end
+  return self.options.get_track_param(track, suffix)
+end
+
+function GridSequencer:track_pattern_steps(track)
+  local raw = self:track_param(track, "pattern_steps")
+  return util.clamp(math.floor((tonumber(raw) or 16) + 0.5), 1, 256)
+end
+
+function GridSequencer:tick_background_tracks(now)
+  local count = self:active_track_count()
+  if count <= 1 then
+    return
+  end
+  for track = 1, count do
+    if track ~= self.track then
+      local state = self.tracks[track]
+      if state.next_step_time == nil then
+        -- Freshly resumed (or never primed): honor a parked pause remainder.
+        state.next_step_time = now + (state.remaining_time or self:step_duration(state.play_index, state))
+        state.remaining_time = nil
+      end
+      local guard = 0
+      while self.playing and now >= state.next_step_time and guard < 8 do
+        self:advance_background_track(track, state)
+        state.next_step_time = state.next_step_time + self:step_duration(state.play_index, state)
+        guard = guard + 1
+      end
+      if guard > 0 and state.next_step_time < now then
+        state.next_step_time = now + self:step_duration(state.play_index, state)
+      end
+    end
+  end
+end
+
+function GridSequencer:advance_background_track(track, state)
+  state.play_index = state.play_index + 1
+  if state.play_index > self:track_pattern_steps(track) then
+    state.play_index = 1
+    state.pattern_pass = (state.pattern_pass or 1) + 1
+  end
+  state.play_page, state.play_step = self:index_to_page_step(state.play_index)
+  self:enter_background_step(track, state)
+end
+
+function GridSequencer:enter_background_step(track, state)
+  local record = state.steps[state.play_index]
+  if record == nil then
+    return
+  end
+  local machine = util.clamp(math.floor((tonumber(self:track_param(track, "machine")) or 1) + 0.5), 1, 4)
+  local active = (is_slice_machine(machine) and table_count(record.slices) > 0)
+    or record.trig == true
+  if not active then
+    return
+  end
+  local fires = self:evaluate_trig(record, state,
+    function() return self:track_param(track, "trig_condition") end,
+    function() return self:track_param(track, "trig_chance") end)
+  if fires and self.options.track_step ~= nil then
+    self.options.track_step(track, record)
   end
 end
 
@@ -1905,12 +2152,12 @@ function GridSequencer:advance_step()
     self.global_pos = next_global
   end
 
-  self.play_index = self.play_index + 1
-  if self.play_index > self:pattern_steps() then
-    self.play_index = 1
+  self.seq.play_index = self.seq.play_index + 1
+  if self.seq.play_index > self:pattern_steps() then
+    self.seq.play_index = 1
     -- A new loop of the pattern: bump the pass counter that drives A:B and 1st
     -- trig conditions (PRD §6.5).
-    self.pattern_pass = (self.pattern_pass or 1) + 1
+    self.seq.pattern_pass = (self.seq.pattern_pass or 1) + 1
   end
   self:sync_play_page_step()
   self:enter_step(false)
@@ -1923,18 +2170,35 @@ end
 -- (Direct Jump), clamped into the new pattern's length.
 function GridSequencer:on_pattern_applied(restart)
   if restart then
-    self.play_index = 1
+    -- Re-anchor EVERY track at step 1 (a fresh pattern start is pattern-wide).
+    for track = 1, TRACK_COUNT_MAX do
+      local state = self.tracks[track]
+      state.play_index = 1
+      state.play_page, state.play_step = self:index_to_page_step(1)
+      state.pattern_pass = 1
+      state.last_cond_result = nil
+    end
     self.global_pos = 1
-    self.pattern_pass = 1
-    self.last_cond_result = nil
     self:sync_play_page_step()
     if self.playing then
       self:enter_step(true)
-      self.next_step_time = util.time() + self:step_duration(self.play_index)
+      self.seq.next_step_time = util.time() + self:step_duration(self.seq.play_index)
+      self:prime_background_tracks(true)
     end
   else
-    if self.play_index > self:pattern_steps() then
-      self.play_index = ((self.play_index - 1) % self:pattern_steps()) + 1
+    -- Direct Jump: keep every track's position, clamped into the new lengths.
+    if self.seq.play_index > self:pattern_steps() then
+      self.seq.play_index = ((self.seq.play_index - 1) % self:pattern_steps()) + 1
+    end
+    for track = 1, TRACK_COUNT_MAX do
+      if track ~= self.track then
+        local state = self.tracks[track]
+        local steps = self:track_pattern_steps(track)
+        if state.play_index > steps then
+          state.play_index = ((state.play_index - 1) % steps) + 1
+          state.play_page, state.play_step = self:index_to_page_step(state.play_index)
+        end
+      end
     end
     if self.global_pos > self:global_length() then
       self.global_pos = ((self.global_pos - 1) % self:global_length()) + 1
@@ -2006,13 +2270,13 @@ function GridSequencer:handle_page_step(x)
     self.selected_page = x
     self:message(string.format("Page %02d", x))
   elseif self.page_mode == "loop" then
-    self.page_loop[x] = not self.page_loop[x]
-    if not any_keys(self.page_loop) then
-      self.page_loop[x] = true
+    self.seq.page_loop[x] = not self.seq.page_loop[x]
+    if not any_keys(self.seq.page_loop) then
+      self.seq.page_loop[x] = true
     end
-    self:message(string.format("Page %02d %s", x, self.page_loop[x] and "On" or "Off"))
+    self:message(string.format("Page %02d %s", x, self.seq.page_loop[x] and "On" or "Off"))
   elseif self.page_mode == "rate" and RATES[x] ~= nil then
-    self.rate_index = x
+    self.seq.rate_index = x
     self:message("Rate " .. rate_label(RATES[x]))
   end
 end
@@ -2020,6 +2284,144 @@ end
 function GridSequencer:set_page_mode(mode)
   self.page_mode = mode
   self:message(PAGE_MODE_LABELS[mode] or mode)
+end
+
+-- ---- Track select / mute keys (grid row 4, cols 8-15) ----------------------
+-- Press = select (the whole editing surface -- steps, params, pages -- follows
+-- the selection); FN+press = mute toggle (engine \trMute: a muted track keeps
+-- advancing but outputs silence). Cols 1-7/16 of row 4 stay reserved.
+local TRACK_KEY_MIN_COL, TRACK_KEY_MAX_COL = 8, 15
+
+function GridSequencer:active_track_count()
+  if self.options.get_active_track_count ~= nil then
+    return util.clamp(math.floor((self.options.get_active_track_count() or 1) + 0.5), 1, TRACK_COUNT_MAX)
+  end
+  return 1
+end
+
+-- active_track_count dropped below the selection: snap back inside the count
+-- (called by the coordinator from the param's action).
+function GridSequencer:clamp_track_selection()
+  local count = self:active_track_count()
+  if self.track > count then
+    self:select_track(count)
+  end
+end
+
+function GridSequencer:select_track(track)
+  track = util.clamp(math.floor((tonumber(track) or 1) + 0.5), 1, TRACK_COUNT_MAX)
+  if track == self.track then
+    return
+  end
+  -- Any steps physically held right now belong to the OLD track's editing
+  -- surface: mark them edited so their release doesn't toggle a step on the
+  -- new track.
+  for step, held in pairs(self.step_holds) do
+    if held then
+      self.step_edited[step] = true
+    end
+  end
+  -- Restore any active step-lock bases BEFORE the id funnel moves to the new
+  -- track: apply_step_param_locks(nil) writes the stashed base values back
+  -- through the coordinator's ui ids, which must still resolve to the OLD
+  -- track's params here.
+  if self.options.apply_step_param_locks ~= nil then
+    self.options.apply_step_param_locks(nil)
+  end
+  self.track = track
+  self.seq = self.tracks[track]
+  -- Live override bookkeeping (param-lock holds, region cache, anchors) was
+  -- the old track's; clear it so nothing leaks across the switch. The layered
+  -- resolver re-derives the new track's region from its own params/locks.
+  self:clear_param_lock_holds()
+  self.seq_anchor = nil
+  self.keys_anchor = nil
+  self.manual_region = nil
+  self.current_region_start = nil
+  self.current_region_end = nil
+  self.current_range_start = nil
+  self.current_range_end = nil
+  self:sync_play_page_step()
+  if self.options.on_track_selected ~= nil then
+    self.options.on_track_selected(track)
+  end
+  self:message("Track " .. track)
+  self:request_redraw()
+end
+
+function GridSequencer:track_muted(track)
+  return self.options.get_track_muted ~= nil and self.options.get_track_muted(track) == true
+end
+
+function GridSequencer:key_track(track, z)
+  if z ~= 1 then
+    return
+  end
+  if track > self:active_track_count() then
+    self:message("Track " .. track .. " off")
+    return
+  end
+  if self.fn_down then
+    local mute = not self:track_muted(track)
+    if self.options.set_track_mute ~= nil then
+      self.options.set_track_mute(track, mute)
+      self:message(string.format("Track %d %s", track, mute and "muted" or "unmuted"))
+    end
+  else
+    self:select_track(track)
+  end
+end
+
+-- Macro keys (row 4, cols 1-4). Holding one routes E2 -> that macro's value
+-- and E3 -> its depth (coordinator enc), so you can ride a macro live from any
+-- page; with a step ALSO held the value edit p-locks onto the step, exactly
+-- like editing a macro param on its page. The key is momentary -- no toggle.
+function GridSequencer:key_macro(macro, z)
+  if z == 1 then
+    self.macro_hold = macro
+    self:message(string.format("Macro %d", macro))
+  elseif self.macro_hold == macro then
+    self.macro_hold = nil
+  end
+  self:request_redraw()
+end
+
+-- Which macro key is held (1-4), or nil. Read by the coordinator's enc().
+function GridSequencer:held_macro()
+  return self.macro_hold
+end
+
+-- Macro-key LEDs (cols 1-4): brightness tracks the macro's value so you can see
+-- where each sits; the held one reads brightest. Value comes from the injected
+-- getter (0-127) so p-locks/live edits show live.
+function GridSequencer:draw_macro_row()
+  for macro = 1, 4 do
+    local value = self.options.get_macro_value ~= nil and self.options.get_macro_value(macro) or 0
+    local level = 3 + math.floor((value / 127) * 8)
+    if self.macro_hold == macro then
+      level = 15
+    end
+    self.g:led(macro, 4, self:pressed_level(macro, 4, level))
+  end
+end
+
+-- Row-4 LEDs: bright = selected, mid = active-but-unselected, off = beyond the
+-- active count; muted tracks read dimmer at the same positions.
+function GridSequencer:draw_track_row()
+  local count = self:active_track_count()
+  for track = 1, TRACK_COUNT_MAX do
+    local x = track + TRACK_KEY_MIN_COL - 1
+    local level = 0
+    if track <= count then
+      local muted = self:track_muted(track)
+      if track == self.track then
+        level = muted and 8 or 12
+      else
+        level = muted and 2 or 6
+      end
+    end
+    self.g:led(x, 4, self:pressed_level(x, 4, level))
+  end
 end
 
 function GridSequencer:key(x, y, z)
@@ -2118,6 +2520,10 @@ function GridSequencer:key(x, y, z)
     self:key_octave(x, z)
   elseif y == 5 and x >= 9 and x <= 16 then
     self:key_scene(x, z)
+  elseif y == 4 and x >= 1 and x <= 4 then
+    self:key_macro(x, z)
+  elseif y == 4 and x >= TRACK_KEY_MIN_COL and x <= TRACK_KEY_MAX_COL then
+    self:key_track(x - TRACK_KEY_MIN_COL + 1, z)
   elseif self:key_pitch_control(x, y, z) then
     -- handled
   elseif z == 1 then
@@ -2167,17 +2573,206 @@ function GridSequencer:key_category(category)
   end
 end
 
+-- ---- Copy / Clear / Paste (Tonverk manual §6.6/§10.10.4/§19) ---------------
+-- The REC/PLAY/STOP transport keys double as COPY/CLEAR/PASTE when a scope
+-- modifier is held, exactly like an Elektron box:
+--   hold STEP(s) + REC/PLAY/STOP  = copy / clear-locks / paste trigs
+--   hold PAGE    + REC/PLAY/STOP  = copy / clear / paste the selected page
+--   hold FN      + REC/PLAY/STOP  = copy / clear(confirm) / paste the pattern
+-- Each scope has its own buffer (self.clipboard.steps/page/pattern), so a
+-- copied step never clobbers a copied pattern. With no modifier held the keys
+-- stay plain transport.
+
+-- Copy every held step, anchored at the lowest held key: entries store the
+-- offset from that anchor so a multi-step copy pastes "in the same relation to
+-- each other" (Tonverk p.46) from whatever step anchors the paste.
+function GridSequencer:copy_held_steps()
+  local held = sorted_held_keys(self.step_holds)
+  if #held == 0 then
+    return
+  end
+  local entries = {}
+  for _, step in ipairs(held) do
+    local record = self:step_record_for_page_step(self.selected_page, step, false)
+    entries[#entries + 1] = {
+      offset = step - held[1],
+      record = record ~= nil and deep_copy(record) or nil
+    }
+  end
+  self.clipboard.steps = entries
+  self:message(#held == 1 and string.format("Step %02d copied", held[1])
+    or string.format("%d steps copied", #held))
+end
+
+function GridSequencer:paste_on_held_steps()
+  local entries = self.clipboard.steps
+  if entries == nil then
+    self:message("Nothing copied")
+    return
+  end
+  local pasted = 0
+  for step, down in pairs(self.step_holds) do
+    if down then
+      for _, entry in ipairs(entries) do
+        local target = step + entry.offset
+        -- Overflow past the page edge is dropped, same as pasting a trig run
+        -- near the end of a pattern on the reference boxes.
+        if target >= 1 and target <= 16 then
+          self.seq.steps[self:step_index(self.selected_page, target)] =
+            entry.record ~= nil and deep_copy(entry.record) or nil
+          pasted = pasted + 1
+        end
+      end
+    end
+  end
+  if pasted > 0 then
+    self:message("Pasted")
+    self:refresh_held_step()
+  end
+end
+
+-- CLEAR on a held trig removes its parameter locks but keeps the trig itself
+-- (Tonverk p.79: "[TRIG] + [PLAY] to clear all parameter locks on the trig").
+function GridSequencer:clear_held_step_locks()
+  for step, down in pairs(self.step_holds) do
+    if down then
+      local record = self:step_record_for_page_step(self.selected_page, step, false)
+      if record ~= nil then
+        record.pitch = nil
+        record.length = nil
+        record.velocity = nil
+        record.param_locks = {}
+      end
+    end
+  end
+  self:message("Locks cleared")
+  self:refresh_held_step()
+end
+
+-- Page scope: the 16 records of the currently-selected page.
+function GridSequencer:copy_selected_page()
+  local page = {}
+  for step = 1, 16 do
+    local record = self:step_record_for_page_step(self.selected_page, step, false)
+    page[step] = record ~= nil and deep_copy(record) or nil
+  end
+  self.clipboard.page = page
+  self:message(string.format("Page %d copied", self.selected_page))
+end
+
+function GridSequencer:paste_selected_page()
+  local page = self.clipboard.page
+  if page == nil then
+    self:message("Nothing copied")
+    return
+  end
+  for step = 1, 16 do
+    self.seq.steps[self:step_index(self.selected_page, step)] =
+      page[step] ~= nil and deep_copy(page[step]) or nil
+  end
+  self:message(string.format("Pasted to page %d", self.selected_page))
+end
+
+function GridSequencer:clear_selected_page()
+  for step = 1, 16 do
+    self.seq.steps[self:step_index(self.selected_page, step)] = nil
+  end
+  self:message(string.format("Page %d cleared", self.selected_page))
+end
+
+-- Pattern scope: buffer/apply via the coordinator (whole pattern snapshot:
+-- sequence + per-pattern params). CLEAR wipes only the trigs, behind the same
+-- YES-confirm popup the reference box shows.
+function GridSequencer:copy_pattern()
+  if self.options.copy_pattern_state ~= nil then
+    self.clipboard.pattern = self.options.copy_pattern_state()
+    self:message("Pattern copied")
+  end
+end
+
+function GridSequencer:paste_pattern()
+  if self.clipboard.pattern == nil then
+    self:message("Nothing copied")
+    return
+  end
+  if self.options.paste_pattern_state ~= nil then
+    self.options.paste_pattern_state(self.clipboard.pattern)
+    self:message("Pattern pasted")
+  end
+end
+
+function GridSequencer:clear_pattern_trigs()
+  local function wipe()
+    self.seq.steps = {}
+    self:message("Pattern cleared")
+    self:request_redraw()
+  end
+  if self.options.open_confirm ~= nil then
+    self.options.open_confirm("Clear pattern?", wipe)
+  else
+    wipe()
+  end
+end
+
 function GridSequencer:key_controls(x, z)
   if x == 1 then
     self.fn_down = z == 1
-  elseif z == 1 and x == 3 then
+    return
+  end
+  if z ~= 1 or (x ~= 3 and x ~= 4 and x ~= 5) then
+    return
+  end
+
+  -- Copy/Clear/Paste scopes, most specific modifier first.
+  if any_keys(self.step_holds) then
+    -- Editing gesture: don't let release toggle the held trigs off.
+    for step, down in pairs(self.step_holds) do
+      if down then
+        self.step_edited[step] = true
+      end
+    end
+    if x == 3 then
+      self:copy_held_steps()
+    elseif x == 4 then
+      self:clear_held_step_locks()
+    else
+      self:paste_on_held_steps()
+    end
+    self:request_redraw()
+    return
+  end
+  if self.page_down then
+    if x == 3 then
+      self:copy_selected_page()
+    elseif x == 4 then
+      self:clear_selected_page()
+    else
+      self:paste_selected_page()
+    end
+    self:request_redraw()
+    return
+  end
+  if self.fn_down then
+    if x == 3 then
+      self:copy_pattern()
+    elseif x == 4 then
+      self:clear_pattern_trigs()
+    else
+      self:paste_pattern()
+    end
+    self:request_redraw()
+    return
+  end
+
+  -- Plain transport.
+  if x == 3 then
     self.recording = not self.recording
     self:message(self.recording and "Record On" or "Record Off")
-  elseif z == 1 and x == 4 then
+  elseif x == 4 then
     if self.options.set_playing ~= nil then
       self.options.set_playing(not self.playing, false)
     end
-  elseif z == 1 and x == 5 then
+  elseif x == 5 then
     if self.options.set_playing ~= nil then
       self.options.set_playing(false, true)
     end
@@ -2773,7 +3368,7 @@ function GridSequencer:draw_slice_rows()
   local count = self:slice_count()
   local held_step = self:first_held_step()
   local held_record = held_step ~= nil and self:step_record_for_page_step(self.selected_page, held_step, false) or nil
-  local play_record = self.playing and self:step_record(self.play_index, false) or nil
+  local play_record = self.playing and self:step_record(self.seq.play_index, false) or nil
 
   for slice = 1, count do
     local row = slice <= 16 and 2 or 3
@@ -2898,6 +3493,8 @@ function GridSequencer:draw_normal_leds()
   end
 
   self:draw_keyboard()
+  self:draw_macro_row()
+  self:draw_track_row()
 
   -- Nav arrows / YES / NO sit at a uniform dim base and only brighten when
   -- pressed. The page-mode tint (which mode is active) shows ONLY while the
@@ -3032,7 +3629,7 @@ function GridSequencer:draw_step_row()
         level = 2 + math.floor((fade * 3) + 0.5)
       end
     end
-    if self.playing and index == self.play_index then
+    if self.playing and index == self.seq.play_index then
       level = flash_on and 15 or 5
     end
     if self.step_holds[x] then
@@ -3050,14 +3647,14 @@ function GridSequencer:draw_page_row()
     if self.page_mode == "select" then
       level = x == self.selected_page and 12 or level
     elseif self.page_mode == "loop" then
-      level = self.page_loop[x] and 9 or level
+      level = self.seq.page_loop[x] and 9 or level
     elseif self.page_mode == "rate" then
       level = RATES[x] ~= nil and 4 or 1
-      if x == self.rate_index then
+      if x == self.seq.rate_index then
         level = 12
       end
     end
-    if self.playing and x == self.play_page then
+    if self.playing and x == self.seq.play_page then
       level = flash_on and 15 or 5
     end
     self.g:led(x, 8, level)

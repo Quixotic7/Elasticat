@@ -9,8 +9,8 @@
 --
 -- ==== NORNS CONTROLS ========================================================
 -- A caret sits BETWEEN characters (insert point). Focus is either the LETTER
--- picker or one of three FUNCTION buttons (Cancel / DEL / Confirm); E2 moves
--- focus across [letters, Cancel, DEL, Confirm].
+-- picker or one of five FUNCTION buttons (X / RND / CLEAR / DEL / Confirm);
+-- E2 moves focus across them. RND fills in a namesizer-generated name.
 --   Letter focus:  E3 scrolls the character picker; K3 inserts it at the caret;
 --                  E1 moves the caret; K2 deletes left of the caret.
 --   Button focus:  K3 activates the button; K2 cancels.
@@ -31,7 +31,7 @@ TextEntry.DEFAULT_CHARSET = " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 TextEntry.DEFAULT_MAX_LENGTH = 32
 TextEntry.PICKER_WINDOW_RADIUS = 3
 -- Focus values (E2 walks these): letters, then the function buttons.
-local FOCUS_LETTERS, FOCUS_CANCEL, FOCUS_CLEAR, FOCUS_DEL, FOCUS_CONFIRM = 0, 1, 2, 3, 4
+local FOCUS_LETTERS, FOCUS_CANCEL, FOCUS_RND, FOCUS_CLEAR, FOCUS_DEL, FOCUS_CONFIRM = 0, 1, 2, 3, 4, 5
 
 -- Build the grid cell table once: cells[y][x] = {kind, lower, shift, level}.
 -- kind: char | shift | backspace | return | escape | left | right | up | down | space
@@ -148,6 +148,22 @@ function TextEntry:_clear()
   self.cursor = 0
 end
 
+-- RND button: replace the text with a namesizer-generated name (bundled
+-- lib/namesizer, hyphen-joined so it's filename-safe). Loaded lazily and
+-- pcall-guarded; a missing/broken library makes RND a silent no-op rather
+-- than crashing a modal that has swallowed all input.
+function TextEntry:_randomize()
+  local ok, NameSizer = pcall(function() return include("lib/namesizer/namesizer") end)
+  if not ok or type(NameSizer) ~= "table" or type(NameSizer.rnd) ~= "function" then
+    return
+  end
+  local ok2, name = pcall(NameSizer.rnd, "-")
+  if ok2 and type(name) == "string" and name ~= "" then
+    self.text = name:sub(1, self.max_length)
+    self.cursor = #self.text
+  end
+end
+
 function TextEntry:_move_cursor(delta)
   self.cursor = math.max(0, math.min(#self.text, self.cursor + delta))
 end
@@ -178,6 +194,8 @@ end
 function TextEntry:_activate_focus()
   if self.focus == FOCUS_CANCEL then
     self:_cancel()
+  elseif self.focus == FOCUS_RND then
+    self:_randomize()
   elseif self.focus == FOCUS_CLEAR then
     self:_clear()
   elseif self.focus == FOCUS_DEL then
@@ -362,13 +380,13 @@ function TextEntry:draw()
     screen.text_center(label)
   end
 
-  -- Function buttons: X / CLEAR / DEL / Confirm. Four even 31px cells with 1px
-  -- gaps (4*31 + 3 = 127). No borders -- just the label, highlighted (filled
-  -- box, inverted text) when focused.
-  local labels = {"X", "CLEAR", "DEL", self.confirm_label}
-  local focus_map = {FOCUS_CANCEL, FOCUS_CLEAR, FOCUS_DEL, FOCUS_CONFIRM}
-  local cell_w = 31
-  for i = 1, 4 do
+  -- Function buttons: X / RND / CLEAR / DEL / Confirm. Five even 25px cells
+  -- with 1px gaps. No borders -- just the label, highlighted (filled box,
+  -- inverted text) when focused. RND replaces the text with a namesizer name.
+  local labels = {"X", "RND", "CLEAR", "DEL", self.confirm_label}
+  local focus_map = {FOCUS_CANCEL, FOCUS_RND, FOCUS_CLEAR, FOCUS_DEL, FOCUS_CONFIRM}
+  local cell_w = 25
+  for i = 1, 5 do
     local bx = (i - 1) * (cell_w + 1)
     if self.focus == focus_map[i] then
       screen.level(15)

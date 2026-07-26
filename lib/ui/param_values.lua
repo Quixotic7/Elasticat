@@ -240,8 +240,10 @@ end
 
 function ParamValues:pattern_rate_index()
   local grid_ui = self.get_grid_ui()
-  if grid_ui ~= nil then
-    return grid_ui.rate_index or 4
+  if grid_ui ~= nil and grid_ui.seq ~= nil then
+    -- Per-track sequence state (Phase 1): the rate lives on the selected
+    -- track's state table (grid_ui.seq), not on the sequencer object.
+    return grid_ui.seq.rate_index or 4
   end
   return 4
 end
@@ -462,9 +464,10 @@ function ParamValues:apply_item_value(param_item, value)
       select_sample()
     end
   elseif param_item.pseudo == "pattern_rate" then
-    if grid_ui ~= nil then
-      grid_ui.rate_index = util.clamp(math.floor(value + 0.5), 1, #PATTERN_RATES)
-      self.show_message("Pattern Rate " .. rate_label(PATTERN_RATES[grid_ui.rate_index] or 1))
+    if grid_ui ~= nil and grid_ui.seq ~= nil then
+      -- Per-track sequence state (Phase 1): write the selected track's rate.
+      grid_ui.seq.rate_index = util.clamp(math.floor(value + 0.5), 1, #PATTERN_RATES)
+      self.show_message("Pattern Rate " .. rate_label(PATTERN_RATES[grid_ui.seq.rate_index] or 1))
     end
   elseif param_item.pseudo == "step_length" then
     local next_length = util.clamp(value, param_item.min or 0.25, param_item.max or 16)

@@ -98,6 +98,9 @@ This document describes the current module boundaries and the rules for future c
   - The parameter-item value runtime: raw value, display formatting, snap/delta adjustment, apply-to-params, step-lock apply/read.
   - Built via constructor injection (`get_grid_ui`, `get_alt`, step-lock tables, etc.), the same idiom `GridSequencer.new()` already used for its callbacks.
   - `format_item_value` is an id → formatter lookup table for the common numeric-display case; only params needing bespoke display logic (enum remapping, pseudo-items) get an explicit branch.
+- `lib/ui/page_render.lua`
+  - Elektron-style renderer for the generic K2/K3-pair param pages (everything `draw_root_page` doesn't route to `source_page.lua`): the 2x4 label/value/position-bar cell grid, the selected-pair outline, lock/edit-flash chip inversion, and the per-category widgets (FILTER response curve, FILTER/AMP envelope sketches, FX insert/sends identity).
+  - Pure rendering, `.new(opts)` + injected accessors (`param_values`, `param_value_or`, registry name lists); no engine calls, no param writes. Cell drawing is level-batched into passes (never per-cell/per-pixel `screen.level`) and curves are short polylines — see the file header's performance law.
 - `lib/ui/source_page.lua`
   - Source-category rendering: the pitch ruler, sample-slot tab, waveform box + start/end/playhead markers, and the main/sample-edit cell renderers.
   - Pure rendering, like `param_renderer.lua`: receives `param_values` and `nav` as objects and coordinator-only helpers (`draw_page_header`, `active_waveform`, `active_region`, `display_phase`, `visual_param_value`) as callbacks, so it never touches engine/param state directly.
@@ -159,8 +162,8 @@ This document describes the current module boundaries and the rules for future c
    Add or update a module in `lib/machines/` instead.
 2. Do not add new warp-mode-specific branches to `elasticat.lua`.
    Add or update a module in `lib/warp_modes/` instead.
-3. Screen parameter cells should be rendered through `lib/ui/param_renderer.lua` (generic pages) or `lib/ui/source_page.lua` (Source-category pages).
-   Do not copy text-fit or selected-corner logic into feature code.
+3. Screen parameter cells should be rendered through `lib/ui/page_render.lua` (generic pages) or `lib/ui/source_page.lua` (Source-category pages; it still uses `lib/ui/param_renderer.lua`'s helpers).
+   Do not copy text-fit, cell, or selection-highlight logic into feature code.
 4. Page headers must be rendered through `lib/ui/header.lua`, via `elasticat.lua`'s single `draw_page_header` wrapper.
    Do not add page-specific header implementations; pass page title, message, tempo, meter, and page number into the shared header.
 5. Parameter layouts should be lists of item descriptors from `lib/ui/param_item.lua`, defined in `lib/pages/model.lua`.
@@ -208,7 +211,7 @@ To add a filter machine:
 To add a parameter page:
 
 1. Define item descriptors in `lib/pages/model.lua` (or the owning machine/warp module for Source sub-pages).
-2. Render them through the existing page renderer (`param_renderer.lua` or `source_page.lua`).
+2. Render them through the existing page renderer (`page_render.lua` or `source_page.lua`).
 3. Avoid direct screen drawing unless the page is a custom visual page, such as waveform editing.
 
 To add a new parameter's display formatting:
