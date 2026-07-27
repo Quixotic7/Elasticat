@@ -670,6 +670,41 @@ function PageRender:draw_low_profile_cell(item, index, selected, row_y)
   })
 end
 
+-- Draw ONE selection bracket around the selected K2/K3 pair (#46): a 3px
+-- top-left corner on the leftmost selected cell and a 3px bottom-right corner
+-- on the rightmost, so the pair reads as a single group -- not a box per cell.
+-- `pairs` is a list of {cell = <0-3>, inverted = <bool>} for the non-blank
+-- selected cells, left-to-right. Corners are bright on a normal cell and dark
+-- on the inverted p-lock chip (which would otherwise mask them). Two
+-- level-batched passes at most (one per corner), never per-pixel.
+function PageRender:draw_selection_bracket(cells, row_y)
+  if cells == nil or #cells == 0 then
+    return
+  end
+  local left = cells[1]
+  local right = cells[#cells]
+  screen.level(left.inverted and 0 or 15)
+  LowProfile.corner_rects(LowProfile.cell_x(left.cell), row_y, "tl")
+  screen.fill()
+  screen.level(right.inverted and 0 or 15)
+  LowProfile.corner_rects(LowProfile.cell_x(right.cell), row_y, "br")
+  screen.fill()
+end
+
+-- Resolve the selected pair (items lo..hi) into the non-blank cells the bracket
+-- should span, then draw it. `cell_for(i)` maps an item index to its cell index
+-- in the row; blanks are skipped so the bracket hugs the real params.
+function PageRender:draw_pair_bracket(items, lo, hi, cell_for, row_y)
+  local cells = {}
+  for i = lo, hi do
+    local it = items[i]
+    if it ~= nil and not it.blank then
+      cells[#cells + 1] = {cell = cell_for(i), inverted = self.param_values:item_locked(it)}
+    end
+  end
+  self:draw_selection_bracket(cells, row_y)
+end
+
 -- The 42-bar filter magnitude render (owner redesign). Bars grow from the
 -- bottom; the cutoff (+/- envelope-depth band while stopped, single bar while
 -- playing) is drawn brighter. Two level-batched passes (performance law).
@@ -889,6 +924,14 @@ function PageRender:draw_envelope_page(items, group, prefix, mode_id, bottom_fir
       self:draw_low_profile_cell(items[i], cell, i == sel_lo or i == sel_lo + 1, FENV_ROW_BOTTOM_Y)
     end
   end
+  -- One group bracket over the selected pair. A pair is always both on the top
+  -- row (sel_lo 1 or 3) or both on the bottom row (5 or 7) -- it never straddles.
+  if sel_lo <= 3 then
+    self:draw_pair_bracket(items, sel_lo, sel_lo + 1, function(i) return i - 1 end, FENV_ROW_TOP_Y)
+  else
+    self:draw_pair_bracket(items, sel_lo, sel_lo + 1,
+      function(i) return first_cell + (i - 5) end, FENV_ROW_BOTTOM_Y)
+  end
   self:draw_envelope_bars(items, sel_lo, prefix, mode_id)
 end
 
@@ -914,6 +957,7 @@ function PageRender:draw_filter_page(items, group, playing)
   for i = 1, 4 do
     self:draw_low_profile_cell(items[i], i - 1, i == sel_lo or i == sel_lo + 1)
   end
+  self:draw_pair_bracket(items, sel_lo, sel_lo + 1, function(i) return i - 1 end, FILTER_ROW_Y)
   self:draw_filter_bars(items, playing == true)
 end
 

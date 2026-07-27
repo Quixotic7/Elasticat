@@ -1036,6 +1036,11 @@ end
 -- the MASTER-page encoder and LEDs stay in sync.
 local SCENE_GLIDE_HZ = 30
 local SCENE_GLIDE_RATE = 5  -- per-second approach rate (time constant ~0.2s)
+-- FN + fader key (#42): a deliberately SLOW, MOMENTARY morph. Advances only
+-- while FN stays held and pauses (never snaps or auto-continues) on release;
+-- linear so full A<->B travel takes a predictable ~5s wherever it starts.
+-- Retune here.
+local SCENE_GLIDE_SLOW_SECONDS = 5
 
 -- One eased step of the crossfade toward scene_glide_target. Shared by the
 -- immediate step on a fader-key press (so even a fast TAP moves) and the
@@ -1046,10 +1051,25 @@ function GridSequencer:step_scene_glide()
     return true
   end
   local current = self.options.get_crossfade() or 0
-  local factor = math.min(1, SCENE_GLIDE_RATE / SCENE_GLIDE_HZ)
-  local next_value = current + (target - current) * factor
-  if math.abs(target - next_value) < 0.004 then
-    next_value = target
+  local next_value
+  -- Rate follows FN LIVE: hold FN for the slow morph, release it (while still
+  -- holding the fader key) to resume the fast approach immediately -- no need to
+  -- re-press (#42, owner feedback). Releasing the fader key stops the glide
+  -- (stop_scene_glide), freezing the position wherever it landed.
+  if self.fn_down == true then
+    -- LINEAR step sized so 0->1 spans SCENE_GLIDE_SLOW_SECONDS at SCENE_GLIDE_HZ.
+    local step = 1 / (SCENE_GLIDE_SLOW_SECONDS * SCENE_GLIDE_HZ)
+    if target >= current then
+      next_value = math.min(target, current + step)
+    else
+      next_value = math.max(target, current - step)
+    end
+  else
+    local factor = math.min(1, SCENE_GLIDE_RATE / SCENE_GLIDE_HZ)
+    next_value = current + (target - current) * factor
+    if math.abs(target - next_value) < 0.004 then
+      next_value = target
+    end
   end
   if next_value ~= current then
     self.options.set_crossfade(next_value)

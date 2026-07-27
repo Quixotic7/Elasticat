@@ -179,6 +179,25 @@ function SceneStore:capture(scene)
   self:invalidate()
 end
 
+-- Clear one param from BOTH scenes and drop its base (held Scene + B2/B3, #43).
+-- With the key absent from both scenes morph_targets() no longer includes it, so
+-- it is fully un-morphed and holds its live/base value across the whole fade --
+-- the owner's "same value in both scenes without editing each" goal. The
+-- coordinator passes the SELECTED track's full param id, so only that track's
+-- lock is touched; other tracks' entries and other keys are untouched.
+function SceneStore:clear_key(key)
+  if key == nil then
+    return false
+  end
+  local had = self.scenes[1][key] ~= nil or self.scenes[2][key] ~= nil
+    or self.bases[key] ~= nil
+  self.scenes[1][key] = nil
+  self.scenes[2][key] = nil
+  self.bases[key] = nil
+  self:invalidate()
+  return had
+end
+
 -- Store one param's value into a scene (the hold-anchor + encoder gesture).
 -- The live param is deliberately NOT written: like a held step's p-lock, the
 -- edit lands only in the scene, and the fader is what brings it into the

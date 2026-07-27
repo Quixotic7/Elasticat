@@ -93,9 +93,11 @@ function LowProfile.draw(opts)
     if d >= 0 then screen.rect(mid, y + 7, max(d, 1), 2)
     else screen.rect(mid + d, y + 7, -d, 2) end
     screen.fill()
-  elseif len > 0 then
+  else
+    -- Clamp to >= 1px: a param morphed to 0 still reads as "present, at zero"
+    -- instead of an empty cell (owner spec, #46).
     screen.level(fill_level)
-    screen.rect(x + BAR_X, y + 7, len, 2)
+    screen.rect(x + BAR_X, y + 7, max(len, 1), 2)
     screen.fill()
   end
 
@@ -109,9 +111,30 @@ function LowProfile.draw(opts)
     if d >= 0 then screen.rect(mid, y + 9, max(d, 1), 1)
     else screen.rect(mid + d, y + 9, -d, 1) end
     screen.fill()
-  elseif alen > 0 then
-    screen.rect(x + BAR_X, y + 9, alen, 1)
+  else
+    -- Clamp to >= 1px, same reasoning as the VALUE bar above.
+    screen.rect(x + BAR_X, y + 9, max(alen, 1), 1)
     screen.fill()
+  end
+end
+
+-- One 3-pixel selection corner bracket at a cell corner (#46). `kind` is "tl"
+-- (top-left) or "br" (bottom-right). The bracket is an L of 3 pixels: the
+-- corner pixel plus one along each edge. Top-left shifts 1px LEFT into the
+-- black border so it never overdraws the label text. The caller sets the level
+-- and batches the fill -- these only add rects, so a whole group's brackets
+-- stay in one level pass (redraw-metro safety). Drawn at the GROUP edges (the
+-- leftmost/rightmost selected cell), not per cell, so a K2/K3 pair reads as one
+-- bracket, not a box around each param.
+function LowProfile.corner_rects(x, y, kind)
+  if kind == "tl" then
+    screen.rect(x - 1, y, 2, 1)          -- corner + one right (top edge)
+    screen.rect(x - 1, y, 1, 2)          -- corner + one down (left edge)
+  else
+    local bx = x + CELL_W - 1
+    local by = y + CELL_H - 1
+    screen.rect(bx - 1, by, 2, 1)        -- corner + one left (bottom edge)
+    screen.rect(bx, by - 1, 1, 2)        -- corner + one up (right edge)
   end
 end
 

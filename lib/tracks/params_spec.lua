@@ -78,12 +78,14 @@ ParamsSpec.SPEC = {
   {suffix = "loop_end", name = "sample end", spec = {0, 128, "lin", 0.01, 128, "", 1 / 128},
     cmd = "loopEnd", xform = "region_point", queue = true},
   -- Range pushes no value of its own -- it changes the MAPPING, so its action
-  -- re-sends this track loop points. Previously these had no action at all,
-  -- so editing a background track Range did nothing until its next trig.
+  -- re-sends this track loop points. range_start also applies the E-SNC
+  -- rigid-pair linkage and range_end the end>start clamp (elasticat.param_
+  -- actions). t1 = true so track 1 registers here too -- its bespoke
+  -- hand-registered Range actions were removed (one code path, all tracks).
   {suffix = "range_start", name = "range start", spec = {0, 128, "lin", 0.01, 0, "", 1 / 128},
-    action = "range_remap"},
+    action = "range_start", t1 = true},
   {suffix = "range_end", name = "range end", spec = {0, 128, "lin", 0.01, 128, "", 1 / 128},
-    action = "range_remap"},
+    action = "range_end", t1 = true},
   {suffix = "loop_reverse", name = "loop reverse", kind = "binary", default = 0, cmd = "setReverse"},
   {suffix = "xfade", name = "loop xfade", spec = {0, 0.25, "lin", 0.001, 0.005, "", 0.004}, cmd = "xfade", queue = true},
   -- warp

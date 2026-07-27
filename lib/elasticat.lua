@@ -660,8 +660,16 @@ elasticat.param_actions = {
   -- Range does not push a value of its own: it changes the MAPPING, so it
   -- re-sends this track loop points at their new engine positions. Without
   -- this, editing a background track Range did nothing until its next trig.
-  range_remap = function(_, track)
-    elasticat.push_loop_points(track, true)
+  -- range_start also applies the E-SNC rigid-pair linkage (elasticat.
+  -- apply_range_start); range_end applies the end>start clamp. Shared by ALL
+  -- tracks -- the linkage used to live only in track 1's hand-registered path.
+  range_start = function(x, track)
+    elasticat.apply_range_start(track, x)
+    elasticat.remap_region(track)
+  end,
+  range_end = function(x, track)
+    elasticat.apply_range_end(track, x)
+    elasticat.remap_region(track)
   end,
   env_range = function(_, track)
     resend_env_times(track)
@@ -850,10 +858,95 @@ elasticat.push_loop_points = function(track, queued)
   end
 end
 
+-- Per-track E-SNC (Range End Sync) state: the range_start value BEFORE the
+-- current edit, needed to compute the rigid-pair delta -- a param action fires
+-- AFTER params:set has already written the new start. Module table (not a
+-- file-scope local) so tracks 2-8 get the same linkage track 1 used to keep to
+-- itself (docs/PHASE2_CONTRACT.md: track 1 is not special). Keyed by track.
+elasticat.last_range_start = {}
+
+-- Range Start edit for ONE track, shared by every track. When E-SNC is on,
+-- range_start and range_end move as a rigid pair: the shared delta is clamped so
+-- end stays <= 128 and start stays >= 0, keeping the window length constant even
+-- on a fast overshoot into the boundary (moving end freely then clamping only
+-- end used to collapse the gap at 128 and drag end back down -- the old "bounce
+-- to 120"). When off, start clamps to end-1 so it can never cross the end
+-- marker. Paired writes go back through params:set (silent, so this action does
+-- not re-enter itself) so the other param + its LEDs follow.
+elasticat.apply_range_start = function(track, x)
+  local sid = elasticat.track_pid(track, "range_start")
+  local eid = elasticat.track_pid(track, "range_end")
+  if not elasticat.param_exists(sid) or not elasticat.param_exists(eid) then
+    return
+  end
+  local sync_id = elasticat.track_pid(track, "range_end_sync")
+  if elasticat.param_exists(sync_id) and params:get(sync_id) == 1 then
+    local prev_start = elasticat.last_range_start[track] or 0
+    local prev_end = params:get(eid) or 128
+    local delta = util.clamp(x - prev_start, -prev_start, 128 - prev_end)
+    local next_start = prev_start + delta
+    local next_end = prev_end + delta
+    if math.abs(next_start - x) > 0.000001 then
+      params:set(sid, next_start, true)
+    end
+    params:set(eid, next_end, true)
+    elasticat.last_range_start[track] = next_start
+  else
+    local max_start = util.clamp((params:get(eid) or 128) - 1, 0, 127)
+    if x > max_start then
+      params:set(sid, max_start, true)
+      elasticat.last_range_start[track] = max_start
+    else
+      elasticat.last_range_start[track] = x
+    end
+  end
+end
+
+-- Range End edit for ONE track: end can never reach start, so its minimum is
+-- start + 1. (E-SNC end moves are driven by apply_range_start's paired write,
+-- which is silent, so this only runs on a direct end edit.)
+elasticat.apply_range_end = function(track, x)
+  local sid = elasticat.track_pid(track, "range_start")
+  local eid = elasticat.track_pid(track, "range_end")
+  if not elasticat.param_exists(eid) then
+    return
+  end
+  local min_end = util.clamp((params:get(sid) or 0) + 1, 1, 128)
+  if x < min_end then
+    params:set(eid, min_end, true)
+  end
+end
+
+-- Re-map a track's loop points after a Range edit. During playback the SELECTED
+-- track's live region is owned by the layered resolver (region-scrub / step-lock
+-- freeze -- see elasticat.region_edit_handled), so a direct push would fight it;
+-- background tracks and the stopped case push straight through. This replaces
+-- track 1's bespoke `if not region_edit_handled() then push_loop_points` guard
+-- and folds tracks 2-8's previously-unguarded push onto the same rule.
+elasticat.remap_region = function(track)
+  if track == engine_track and elasticat.region_edit_handled ~= nil
+    and elasticat.region_edit_handled() then
+    return
+  end
+  elasticat.push_loop_points(track, true)
+end
+
 -- The immediate dispatcher params_spec hands every non-queued param action.
 -- (key, track, cmd, ...) mirrors tr_queue below so the two are interchangeable.
-elasticat.tr_now = function(_, track, cmd, ...)
-  tr_call(track, cmd, ...)
+--
+-- During a crossfader morph (elasticat.morph_active, set around
+-- scene_store:apply) the immediate sends are re-routed through the 12Hz
+-- coalescing queue: a held glide drives apply() at ~30Hz, and without this the
+-- ~22 non-queued morph params fire an UNCOALESCED engine send every tick. That
+-- sustained burst overruns the audio engine's OSC input -- audio drops out for
+-- seconds until it drains (docs/PHASE2_CONTRACT.md cost-control 4). Keyed by
+-- the param id, so repeated ticks collapse to one send per param per flush.
+elasticat.tr_now = function(key, track, cmd, ...)
+  if elasticat.morph_active and key ~= nil then
+    elasticat.tr_queue(key, track, cmd, ...)
+  else
+    tr_call(track, cmd, ...)
+  end
 end
 
 function elasticat.set_engine_track(track)
@@ -1204,13 +1297,6 @@ resend_menv_times = function(track)
   resend("menv_attack", "menvAttack")
   resend("menv_decay", "menvDecay")
   resend("menv_release", "menvRelease")
-end
-
--- Coalesced (12Hz) version of update_engine_loop_points -- used when re-mapping
--- the loop points from a rapidly-scrubbed control (Range) during playback, so
--- per-detent edits don't flood the engine with immediate sends and feel laggy.
-local function queue_engine_loop_points()
-  elasticat.push_loop_points(1, true)
 end
 
 -- Each track has one gain input (\trAmp); the per-sample "gain" param is a
@@ -2393,6 +2479,9 @@ function elasticat.params(options)
   local function region_edit_handled()
     return pool_options.on_region_edit ~= nil and pool_options.on_region_edit() == true
   end
+  -- Exposed so the module-scope Range action (elasticat.remap_region) uses the
+  -- exact same playback-vs-stopped resolver gate as the loop-point actions.
+  elasticat.region_edit_handled = region_edit_handled
 
   add_control(ids.loop_start, "sample start",
     cs.new(0, 128, "lin", 0.01, 0, "", 1 / 128),
@@ -2410,59 +2499,11 @@ function elasticat.params(options)
       end
     end)
 
-  -- Range narrows the trim window; changing it re-maps the current loop points
-  -- through map_trim_point. During sequenced playback the grid re-sets the
-  -- region every step, so this just handles the base/encoder-driven case.
-  local last_range_start = 0
-
-  add_control(ids.range_start, "range start",
-    cs.new(0, 128, "lin", 0.01, 0, "", 1 / 128),
-    function(x)
-      -- When E-SNC is on, range start and end move as one rigid pair: the shared
-      -- delta is clamped so end stays <= 128 and start stays >= 0, which keeps
-      -- the length constant even on a fast overshoot into the boundary. (Moving
-      -- end freely then clamping only end used to collapse the gap at 128 and
-      -- then drag end back down on the way out -- the "bounce to 120".)
-      if ids.range_end_sync ~= nil and params:get(ids.range_end_sync) == 1 then
-        local prev_start = last_range_start
-        local prev_end = params:get(ids.range_end) or 128
-        local delta = util.clamp(x - prev_start, -prev_start, 128 - prev_end)
-        local next_start = prev_start + delta
-        local next_end = prev_end + delta
-        if math.abs(next_start - x) > 0.000001 then
-          params:set(ids.range_start, next_start, true)
-        end
-        params:set(ids.range_end, next_end, true)
-        last_range_start = next_start
-      else
-        -- Independent: start can never reach end. Clamp to end - 1 (so its max
-        -- is 127 when end is 128), which stops the start marker at the end
-        -- rather than crossing it.
-        local max_start = util.clamp((params:get(ids.range_end) or 128) - 1, 0, 127)
-        if x > max_start then
-          params:set(ids.range_start, max_start, true)
-          last_range_start = max_start
-        else
-          last_range_start = x
-        end
-      end
-      if not region_edit_handled() then
-        queue_engine_loop_points()
-      end
-    end)
-
-  add_control(ids.range_end, "range end",
-    cs.new(0, 128, "lin", 0.01, 128, "", 1 / 128),
-    function(x)
-      -- End can never reach start: its minimum is start + 1.
-      local min_end = util.clamp((params:get(ids.range_start) or 0) + 1, 1, 128)
-      if x < min_end then
-        params:set(ids.range_end, min_end, true)
-      end
-      if not region_edit_handled() then
-        queue_engine_loop_points()
-      end
-    end)
+  -- Range (range_start/range_end) is registered per-track by ParamsSpec for ALL
+  -- tracks including track 1 (t1 = true), with the shared E-SNC linkage +
+  -- end/start clamp in elasticat.apply_range_start / apply_range_end. Track 1's
+  -- bespoke Range actions were removed here so there is one code path per the
+  -- contract (the linkage used to work on track 1 only).
 
   -- Sample preview: momentary audition of the current sample's trim window,
   -- only while master playback is stopped (see elasticat.preview_trim). Driven

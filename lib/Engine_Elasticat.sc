@@ -1689,6 +1689,14 @@ Engine_Elasticat : CroneEngine {
 
 	spawnSend1 {
 		if(send1Synth.notNil, { send1Synth.free; });
+		send1Synth = nil;
+		// Machine None (index 0) is \elasticatFxNone -- a bare PASSTHROUGH. As a
+		// per-track insert that is correct (the chain must stay connected), but a
+		// send RETURN that just copies sendBus1 into masterBus doubles the sent
+		// signal (the owner hears it even with the send "off"). A send return
+		// adds an effect or nothing: None spawns NO synth, so sendBus1 is simply
+		// left unread (nothing downstream depends on it).
+		if(send1Machine.asInteger == 0, { ^nil });
 		send1Synth = Synth.tail(sendGroup, fxInsertNames.wrapAt(send1Machine.asInteger),
 			this.sendFxArgs(0, sendBus1.index, masterBus.index));
 		^send1Synth;
@@ -1705,6 +1713,10 @@ Engine_Elasticat : CroneEngine {
 
 	spawnSend2 {
 		if(send2Synth.notNil, { send2Synth.free; });
+		send2Synth = nil;
+		// Machine None: no return synth (see spawnSend1 -- a None passthrough
+		// would double the sent signal back into masterBus).
+		if(send2Machine.asInteger == 0, { ^nil });
 		send2Synth = Synth.tail(sendGroup, fxInsertNames.wrapAt(send2Machine.asInteger),
 			this.sendFxArgs(1, sendBus2.index, masterBus.index));
 		^send2Synth;

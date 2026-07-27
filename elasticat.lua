@@ -2008,6 +2008,29 @@ local function clear_lock_for_slot(slot, all_steps)
   return did_clear
 end
 
+-- Held Scene anchor + B2/B3: clear the SELECTED param's scene lock (#43). The
+-- pair is resolved from the SAME items list the page renders (current_group_
+-- items), so it targets the param under the K2/K3 cursor -- never the generic
+-- grid position. Clears the param from BOTH scenes for the SELECTED track only
+-- (ui_id funnels to the selected track's full id, the scene key), so it becomes
+-- fully un-morphed and holds one value across the fade.
+local function clear_scene_lock_for_slot(slot)
+  local param_item = ({nav:current_group_items()})[slot]
+  if param_item == nil or param_item.lockable ~= true or scene_store == nil then
+    return false
+  end
+  local key = ui_id(param_item.id)
+  if not elasticat.param_exists(key) then
+    return false
+  end
+  local cleared = scene_store:clear_key(key)
+  if cleared then
+    show_message(param_values:item_long_name(param_item) .. " scene lock clear")
+  end
+  request_redraw()
+  return cleared
+end
+
 local function settings_delta_value(delta)
   local items = nav:settings_items()
   local index = nav.settings_item_index[nav:current_settings_category()] or 1
@@ -3032,7 +3055,12 @@ function init()
     on_crossfade = function(x)
       if scene_store ~= nil then
         elasticat.undo_record_crossfade()
+        -- Coalesce every morph write (incl. the immediate params) onto the 12Hz
+        -- engine queue for the duration of this apply, so a held glide can't
+        -- flood the engine with per-tick sends (see elasticat.tr_now).
+        elasticat.morph_active = true
         scene_store:apply(x / 128)
+        elasticat.morph_active = false
       end
     end,
     -- Phase 1 track scaffolding: active_track_count changed -- snap the grid's
@@ -3634,8 +3662,15 @@ function key(n, z)
   -- K2/NO = cancel -- so by the time execution reaches here the settings
   -- layer is closed and these are the base-surface keys.
   local step_edit = grid_ui ~= nil and grid_ui.screen_edit ~= nil and grid_ui:screen_edit() or nil
+  local scene_held = scene_store ~= nil and scene_store:edit_target_scene() ~= nil
   if n == 2 or n == 3 then
     local slot = n == 2 and 1 or 2
+    -- Held Scene anchor takes precedence: B2/B3 clears the selected param from
+    -- BOTH scenes (#43), the scene-lock analogue of the step-lock clear below.
+    if scene_held then
+      clear_scene_lock_for_slot(slot)
+      return
+    end
     if step_edit ~= nil then
       clear_lock_for_slot(slot, false)
       return
