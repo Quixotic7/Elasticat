@@ -456,34 +456,17 @@ elasticat.osc_report = function(path, args)
     return true
   elseif path == "/elasticat/mod" then
     -- Live mod-bus values (pitch/cutoff/res/amp/pan, -1..1) at 15Hz: the UI's
-    -- "actual value" bars and the filter render read these.
-    --
-    -- All 8 tracks run their own mod synth, so the script keeps ONLY the
-    -- selected track's stream (PHASE2_CONTRACT, "OSC reporting"). Two message
-    -- shapes are accepted so this works either side of the engine change
-    -- landing: 6 args = the track index leads, filter on it; 5 args = the
-    -- legacy un-routed message, which is track 1's whenever only one track is
-    -- running. Attributing the legacy shape to track 1 (rather than to
-    -- "whatever is selected") is what stops track 5's LFO bleeding into
-    -- track 3's bars.
-    if #args >= 6 then
-      if elasticat.osc_track(args[1]) == (elasticat.selected_track or 1) then
-        elasticat.set_mod_values(args[2], args[3], args[4], args[5], args[6])
-      end
-    elseif (elasticat.selected_track or 1) == 1 then
-      elasticat.set_mod_values(args[1], args[2], args[3], args[4], args[5])
-    end
+    -- "actual value" bars and the filter render read these. The engine forwards
+    -- only the UI-selected track's stream, with the reporting track appended as
+    -- a TRAILING value; the facade router interprets that shape (against the
+    -- engine's ordering, where it is unit-tested) and gates on engine_track,
+    -- which select_ui_track keeps equal to the selected track.
+    elasticat.route_mod_report(args)
     return true
   elseif path == "/elasticat/filterEnv" then
-    -- Filter-envelope cutoff contribution (semitones), 15Hz. Same two-shape,
-    -- selected-track-only handling as /elasticat/mod above.
-    if #args >= 2 then
-      if elasticat.osc_track(args[1]) == (elasticat.selected_track or 1) then
-        elasticat.set_filter_env_mod(args[2])
-      end
-    elseif (elasticat.selected_track or 1) == 1 then
-      elasticat.set_filter_env_mod(args[1])
-    end
+    -- Filter-envelope cutoff contribution (semitones), 15Hz. Same trailing-track
+    -- shape and selected-track routing as /elasticat/mod above.
+    elasticat.route_filter_env_report(args)
     return true
   elseif path == "/elasticat/transport" then
     if phase_reports_allowed() then
@@ -1667,9 +1650,13 @@ end
 
 local function source_warp_items()
   local items = WarpRegistry.source_items(param_value_or("mode", 1), ParamItem)
-  -- The warp-engine selector leads the WARP page (was buried in settings). It is
-  -- p-lockable -- a step can sequence a different warp engine.
-  table.insert(items, 1, ParamItem.item("mode", "WARP", {lockable = true, options = 6}))
+  -- The warp-engine selector leads the WARP page. Owner decision: it is NOT
+  -- p-lockable and cannot change during playback -- changing the warp algorithm
+  -- mid-run respawns the reader (and would need a different per-warp slice def),
+  -- so every slice in a session shares one warp. `no_edit_playing` blocks the
+  -- encoder edit while the transport runs (see the enc handler).
+  table.insert(items, 1, ParamItem.item("mode", "WARP",
+    {lockable = false, no_edit_playing = true, options = 6}))
   return items
 end
 
@@ -3738,15 +3725,20 @@ function enc(n, d)
     nav:select_global_page_delta(d)
   elseif n == 2 then
     local left = nav:current_group_items()
+    -- Owner: warp mode (no_edit_playing) can't change while the transport runs.
+    if left ~= nil and left.no_edit_playing == true and playing then
+      show_message("Stop to change " .. (left.short or "this"))
     -- Held A/B anchor: the edit p-locks into that scene instead (PRD §6.6).
-    if not scene_edit_item(left, d) then
+    elseif not scene_edit_item(left, d) then
       elasticat.undo_record_param(left)
       param_values:delta_item(left, d)
       scene_base_follow(left)
     end
   elseif n == 3 then
     local _, right = nav:current_group_items()
-    if not scene_edit_item(right, d) then
+    if right ~= nil and right.no_edit_playing == true and playing then
+      show_message("Stop to change " .. (right.short or "this"))
+    elseif not scene_edit_item(right, d) then
       elasticat.undo_record_param(right)
       param_values:delta_item(right, d)
       scene_base_follow(right)

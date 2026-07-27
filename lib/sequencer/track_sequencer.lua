@@ -954,7 +954,12 @@ function TrackSequencer:trigger_step_slices(record)
       first_end = first_end or end_point
       self:call("trigger_slice", slice, start_point, end_point, {
         velocity = record.velocity or self:default_velocity(),
-        length_seconds = self:note_seconds(record),
+        -- Natural pitch, like the live Loop/Slice keys (which pass 0). Passing
+        -- the step note length here made syncToClock stretch each slice to fit
+        -- the step, so a sequenced slice played higher-pitched than the same
+        -- slice hit live. 0 = the engine's natural-length branch (Digitakt-style
+        -- slicing); mono steals the previous slice at the next trig.
+        length_seconds = 0,
         pitch = record.pitch or self:base_pitch()
       })
     end

@@ -19,6 +19,10 @@ end
 
 function Machine.source_page2_items(Item)
   return {
+    -- WARP algo selector, same as the loop machine's WARP page -- it picks the
+    -- per-warp slice voice def. Not p-lockable and not editable during playback
+    -- (all slices in a run share one warp).
+    Item.item("mode", "WARP", {lockable = false, no_edit_playing = true, options = 6}),
     Item.item("slice_sync", "SYNC", {lockable = false, binary = true, min = 0, max = 1, step = 1}),
     Item.item("slice_rate", "RATE", {lockable = true, min = 0.125, max = 8, step = 0.01, snaps = {0.125, 0.25, 0.5, 1, 2, 4, 8}})
   }

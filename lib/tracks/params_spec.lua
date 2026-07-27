@@ -67,7 +67,8 @@ ParamsSpec.SPEC = {
   {suffix = "mute", name = "mute", kind = "binary", default = 0, cmd = "mute", t1 = true},
   -- source
   {suffix = "sample_slot", name = "sample slot", spec = {0, 128, "lin", 1, 1, "", 1 / 128}, cmd = "setSampleSlot"},
-  {suffix = "machine", name = "machine", kind = "option", options = "machines", default = 1},
+  {suffix = "machine", name = "machine", kind = "option", options = "machines", default = 1,
+    action = "source_machine"},
   {suffix = "pitch", name = "pitch", spec = {-24, 24, "lin", 0.1, 0, "st", 0.1 / 48}, cmd = "setPitch", queue = true},
   -- region_point folds THIS track file-trim window and Range into the engine
   -- point, matching what track 1 hand-registered action does. Without it a

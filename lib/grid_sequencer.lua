@@ -2512,18 +2512,45 @@ function GridSequencer:update_preview_state()
     and (any_keys(self.loop_holds) or self:any_previewable_step_held())
   if should_preview and not self.preview_active then
     self.preview_active = true
-    self.options.play(true)
-    -- Open the amp envelope indefinitely so the preview sustains while held
-    -- (engine noteOff): the matching note_off below closes the gate cleanly.
-    if not is_slice_machine(self:machine()) and self.options.note_on ~= nil then
-      self.seq:call("note_on", 0)
+    if is_slice_machine(self:machine()) then
+      -- Preview the HELD STEP's SLICE, not the whole loop. play(true) here
+      -- started the loop reader (the bug: holding a slice step previewed the
+      -- entire loop). Slice keys preview themselves via key_slice_control.
+      self:preview_held_step_slices()
+    else
+      self.options.play(true)
+      -- Open the amp envelope indefinitely so the preview sustains while held
+      -- (engine noteOff): the matching note_off below closes the gate cleanly.
+      if self.options.note_on ~= nil then
+        self.seq:call("note_on", 0)
+      end
     end
   elseif not should_preview and self.preview_active then
     self.preview_active = false
-    if self.options.note_off ~= nil then
-      self.seq:call("note_off")
+    if is_slice_machine(self:machine()) then
+      if self.options.release_all_slices ~= nil then
+        self.seq:call("release_all_slices")
+      end
+    else
+      if self.options.note_off ~= nil then
+        self.seq:call("note_off")
+      end
+      self.options.play(false)
     end
-    self.options.play(false)
+  end
+end
+
+-- Trigger the first held previewable step's slice(s) on the selected track --
+-- the stopped step-hold preview for a slice machine (the loop reader stays off).
+function GridSequencer:preview_held_step_slices()
+  for step, held in pairs(self.step_holds) do
+    if held then
+      local record = self:step_record_for_page_step(self.selected_page, step, false)
+      if record ~= nil and record.trig == true and not self:is_ghost(record) then
+        self.seq:trigger_step_slices(record)
+        return
+      end
+    end
   end
 end
 

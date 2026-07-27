@@ -1,9 +1,19 @@
 # Phase 2 — open tasks (handoff)
 
-Snapshot for a fresh session. All work is committed and deployed at `cfef441`
-(`main`, and the Norns card, both at that commit). Suggested order below is
-cheapest/most-isolated first. Read `docs/PHASE2_CONTRACT.md` first — it is
-binding.
+> **STATUS (updated 2026-07-27).** This batch is essentially DONE. #46, #42, #44,
+> #43, #45 and #41 **parts A+B** are all committed, deployed, and merged to
+> `main` (the sections below are kept for history). A full **slice overhaul**
+> also landed (per-warp voices, mono default + steal, natural sequenced pitch,
+> WARP selector, real step preview; poly is capped at `maxSliceVoices=16`).
+> **Still open:** #41 **part C** (DEFERRED — needs an owner call on base-vs-p-lock
+> layering; do not build blind) and the lower-priority items (#33, #34, razor
+> split-point morph, SVF machines). The "sequencer never advances" report was a
+> STUCK norns internal clock (full power-OFF fixes it), NOT a code bug — don't
+> chase it. The original snapshot below was taken at `cfef441`; `main` is now
+> well ahead.
+
+Snapshot for a fresh session. Suggested order below is cheapest/most-isolated
+first. Read `docs/PHASE2_CONTRACT.md` first — it is binding.
 
 ## Recurring hazards (all have caused real bugs this project)
 
@@ -176,7 +186,18 @@ verify with the runtime harness. Machine-change half likely needs full restart.
 ## #41 — Filter render lost filter-env + p-lock motion (do last — most tracing)
 
 Files: `elasticat.lua`, `lib/ui/page_render.lua`, `lib/Engine_Elasticat.sc`.
-THREE parts.
+THREE parts. **A and B are DONE (commit 52f38d6); C is deferred.**
+
+- **A — DONE.** The engine appends the reporting track as a TRAILING OSC value;
+  the coordinator read the leading arg as the track and shifted every mod field
+  by one, so the feed never reached the render. Arg-order interpretation now
+  lives on the facade (`route_mod_report` / `route_filter_env_report`),
+  unit-tested (`bin/lua/mod_report_route_test.lua`).
+- **B — DONE.** `draw_filter_bars` now reads the LIVE param during playback (what
+  a firing step lock set) instead of the masked base `item_value` returns, so a
+  firing `filter_cutoff`/`res` lock sweeps the bars; STOPPED still previews the
+  held step. Test: `bin/lua/filter_render_plock_test.lua`.
+- **C — DEFERRED (owner input).** See part C below; unchanged.
 
 A. **Render no longer shows FILTER ENVELOPE modulation** (LFO still shows). The
    engine's `filterEnvRaw` SendReply carries `trackIndex` as replyID (Phase 2)

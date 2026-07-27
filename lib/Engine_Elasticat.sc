@@ -124,7 +124,7 @@ Engine_Elasticat : CroneEngine {
 	// (the 32-slot voice map plus slice polyphony/mono) is unchanged.
 	var <sliceAttack = 0.002;
 	var <sliceRelease = 0.02;
-	var <sliceMono = 0;
+	var <sliceMono = 1;   // default MONO (owner): one slice voice at a time
 	var <sliceSyncToClock = 1;
 	var <sliceRate = 1;
 	var sliceVoiceOrder;
@@ -707,103 +707,120 @@ Engine_Elasticat : CroneEngine {
 			Out.ar(out, sig);
 		}).add;
 
-		SynthDef(\elasticatSliceVoice, {
-			arg out=0, bufL=0, bufR=0,
-			startPoint=0, endPoint=8, playMode=0, reverse=0,
-			amp=0.8, pan=0, pitch=0, velocity=1, gate=1,
-			sliceAttack=0.002, sliceRelease=0.02,
-			envMode=1, envAttack=0.0001, envDecay=0.15, envSustain=0.8, envRelease=0.0001, envHold=1000000,
-			lengthSeconds=0, syncToClock=1, sliceRate=1, warpMode=0,
-			targetBpm=120, macro=0, grainSize=0.08, grainOverlap=8,
-			grainJitter=0, wsolaWindow=0.1, wsolaSearch=0.03,
-			pvWindow=0.2, pvDispersion=0, pitchModBus=0, steal=0;
-			var frames, startFrame, endFrame, loFrame, hiFrame, continueMode, readLo, readHi, loopMode;
-			var directionSign, resetFrame, rangeFrames, duration, pitchRatio, freePitchRatio, freeRate, fitRate, readRate;
-			var pos, loopPos, sweepFrames, sweepForwardPos, sweepReversePos, sweepPos, readPhase, env, adsrEnv, ahrEnv, raw, grain, ola, pc, sig, playAmp;
-			var grainDur, grainCount, grainRandom, olaTrig, olaPos, pcRatio, stealFade;
+		// ONE slice-voice SynthDef per warp mode. The old single def computed raw
+		// + Warp1 (grain) + TGrains (ola) + PitchShift (pc) ALL at once and
+		// Select'd one -- 145 UGens per voice, which cliffed norns CPU with a few
+		// concurrent slices (audio dropped out / the server crashed). Warp mode is
+		// a build-time constant here (a `switch` builds only the matching branch's
+		// UGens), and a voice is spawned with a FIXED warp (triggerSlice picks the
+		// def by the track's warp mode, which cannot change mid-playback), so every
+		// live slice runs a lean def -- raw is ~a dozen UGens instead of 145.
+		//   warp modes: 0 tape / 1 varispeed / 2 chopped -> raw; 3 granular; 4
+		//   random_ola; 5 pitch_corrected. (Matches the old Select order.)
+		[\raw, \grain, \ola, \pc].do({ arg warpKind;
+			SynthDef(("elasticatSliceVoice_" ++ warpKind).asSymbol, {
+				arg out=0, bufL=0, bufR=0,
+				startPoint=0, endPoint=8, playMode=0, reverse=0,
+				amp=0.8, pan=0, pitch=0, velocity=1, gate=1,
+				sliceAttack=0.002, sliceRelease=0.02,
+				envMode=1, envAttack=0.0001, envDecay=0.15, envSustain=0.8, envRelease=0.0001, envHold=1000000,
+				lengthSeconds=0, syncToClock=1, sliceRate=1,
+				targetBpm=120, macro=0, grainSize=0.08, grainOverlap=8,
+				grainJitter=0, wsolaWindow=0.1, wsolaSearch=0.03,
+				pvWindow=0.2, pvDispersion=0, pitchModBus=0, steal=0;
+				var frames, startFrame, endFrame, loFrame, hiFrame, continueMode, readLo, readHi, loopMode;
+				var directionSign, resetFrame, rangeFrames, duration, pitchRatio, freePitchRatio, freeRate, fitRate, readRate;
+				var pos, loopPos, sweepFrames, sweepForwardPos, sweepReversePos, sweepPos, readPhase, env, adsrEnv, ahrEnv, sig, playAmp;
+				var grainDur, grainCount, grainRandom, olaTrig, olaPos, stealFade;
 
-			frames = BufFrames.kr(bufL).max(4);
-			startFrame = (startPoint.clip(0, 127.99) / 128) * (frames - 1);
-			endFrame = (endPoint.clip(0.01, 128) / 128) * (frames - 1);
-			loFrame = startFrame.min(endFrame).clip(0, frames - 2);
-			hiFrame = startFrame.max(endFrame).clip(loFrame + 1, frames - 1);
-			continueMode = (playMode >= 3);
-			loopMode = ((playMode >= 2) * (playMode < 3)).clip(0, 1);
-			readLo = loFrame * (1 - continueMode);
-			readHi = (hiFrame * (1 - continueMode)) + ((frames - 1) * continueMode);
-			directionSign = 1 - (reverse.clip(0, 1) * 2);
-			resetFrame = (startFrame * (1 - reverse.clip(0, 1))) + (endFrame * reverse.clip(0, 1));
-			resetFrame = resetFrame.clip(readLo, readHi);
-			rangeFrames = (readHi - readLo).max(1);
-			duration = lengthSeconds.max(0.005);
-			pitchRatio = (Lag.kr(pitch, 0.01) + (In.kr(pitchModBus, 1).clip(-1, 1) * 12)).midiratio.clip(0.03125, 32);
-			freePitchRatio = Select.kr(warpMode >= 3, [pitchRatio, DC.kr(1)]);
-			freeRate = BufRateScale.kr(bufL) * sliceRate.max(0.03125) * freePitchRatio;
-			fitRate = rangeFrames / (duration * SampleRate.ir).max(1);
-			readRate = Select.kr(syncToClock.clip(0, 1), [freeRate, fitRate]) * directionSign;
-			loopPos = Phasor.ar(
-				0,
-				readRate,
-				readLo,
-				readHi.max(readLo + 1),
-				resetFrame
-			);
-			sweepFrames = Sweep.ar(0, readRate.abs * SampleRate.ir);
-			sweepForwardPos = resetFrame + sweepFrames;
-			sweepReversePos = resetFrame - sweepFrames;
-			sweepPos = Select.ar(reverse.clip(0, 1), [sweepForwardPos, sweepReversePos]);
-			pos = Select.ar(loopMode, [sweepPos.clip(readLo, readHi), loopPos]);
-			readPhase = (pos / (frames - 1)).clip(0, 0.999999);
-			// Amp envelope (shared with the readers). ADSR sustains while the slice
-			// gate is held and releases on gate-off; AHR is a fixed attack/hold/
-			// release burst (Hold matters, same as the loop reader). Hold/release are
-			// capped so an INF setting can't strand a polyphonic voice. Both run at
-			// doneAction 0; FreeSelf frees on gate-release+decay (ADSR) or when the
-			// burst completes (AHR).
-			adsrEnv = EnvGen.kr(
-				Env.adsr(envAttack.max(0.0001), envDecay.max(0.0001), envSustain.clip(0, 1), envRelease.clip(0.0001, 30), 1, -4),
-				gate, doneAction: 0);
-			ahrEnv = EnvGen.kr(
-				Env([0, 1, 1, 0], [envAttack.max(0.0001), envHold.clip(0.0001, 30), envRelease.clip(0.0001, 30)], [-4, 0, -4]),
-				gate, doneAction: 0);
-			env = Select.kr(envMode.clip(0, 1), [adsrEnv, ahrEnv]);
-			FreeSelf.kr(Select.kr(envMode.clip(0, 1), [(gate < 0.5) * (adsrEnv < 0.0004), Done.kr(ahrEnv)]));
-			raw = [
-				BufRd.ar(1, bufL, pos, loop: 1, interpolation: 4),
-				BufRd.ar(1, bufR, pos, loop: 1, interpolation: 4)
-			];
-			grainDur = Lag.kr(grainSize.clip(0.002, 0.5), 0.05);
-			grainCount = Lag.kr(grainOverlap.clip(1, 64), 0.05);
-			grainRandom = Lag.kr((grainJitter + (macro * 0.03)).clip(0, 0.25), 0.05);
-			grain = [
-				Warp1.ar(1, bufL, readPhase, pitchRatio, grainDur, -1, grainCount, grainRandom, 4),
-				Warp1.ar(1, bufR, readPhase, pitchRatio, grainDur, -1, grainCount, grainRandom, 4)
-			];
-			olaTrig = Impulse.ar((grainCount / Lag.kr(wsolaWindow.clip(0.005, 0.5), 0.05)).clip(1, 240));
-			olaPos = ((readPhase * BufDur.kr(bufL)) + TRand.ar(wsolaSearch.neg, wsolaSearch, olaTrig)).wrap(0, BufDur.kr(bufL).max(0.001));
-			ola = [
-				TGrains.ar(1, olaTrig, bufL, pitchRatio, olaPos, Lag.kr(wsolaWindow.clip(0.005, 0.5), 0.05), 0, 1, 4),
-				TGrains.ar(1, olaTrig, bufR, pitchRatio, olaPos, Lag.kr(wsolaWindow.clip(0.005, 0.5), 0.05), 0, 1, 4)
-			];
-			pcRatio = pitchRatio;
-			pc = PitchShift.ar(raw, Lag.kr(pvWindow.clip(0.005, 2), 0.05), pcRatio, Lag.kr(pvDispersion.clip(0, 1), 0.05), Lag.kr(pvDispersion.clip(0, 1), 0.05));
-			sig = [
-				Select.ar(warpMode.clip(0, 5), [raw[0], raw[0], raw[0], grain[0], ola[0], pc[0]]),
-				Select.ar(warpMode.clip(0, 5), [raw[1], raw[1], raw[1], grain[1], ola[1], pc[1]])
-			];
-			// Voice stealing (global concurrent-voice cap, Phase 2). \gate alone
-			// cannot end an AHR voice -- that envelope ignores gate-off -- so a
-			// stolen voice needs its own exit: a 20 ms fade to silence that frees
-			// the synth outright. Idle at 1 until \steal is set, so an unstolen
-			// voice is bit-identical to before.
-			stealFade = EnvGen.kr(Env([1, 0], [0.02]), steal, doneAction: 2);
-			// Track pan + volume are applied downstream at the filter output stage;
-			// the voice keeps only velocity and its per-note envelope.
-			playAmp = velocity.clip(0, 1) * env * stealFade;
-			sig = [sig[0], sig[1]] * playAmp;
-			sig = LeakDC.ar(sig);
-			Out.ar(out, sig);
-		}).add;
+				frames = BufFrames.kr(bufL).max(4);
+				startFrame = (startPoint.clip(0, 127.99) / 128) * (frames - 1);
+				endFrame = (endPoint.clip(0.01, 128) / 128) * (frames - 1);
+				loFrame = startFrame.min(endFrame).clip(0, frames - 2);
+				hiFrame = startFrame.max(endFrame).clip(loFrame + 1, frames - 1);
+				continueMode = (playMode >= 3);
+				loopMode = ((playMode >= 2) * (playMode < 3)).clip(0, 1);
+				readLo = loFrame * (1 - continueMode);
+				readHi = (hiFrame * (1 - continueMode)) + ((frames - 1) * continueMode);
+				directionSign = 1 - (reverse.clip(0, 1) * 2);
+				resetFrame = (startFrame * (1 - reverse.clip(0, 1))) + (endFrame * reverse.clip(0, 1));
+				resetFrame = resetFrame.clip(readLo, readHi);
+				rangeFrames = (readHi - readLo).max(1);
+				duration = lengthSeconds.max(0.005);
+				pitchRatio = (Lag.kr(pitch, 0.01) + (In.kr(pitchModBus, 1).clip(-1, 1) * 12)).midiratio.clip(0.03125, 32);
+				// raw reads the buffer at the pitched rate; the warp UGens apply pitch
+				// themselves, so their read position advances at 1x (build-time choice).
+				freePitchRatio = if(warpKind == \raw, { pitchRatio }, { DC.kr(1) });
+				freeRate = BufRateScale.kr(bufL) * sliceRate.max(0.03125) * freePitchRatio;
+				fitRate = rangeFrames / (duration * SampleRate.ir).max(1);
+				readRate = Select.kr(syncToClock.clip(0, 1), [freeRate, fitRate]) * directionSign;
+				loopPos = Phasor.ar(
+					0,
+					readRate,
+					readLo,
+					readHi.max(readLo + 1),
+					resetFrame
+				);
+				sweepFrames = Sweep.ar(0, readRate.abs * SampleRate.ir);
+				sweepForwardPos = resetFrame + sweepFrames;
+				sweepReversePos = resetFrame - sweepFrames;
+				sweepPos = Select.ar(reverse.clip(0, 1), [sweepForwardPos, sweepReversePos]);
+				pos = Select.ar(loopMode, [sweepPos.clip(readLo, readHi), loopPos]);
+				readPhase = (pos / (frames - 1)).clip(0, 0.999999);
+				// Amp envelope (shared with the readers). ADSR sustains while the slice
+				// gate is held and releases on gate-off; AHR is a fixed attack/hold/
+				// release burst (Hold matters, same as the loop reader). Hold/release are
+				// capped so an INF setting can't strand a polyphonic voice. Both run at
+				// doneAction 0; FreeSelf frees on gate-release+decay (ADSR) or when the
+				// burst completes (AHR).
+				adsrEnv = EnvGen.kr(
+					Env.adsr(envAttack.max(0.0001), envDecay.max(0.0001), envSustain.clip(0, 1), envRelease.clip(0.0001, 30), 1, -4),
+					gate, doneAction: 0);
+				ahrEnv = EnvGen.kr(
+					Env([0, 1, 1, 0], [envAttack.max(0.0001), envHold.clip(0.0001, 30), envRelease.clip(0.0001, 30)], [-4, 0, -4]),
+					gate, doneAction: 0);
+				env = Select.kr(envMode.clip(0, 1), [adsrEnv, ahrEnv]);
+				FreeSelf.kr(Select.kr(envMode.clip(0, 1), [(gate < 0.5) * (adsrEnv < 0.0004), Done.kr(ahrEnv)]));
+				// Only THIS warp's UGens are built (warpKind is a build-time constant).
+				sig = switch(warpKind,
+					\raw, {
+						[BufRd.ar(1, bufL, pos, loop: 1, interpolation: 4),
+						 BufRd.ar(1, bufR, pos, loop: 1, interpolation: 4)]
+					},
+					\grain, {
+						grainDur = Lag.kr(grainSize.clip(0.002, 0.5), 0.05);
+						grainCount = Lag.kr(grainOverlap.clip(1, 64), 0.05);
+						grainRandom = Lag.kr((grainJitter + (macro * 0.03)).clip(0, 0.25), 0.05);
+						[Warp1.ar(1, bufL, readPhase, pitchRatio, grainDur, -1, grainCount, grainRandom, 4),
+						 Warp1.ar(1, bufR, readPhase, pitchRatio, grainDur, -1, grainCount, grainRandom, 4)]
+					},
+					\ola, {
+						grainCount = Lag.kr(grainOverlap.clip(1, 64), 0.05);
+						olaTrig = Impulse.ar((grainCount / Lag.kr(wsolaWindow.clip(0.005, 0.5), 0.05)).clip(1, 240));
+						olaPos = ((readPhase * BufDur.kr(bufL)) + TRand.ar(wsolaSearch.neg, wsolaSearch, olaTrig)).wrap(0, BufDur.kr(bufL).max(0.001));
+						[TGrains.ar(1, olaTrig, bufL, pitchRatio, olaPos, Lag.kr(wsolaWindow.clip(0.005, 0.5), 0.05), 0, 1, 4),
+						 TGrains.ar(1, olaTrig, bufR, pitchRatio, olaPos, Lag.kr(wsolaWindow.clip(0.005, 0.5), 0.05), 0, 1, 4)]
+					},
+					\pc, {
+						var pcRaw = [BufRd.ar(1, bufL, pos, loop: 1, interpolation: 4),
+							BufRd.ar(1, bufR, pos, loop: 1, interpolation: 4)];
+						PitchShift.ar(pcRaw, Lag.kr(pvWindow.clip(0.005, 2), 0.05), pitchRatio, Lag.kr(pvDispersion.clip(0, 1), 0.05), Lag.kr(pvDispersion.clip(0, 1), 0.05))
+					}
+				);
+				// Voice stealing (global concurrent-voice cap, Phase 2). \gate alone
+				// cannot end an AHR voice -- that envelope ignores gate-off -- so a
+				// stolen voice needs its own exit: a 20 ms fade to silence that frees
+				// the synth outright. Idle at 1 until \steal is set, so an unstolen
+				// voice is bit-identical to before.
+				stealFade = EnvGen.kr(Env([1, 0], [0.02]), steal, doneAction: 2);
+				// Track pan + volume are applied downstream at the filter output stage;
+				// the voice keeps only velocity and its per-note envelope.
+				playAmp = velocity.clip(0, 1) * env * stealFade;
+				sig = [sig[0], sig[1]] * playAmp;
+				sig = LeakDC.ar(sig);
+				Out.ar(out, sig);
+			}).add;
+		});
 
 		// --- Filter machines (global, post-mix) --------------------------------
 		// Each reads the summed voices off fxBus, applies pre-filter drive, an
@@ -3066,10 +3083,16 @@ ElasticatTrack {
 		});
 		duration = duration.clip(0.005, 60);
 
-		if(engine.sliceMono == 1, { this.releaseAllSlices; });
+		if(engine.sliceMono == 1, { this.stealActiveSlices; });
 		this.releaseSlice(idx);
 
-		synth = Synth.tail(sourceGroup, \elasticatSliceVoice, [
+		// Pick the lean per-warp slice def for THIS track's warp mode (machine):
+		// 0 tape / 1 varispeed / 2 chopped -> raw, 3 granular, 4 random_ola, 5 pc.
+		synth = Synth.tail(sourceGroup, switch(machine.asInteger,
+			3, { \elasticatSliceVoice_grain },
+			4, { \elasticatSliceVoice_ola },
+			5, { \elasticatSliceVoice_pc },
+			{ \elasticatSliceVoice_raw }), [
 			\out, fxBus.index,
 			\bufL, (bufL ? engine.defaultBufL).bufnum,
 			\bufR, (bufR ? engine.defaultBufR).bufnum,
@@ -3092,7 +3115,6 @@ ElasticatTrack {
 			\lengthSeconds, duration,
 			\syncToClock, engine.sliceSyncToClock,
 			\sliceRate, engine.sliceRate,
-			\warpMode, machine,
 			\targetBpm, engine.targetBpm,
 			\macro, macro,
 			\grainSize, grainSize,
@@ -3145,6 +3167,22 @@ ElasticatTrack {
 		sliceVoices.do({ arg synth, i;
 			if(synth.notNil, {
 				synth.set(\gate, 0);
+				sliceVoices[i] = nil;
+				engine.forgetSliceVoice(synth);
+			});
+		});
+	}
+
+	// MONO cut: a new slice must END the previous one NOW, not let it ring out.
+	// releaseAllSlices only opens the release stage -- an AHR voice ignores
+	// gate-off entirely (it holds to the end) and even an ADSR release lingers,
+	// so fast sequenced slices piled up voices and the engine went staticy after
+	// a few bars. \steal is the 20 ms fade-and-free that works for BOTH env
+	// types, so mono re-uses it.
+	stealActiveSlices {
+		sliceVoices.do({ arg synth, i;
+			if(synth.notNil, {
+				synth.set(\steal, 1);
 				sliceVoices[i] = nil;
 				engine.forgetSliceVoice(synth);
 			});

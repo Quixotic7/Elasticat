@@ -507,6 +507,38 @@ function elasticat.set_mod_values(track, pitch, cutoff, res, amp, pan)
   mod_live.pan = tonumber(pan) or 0
 end
 
+-- Route a raw /elasticat/mod report into set_mod_values. The engine sends the
+-- FIVE mod sums first and appends the reporting track as a TRAILING sixth value
+-- (Engine_Elasticat.sc modResponder: [pitch, cutoff, res, amp, pan, track]).
+-- The coordinator used to read the leading arg as the track, which shifted every
+-- value by one -- pitch was dropped, the track index landed in the pan slot, and
+-- osc_track(pitch) clamped to 1 so only track 1 ever updated (with garbage). We
+-- interpret the shape here, where it can be unit-tested against the engine's
+-- ordering. A 5-arg message is an older, untagged (single-track) engine; it
+-- applies to the current engine_track, which is 1 in that case. set_mod_values
+-- gates on engine_track, so a stray other-track report is dropped.
+function elasticat.route_mod_report(args)
+  args = args or {}
+  if #args >= 6 then
+    elasticat.set_mod_values(args[6], args[1], args[2], args[3], args[4], args[5])
+  else
+    elasticat.set_mod_values(args[1], args[2], args[3], args[4], args[5])
+  end
+end
+
+-- Route a raw /elasticat/filterEnv report into set_filter_env_mod. The engine
+-- sends the cutoff contribution (semitones) FIRST and the reporting track as a
+-- TRAILING second value (Engine_Elasticat.sc filterEnvResponder: [semitones,
+-- track]). Same trailing-track convention as route_mod_report.
+function elasticat.route_filter_env_report(args)
+  args = args or {}
+  if #args >= 2 then
+    elasticat.set_filter_env_mod(args[2], args[1])
+  else
+    elasticat.set_filter_env_mod(args[1])
+  end
+end
+
 -- The modulation OFFSET for a param, expressed in that param's own display
 -- units, so the UI can just add it to the base value. Mirrors the scaling each
 -- destination synth applies:
@@ -675,6 +707,12 @@ elasticat.param_actions = {
     resend_env_times(track)
     resend_filter_env_times(track)
     resend_menv_times(track)
+  end,
+  -- Source machine (loop / loop_trig / slice) change: re-evaluate the free-run
+  -- play gate so switching back to loop mid-run resumes, and switching to a
+  -- slice machine stops the reader (slices sound from their own triggers) (#45).
+  source_machine = function(_, track)
+    elasticat.push_track_play_state(track)
   end
 }
 
@@ -1001,6 +1039,19 @@ function elasticat.track_muted(track)
   return params:lookup_param(pid) ~= nil and params:get(pid) == 1
 end
 
+-- Re-push a track's EFFECTIVE free-run play state, the same rule elasticat.play
+-- uses: playing only when the transport is running AND the source machine is
+-- loop (1). A source-machine change (loop <-> slice/loop_trig) must re-evaluate
+-- this gate on the fresh synth, or a track switched back to loop mid-run stays
+-- silent until stop/start (#45). Track 1's hand-registered machine action
+-- already does this inline; this is the shared path for tracks 2-8.
+elasticat.push_track_play_state = function(track)
+  local machine = elasticat.track_param_value(track, "machine") or 1
+  local transport = ids.play ~= nil and elasticat.param_exists(ids.play)
+    and params:get(ids.play) == 1
+  tr_call(track, "play", (transport and machine == 1) and 1 or 0)
+end
+
 -- elasticat.track_step DELETED (Phase 2 per-track sequencers). It was the
 -- background-track step stub -- pitch, loop locks, a bare noteOn -- and the
 -- reason a deselected track went quiet. Every track now runs the SAME
@@ -1109,6 +1160,20 @@ elasticat.sync_track_slot_metadata = function(track)
   end
   if sample_pool.steps[slot] ~= nil then
     tr_call(track, "setSampleSteps", sample_pool.steps[slot])
+  end
+end
+
+-- Push a slot's freshly-detected metadata (source BPM + steps) to every ACTIVE
+-- track that PLAYS it. In Phase 2 each track picks its own slot, so a load must
+-- reach the track playing that slot even when the slot is not the File-page
+-- focus -- otherwise the track free-runs at the default 16 steps and every
+-- non-TAPE warp mode is at the wrong rate until the steps param is nudged (#45).
+elasticat.sync_slot_metadata_to_tracks = function(slot)
+  slot = sample_slot_number(slot)
+  for t = 1, elasticat.active_track_count() do
+    if elasticat.track_slot(t) == slot then
+      elasticat.sync_track_slot_metadata(t)
+    end
   end
 end
 
@@ -1959,7 +2024,11 @@ function elasticat.load_pool_slot(slot, path, make_active)
   if slot == file_edit_slot then
     apply_file_slot_metadata(slot)
   end
+  -- Push the detected steps/bpm to whatever tracks actually play this slot
+  -- (Phase 2 per-track slots), so a load reaches the engine immediately (#45).
+  elasticat.sync_slot_metadata_to_tracks(slot)
   if slot == active_sample_slot then
+    -- The focused slot also refreshes loop points + amp for the whole mix.
     push_engine_slot_metadata(slot)
   end
   notify_pool_change("load", slot, path)
@@ -2723,7 +2792,10 @@ function elasticat.params(options)
     function(x) queue_engine_call(param_id(prefix, "slice_rate"), "setSliceRate", x) end,
     function(param) return string.format("%.2fx", param:get()) end)
 
-  params:add_option(param_id(prefix, "slice_polyphony"), "slice polyphony", {"poly 8", "mono"}, 1)
+  -- Default MONO (owner): one slice voice at a time keeps the slice machine
+  -- cheap. Poly is opt-in. The engine's sliceMono default matches (mono) so a
+  -- fresh boot agrees without needing an init push.
+  params:add_option(param_id(prefix, "slice_polyphony"), "slice polyphony", {"poly 8", "mono"}, 2)
   params:set_action(param_id(prefix, "slice_polyphony"), function(x)
     engine_call("setSliceMono", x == 2 and 1 or 0)
   end)

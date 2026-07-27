@@ -711,15 +711,26 @@ end
 function PageRender:draw_filter_bars(items, playing)
   local machine = floor(self.value("filter_machine", 1) + 0.5)
   local morphing = machine % 2 == 0
-  local cut = self:item_value(items, "filter_cutoff", 64)
-  local res_raw = self:item_value(items, "filter_res", 0)
-  -- During playback the render follows the ACTUAL (modulated) filter, so LFOs /
-  -- the filter env / macros visibly sweep the bars. mod_offsets is injected by
-  -- the coordinator and reads the engine's 15Hz mod feed.
-  if playing and self.mod_offsets ~= nil then
-    local d_cut, d_res = self.mod_offsets()
-    cut = cut + (d_cut or 0)
-    res_raw = res_raw + (d_res or 0)
+  local cut, res_raw
+  if playing then
+    -- Follow the value actually SOUNDING. self.value is the live param, which is
+    -- what a firing step p-lock set -- item_value returns the pre-lock BASE
+    -- (active_step_lock_bases masks it so an encoder edit adjusts the base), so
+    -- it would freeze the bars at the base while a cutoff/res lock sweeps the
+    -- real filter. The mod feed (LFOs / filter env / macros, injected by the
+    -- coordinator from the engine's 15Hz report) then adds on top.
+    cut = self.value("filter_cutoff", 64)
+    res_raw = self.value("filter_res", 0)
+    if self.mod_offsets ~= nil then
+      local d_cut, d_res = self.mod_offsets()
+      cut = cut + (d_cut or 0)
+      res_raw = res_raw + (d_res or 0)
+    end
+  else
+    -- STOPPED: item_value, so holding a step with a filter_cutoff/res lock
+    -- previews that step's locked filter (the same value the cell shows).
+    cut = self:item_value(items, "filter_cutoff", 64)
+    res_raw = self:item_value(items, "filter_res", 0)
   end
   local res = min(max(res_raw / 127, 0), 1)
   local fc = 0.06 + min(max(cut / 127, 0), 1) * 0.88
