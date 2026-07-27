@@ -5,6 +5,11 @@ only. Coordinates are grid `(x,y)`, `x`=1-16 left-right, `y`=1-8 top-bottom.
 
 ## Grid map (loop-machine layout)
 
+> **Visual reference:** [`GRID_LAYOUT.html`](GRID_LAYOUT.html) diagrams the whole
+> 16x8 grid by functional region (open it in a browser). The empty cells there are
+> deliberate -- spacing is what separates one group from the next.
+
+
 ```
 y\x     1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16
 y1     FN    -  REC PLAY STOP    -  MST FILE  PAT    - TRIG  SRC FILT  AMP   FX  MOD
@@ -84,10 +89,10 @@ once: start+end from their span.
 | 16,6 | FILL | Hold = momentary Fill. FN+press = latch Fill on/off. |
 | 1,7-8,7 | C D E F G A B C+1 | White keys (one octave + root above). |
 | 11,7 | NO | Cancel in menus/dialogs (= K2). **Outside menus: quick UNDO** — see below. |
-| 12,7 | LEFT | Settings nav left/value-; with PAGE held = Pattern-Rate mode. |
+| 12,7 | LEFT | Settings nav left/value-. |
 | 13,7 | DOWN | Settings nav down; with PAGE held = Page-Loop mode. |
 | 14,7 | RIGHT | Settings nav right/value+/confirm-on-action-row; with PAGE held = back to Page-Select. **Also**: while the pattern-load overlay is open, renames the current pattern. |
-| 16,7 | PAGE | Hold: step row becomes Page-Select / Page-Loop / Rate overlay (pick mode with UP/LEFT/DOWN above). |
+| 16,7 | PAGE | Hold: step row becomes the Page-Select / Page-Loop overlay (pick mode with UP/DOWN above). Pattern rate lives on the main UI, not here. |
 
 ## Grid: row 8 — steps
 
@@ -99,7 +104,7 @@ once: start+end from their span.
 | Hold + press loop/pitch/slice key | Lock that value to the step. |
 | Hold + `K2`/`K3` | Clear one param's lock on that step. |
 | While PATN overlay open | Press a slot (1-16) to load that pattern. |
-| While PAGE (16,7) held | Pick page / toggle page-loop / pick rate, per the active overlay mode. |
+| While PAGE (16,7) held | Pick page / toggle page-loop, per the active overlay mode. |
 
 ## Quick undo (NO key)
 

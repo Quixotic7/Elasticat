@@ -18,6 +18,24 @@ local page_model = {
         }
       },
       {
+        -- MIX: the 8-track overview (lib/ui/mixer_page.lua). The coordinator
+        -- detects `mixer` and renders the column grid under the normal header.
+        --
+        -- Its items are ordinary per-track params, so K2/K3 + E2/E3 edit the
+        -- SELECTED track's mix from this page with no new input handling --
+        -- they resolve through elasticat.lua's ui_id funnel like every other
+        -- page. MUTE is per-track today (ParamsSpec.SPEC); VOL/PAN become
+        -- per-track the moment those suffixes land in SPEC, at which point this
+        -- page follows the selection automatically.
+        title = "MIX",
+        mixer = true,
+        items = {
+          item("amp", "VOL", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 100, 127}}),
+          item("pan", "PAN", {lockable = true, min = 0, max = 128, step = 1, snaps = {0, 32, 64, 96, 128}}),
+          item("mute", "MUTE", {lockable = false, binary = true, min = 0, max = 1, step = 1})
+        }
+      },
+      {
         -- Full-screen looping sprite + grid comet sweep, tempo-scaled. The
         -- coordinator detects `animation` and renders it with no header/UI.
         title = "VISUALIZER",
@@ -82,13 +100,19 @@ local page_model = {
         title = "PATTERN",
         items = {
           item("pattern_steps", "LEN", {lockable = false, min = 1, max = 256, step = 1, snaps = {4, 8, 16, 32, 48, 64, 96, 128, 256}}),
-          item("pattern_rate", "RATE", {pseudo = "pattern_rate", lockable = false, min = 1, max = 8, step = 1, options = 8}),
+          -- 21 fraction rates (see TrackSequencer.RATE_FRACTIONS); 1x is 13.
+          -- NOT an `options` item: it is a pseudo with its own label function,
+          -- and `options` suppresses the value bar (item_frac returns nil) as
+          -- well as steering some paths at option_value(), which throws on an
+          -- unregistered id. With min/max it gets a real bar showing position
+          -- in a 21-long list. FN snaps to the musical anchors 1/2, 1, 2.
+          item("pattern_rate", "RATE", {pseudo = "pattern_rate", lockable = false, min = 1, max = 21, step = 1, snaps = {7, 13, 21}}),
           item("global_pattern_length", "GLEN", {lockable = false, min = 1, max = 256, step = 1, snaps = {4, 8, 16, 32, 48, 64, 96, 128, 256}})
         }
       }
     },
     settings = {
-      item("pattern_rate", "RATE", {pseudo = "pattern_rate", options = 8}),
+      item("pattern_rate", "RATE", {pseudo = "pattern_rate", min = 1, max = 21, step = 1, snaps = {7, 13, 21}}),
       item("pattern_quantize", "PATTERN CHANGE", {options = 4}),
       item("global_pattern_length", "GLOBAL LENGTH", {min = 1, max = 256, step = 1, snaps = {4, 8, 16, 32, 64, 128, 256}})
     }

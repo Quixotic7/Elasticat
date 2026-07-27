@@ -1,6 +1,14 @@
 // Elasticat v2 foundation.
 //
-// One shared server-side transport phase drives one active mode synth at a time.
+// Every track is an instance of ONE class, ElasticatTrack (defined at the
+// bottom of this file; see docs/PHASE2_CONTRACT.md). Track 1 is not special:
+// it owns a chain built by exactly the same code as tracks 2-8, so changing
+// how a track works is a one-place change, never 8x.
+//
+// The engine owns only what is genuinely global: the 2 send busses and their
+// FX, the master bus + master FX, transport tempo / clock sync, the shared
+// sample pool, the SynthDefs, and OSC routing.
+//
 // Existing mode families are preserved under technically accurate names:
 //   0 tape              former basic
 //   1 tempo_varispeed   former classic
@@ -10,184 +18,36 @@
 //   5 pitch_corrected   former pv/PitchShift color
 Engine_Elasticat : CroneEngine {
 
-	var <transportSynth;
-	var <activeSynth;
-	var previewSynth;
-	var <bufL;
-	var <bufR;
-	var <defaultBufL;
-	var <defaultBufR;
-	var <activeSliceSynths;
-	var phaseBus;
-	var scriptAddress;
-	var statusResponder;
-	var modResponder;      // live mod-bus values -> script (~15Hz UI feed)
-	var filterEnvResponder; // filter-env cutoff contribution -> script (15Hz)
-	var transportResponder;
-	var modeSynthNames;
-	var modeNames;
-	var readerAmpEnv;  // shared amp-envelope graph for the continuous mode readers
-	var filterPrep;           // shared drive + env-modulated cutoff/res prep for filter machines
-	var filterChannelClassic; // shared per-channel Classic (multimode) filter graph
-	var filterChannelMorph;   // shared per-channel Morphing filter graph
-	var filterBalanceCutoffs; // shared balance law: base cutoff + balance -> [fcA, fcB]
-	var filterModOut;         // shared pan/amp output stage with pan/amp mod-bus input
-	var fxMixBlend;           // shared dry/wet crossfade graph for insert FX machines
-	var fxDriveShape;         // shared drive/clip curve for the insert FX chain
-	var activeMode = 0;
-	var playing = 0;
-	var targetBpm = 120;
-	var sampleSteps = 16;
-	var loopStart = 0;
-	var loopEnd = 128;
-	var pitch = 0;
-	var speed = 1;
-	var direction = 1;
-	var amp = 0.8;
-	var pan = 0;
-	var modeMacro = 0;
-	var modeSwitchFade = 0.05;
-	var loopXfade = 0.005;
-	var maxCorrection = 0.02;
-	var hardThreshold = 0.125;
-	var correction = 0;
-	var resetCount = 0;
-	var loadGeneration = 0;
-	var poolSize = 128;
-	var poolBufL;
-	var poolBufR;
-	var poolPaths;
-	var poolLoaded;
-	var poolFrames;
-	var poolRates;
-	var poolGenerations;
-	var sampleSlot = 1;
-	var modeSwitchCount = 0;
-	var failedModeSwitchCount = 0;
-	var hardRealignCount = 0;
-	var staleClockCount = 0;
-	var lastClockSeq = -1;
-	var lastPhase = 0;
-	var lastExpectedPhase = 0;
-	var lastPhaseError = 0;
-	var lastErrorMs = 0;
-	var derivedSourceBpm = 120;
-	var sourceBpm = 120;
-	var sourceFrames = 4;
-	var sourceRate = 48000;
-	var loaded = 0;
-	var debugLevel = 1;
-	var sliceAttack = 0.002;
-	var sliceRelease = 0.02;
-	// Amp envelope (Amp page). envMode 0 = ADSR, 1 = AHR. Times in seconds,
-	// sustain 0..1. Stored here; the reader/slice-voice DSP wiring lands next.
-	// Defaults match the AHR drone default (0 / INF / 0) so the first play drones
-	// even before the script syncs the params.
-	var envMode = 1;
-	var envAttack = 0.0001;
-	var envDecay = 0.15;
-	var envSustain = 0.8;
-	var envRelease = 0.0001;
-	var envHold = 1000000;
-	var envTrigCount = 0;      // bumped per note-on to retrigger the amp envelope
-	var envNoteSeconds = 0.5;  // current note length (ADSR gate window); <= 0 means "hold until noteOff" (Task 1, PRD S8)
-	var noteOffTrigCount = 0;  // bumped per noteOff to release an indefinitely-held ADSR gate (Task 1, PRD S8)
-	var portamento = 0;        // 1 = overlapping trigger glides (no re-attack)
-	var sliceMono = 0;
-	var sliceSyncToClock = 1;
-	var sliceRate = 1;
-	var chopBeats = 0.25;
-	var chopMode = 0;
-	var chopAttack = 0.002;
-	var chopHold = 0.04;
-	var chopRelease = 0.01;
-	var grainSize = 0.08;
-	var grainOverlap = 8;
-	var grainJitter = 0;
-	var grainSpray = 0;
-	var wsolaWindow = 0.1;
-	var wsolaSearch = 0.03;
-	var pvWindow = 0.2;
-	var pvDispersion = 0;
-	// Global filter (post-mix, pre master pan/vol). One shared instance per
-	// track, sitting in filterGroup after the voice sourceGroup. Machine is a
-	// setting (not p-lockable); Type/Cutoff/Res/Drive/Morph/Balance are. The
-	// filter envelope is independent of the amp env (its own mode) but reuses
-	// the amp env's seconds mapping on the script side.
-	var fxBus;
-	var sourceGroup;
-	var filterGroup;
-	var filterSynth;
-	var filterSynthNames;
-	var filterMachine = 0;
-	var filterType = 0;         // 0 LP, 1 HP, 2 BP, 3 notch (classic machines)
-	var filterCutoff = 20000;   // Hz (default wide open = effective bypass)
-	var filterRes = 0;          // 0..1
-	var filterDrive = 0;        // 0..1 pre-filter drive
-	var filterMorph = 0;        // 0..1 morphing machines: 0 LP -> 0.5 notch -> 1 HP
-	var filterBalance = 0;      // -1..1 stereo / mid-side balance (variant machines)
-	var filterEnvMode = 1;      // independent of amp env: 0 ADSR, 1 AHR
-	var filterEnvAttack = 0.0001;
-	var filterEnvDecay = 0.15;
-	var filterEnvSustain = 0.8;
-	var filterEnvRelease = 0.0001;
-	var filterEnvHold = 1000000;
-	var filterEnvDepth = 0;     // -1..1, scaled to +/-6 octaves of cutoff mod
-	// Insert 1 (global, post-filter). One shared instance per track, sitting in
-	// insertGroup after filterGroup -- the filter now writes into insertBus
-	// instead of straight to master. Machine is a setting (not p-lockable);
-	// Drive/Mix/Delay*/Reverb*/Lofi* are. Index 0 is always the dry-passthrough
-	// \elasticatFxNone SynthDef so the chain graph never leaves insertBus
-	// unread (PRD SS4.3; Insert 1 only for now -- Insert 2/Sends/Master insert
-	// are follow-ups).
-	var insertBus;
-	var insertGroup;
-	var insertSynth;
-	var fxInsertNames;
-	var fxInsertMachine = 0;
-	var fxDrive = 0;            // 0..1 pre-effect drive (DRIVE machine)
-	var fxMix = 0.5;            // 0..1 dry/wet, shared by every wet fx machine
-	var delayBeats = 1;         // beat division (quarter note = 1), tempo-synced
-	var delayFeedback = 0.3;    // 0..1
-	var delayTone = 1;          // 0..1 -> feedback-loop lowpass cutoff amount
-	var reverbSize = 0.5;       // 0..1 -> FreeVerb2 room
-	var reverbDamp = 0.5;       // 0..1 -> FreeVerb2 damp
-	var lofiBits = 24;          // 1..24 bits (round-to-step quantizer)
-	var lofiRate = 48000;       // Hz (Latch sample-and-hold rate)
+	// --- Tracks --------------------------------------------------------------
+	// tracks[1..8]; slot 0 is unused so the array indexes by track NUMBER.
+	// State instances are created lazily by `track`; the CHAIN (synths/busses)
+	// is allocated by \activeTrackCount. Track 1's chain is always allocated
+	// -- it is the clock reference -- but it is otherwise an ordinary track.
+	var <tracks;
+	var activeTrackCount = 1;
+	var <tracksGroup;   // holds all 8 track chains; runs before sendGroup
+	var levelDecim;     // per-track 30Hz -> 15Hz counter for the meter feed
 
-	// --- Send buses (Send 1/2) + Master bus/insert (global; PRD SS3/SS8) -----
-	// Insert 1 now writes into masterBus instead of straight to context.out_b;
-	// masterGroup (after sendGroup) hosts the master insert FX synth, the only
-	// thing writing context.out_b for this track. sendGroup (after
-	// insertGroup, before masterGroup) hosts a tap synth (elasticatSendTap)
-	// that copies either the pre-insert (post-filter, insertBus) or
-	// post-insert-1 (masterBus, read there before any send return has landed
-	// this block) signal into sendBus1/2 at sendLevel1/2, followed by each
-	// send's own FX machine synth reading its send bus and writing back into
-	// masterBus -- all ahead of masterGroup's read in node order, so the
-	// master insert always sees Insert 1 + both send returns summed. Every
-	// send/master FX slot reuses the same fxInsertNames machine set (None/
-	// Drive/Delay/Reverb/Lofi) as Insert 1; index 0 (None) is the always-
-	// present passthrough so no bus is ever left unread.
-	var masterBus;
-	var sendBus1;
-	var sendBus2;
-	var sendGroup;
-	var masterGroup;
-	var sendTapSynth;
+	// --- Global send busses / master bus (PRD SS3/SS8) -----------------------
+	// Group order: tracksGroup -> sendGroup -> masterGroup.
+	// Each track's send tap writes sendBus1/2 and its mix synth writes
+	// masterBus, all from tracksGroup. sendGroup's two FX synths read the send
+	// busses and add back into masterBus. masterGroup's master insert reads
+	// masterBus (tracks + both send returns, all written by then) and is the
+	// only thing writing context.out_b.
+	var <sendGroup;
+	var <masterGroup;
+	var <masterBus;
+	var <sendBus1;
+	var <sendBus2;
 	var send1Synth;
 	var send2Synth;
 	var masterSynth;
-	var sendTap = 0;        // 0 = pre-insert (post-filter), 1 = post-insert-1
-	var sendLevel1 = 0;     // 0..1 continuous send amount
-	var sendLevel2 = 0;
 	var send1Machine = 0;   // index into fxInsertNames
 	var send2Machine = 0;
 	var masterFxMachine = 0;
-	// Per-slot FX params, indexed [send1, send2, master] -- mirrors the
-	// Insert 1 scalars above (fxDrive/fxMix/delayBeats/.../lofiRate) but kept
-	// as arrays here since there are three independent slots sharing the same
-	// machine set.
+	// Per-slot FX params, indexed [send1, send2, master] -- three independent
+	// slots sharing one machine set, so arrays rather than scalars.
 	var sendFxDrive;
 	var sendFxMix;
 	var sendFxDelayBeats;
@@ -198,77 +58,104 @@ Engine_Elasticat : CroneEngine {
 	var sendFxLofiBits;
 	var sendFxLofiRate;
 
-	// --- Modulation: 2 LFOs + 1 mod envelope (MOD category) -----------------
-	// SC-side modulation so it is smooth and never spams OSC: one control-rate
-	// \elasticatMod synth computes lfo1/lfo2/menv and routes depth * value of
-	// each source onto per-DESTINATION control buses (sources targeting the
-	// same destination sum in-synth). Destination synths add In.kr(bus) to the
-	// matching parameter:
-	//   pitch  -> readers/slice voices, +/-12 semitones at full depth
-	//   cutoff -> filterPrep, +/-3 octaves (36 semitones) at full depth
-	//   res    -> filterPrep, +/-0.5 of the 0..1 resonance
-	//   amp    -> filter output gain, amp * (1 + mod) clipped >= 0 (tremolo)
-	//   pan    -> filter output pan, +/-1 added then clipped
-	// Bus indices are passed as args on every respawn (commonArgs/filterArgs/
-	// triggerSlice), so machine changes keep modulation wired.
-	var modBusPitch;
-	var modBusCutoff;
-	var modBusRes;
-	var modBusAmp;
-	var modBusPan;
-	var modSynth;
-	var lfo1Dest = 0;      // 0 off, 1 pitch, 2 cutoff, 3 res, 4 amp, 5 pan
-	var lfo1Wave = 0;      // 0 sine, 1 tri, 2 saw, 3 rsaw, 4 sqr, 5 rand (S&H)
-	var lfo1Beats = 4;     // beats per LFO cycle (tempo-synced via targetBpm)
-	var lfo1Depth = 0;     // -1..1
-	var lfo1Mode = 0;      // 0 free, 1 trig, 2 one(-shot cycle), 3 hold (S&H)
-	var lfo2Dest = 0;
-	var lfo2Wave = 0;
-	var lfo2Beats = 4;
-	var lfo2Depth = 0;
-	var lfo2Mode = 0;
-	var menvDest = 0;
-	var menvAttack = 0.01; // seconds
-	var menvDecay = 0.15;
-	var menvSustain = 0.8; // 0..1
-	var menvRelease = 0.15; // seconds
-	var menvDepth = 0;     // -1..1
-	var lfoTrigCount = 0;  // bumped per step where lfo_reset resolves ON
-	var menvTrigCount = 0; // bumped per step where env_reset resolves ON
-	// 4 macros -- each a small MOD MATRIX. A macro has a base value (0..1, the
-	// knob the grid macro keys / macro page drive) and a SIGNED depth to every
-	// one of the 5 destinations (pitch/cutoff/res/amp/pan). Holding a macro key
-	// and turning a destination param dials that macro->param depth (Lua side).
-	// The macro contributes value * depth[d] to each destination bus d, summing
-	// with the direct LFO/env contributions. An LFO/mod-env can TARGET a macro
-	// (dest 6..9 = macro 1..4) to modulate its value, so a macro is an extra
-	// mod source whose "wave" is a (modulatable) knob feeding many destinations.
-	var macroBase;         // Array[4], 0..1
-	var macroMatrix;       // Array[4] of Array[5], -1..1 (depth per destination)
+	// --- SynthDef name registries (a machine is one row here + one SynthDef) -
+	var <modeSynthNames;
+	var <modeNames;
+	var <filterSynthNames;
+	var <fxInsertNames;
 
-	// --- Phase 1 multitrack scaffolding (tracks 2-8; PHASE1_CONTRACT.md) ----
-	// Track 1 stays on the instance vars above (zero regression risk); tracks
-	// 2-8 each get a state Event in trackStates (indexed by track NUMBER, so
-	// slots 0/1 stay unused) holding the per-track fields plus that track's
-	// chain node/bus refs. Chains are allocated lazily by \activeTrackCount:
-	// an inactive track owns NO synths and NO busses -- only the (tiny) state
-	// Event once a command has touched it. Each active chain = its own
-	// transport phasor + reader synth (same crossfade machine-swap mechanism
-	// as track 1) + a small mix synth (amp/pan/mute plus the click-free fade
-	// used when freeing), summing into masterBus from tracksGroup -- which
-	// sits AFTER sendGroup (so tracks 2-8 never leak into track 1's send
-	// taps, which read masterBus earlier in the block) and BEFORE masterGroup
-	// (so they still pass through the master insert to context.out_b). No
-	// per-track filter/amp-env/insert/mod in Phase 1; track 1 keeps its full
-	// existing path through the global filter chain untouched.
-	var trackStates;
-	var activeTrackCount = 1;
-	var tracksGroup;
-	var trackZeroModBus;   // never-written control bus: tracks' pitchModBus reads 0
-	var track1Mute = 0;    // \trMute 1 x gates the filter-stage amp for track 1
+	// --- Shared SynthDef graph functions -------------------------------------
+	var readerAmpEnv;         // shared amp-envelope graph for readers/filter env
+	var filterPrep;           // shared drive + env-modulated cutoff/res prep
+	var filterChannelClassic; // shared per-channel Classic (multimode) filter
+	var filterChannelMorph;   // shared per-channel Morphing filter
+	var filterBalanceCutoffs; // shared balance law: cutoff + balance -> [fcA, fcB]
+	var filterModOut;         // shared pan/amp output stage with pan/amp mod input
+	var fxMixBlend;           // shared dry/wet crossfade for insert FX machines
+	var fxDriveShape;         // shared drive/clip curve for the insert FX chain
+
+	// --- Global transport / clock -------------------------------------------
+	// Tempo is a MASTER-scope setting; every track's transport follows it.
+	// Clock sync uses track 1 as the phase reference (one loop can be the
+	// reference, and the transport correction it derives is pushed to ALL
+	// tracks) -- that is an engine-level role, not per-track behavior.
+	var <targetBpm = 120;
+	var <modeSwitchFade = 0.05;
+	var <correction = 0;
+	var loopXfade = 0.005;
+	var maxCorrection = 0.02;
+	var hardThreshold = 0.125;
+	var modeSwitchCount = 0;
+	var failedModeSwitchCount = 0;
+	var hardRealignCount = 0;
+	var staleClockCount = 0;
+	var lastClockSeq = -1;
+	var lastPhase = 0;
+	var lastExpectedPhase = 0;
+	var lastPhaseError = 0;
+	var lastErrorMs = 0;
+	var loadGeneration = 0;
+	var debugLevel = 1;
+	// Which track's per-instance mod / filter-env stream reaches the script.
+	// Eight copies of each now run; forwarding all of them would flood OSC and
+	// paint another track's modulation onto this track's page. Defaults to 1.
+	var uiTrack = 1;
+
+	// --- Shared sample pool --------------------------------------------------
+	// One buffer set per slot, shared by every track (no duplication).
+	var <poolSize = 128;
+	var <poolBufL;
+	var <poolBufR;
+	var poolPaths;
+	var <poolLoaded;
+	var <poolFrames;
+	var <poolRates;
+	var poolGenerations;
+	var <defaultBufL;
+	var <defaultBufR;
+	var previewSynth;
+
+	// --- Slice voices --------------------------------------------------------
+	// Articulation settings are engine-wide; the VOICES live on their track
+	// (spawned into that track's sourceGroup so they pass through that track's
+	// filter). sliceVoiceOrder is the oldest-first list across ALL tracks that
+	// enforces maxSliceVoices -- 8 tracks x 8 voices would cliff the CPU, so
+	// the oldest voice is stolen when the cap is hit. The per-track limit
+	// (the 32-slot voice map plus slice polyphony/mono) is unchanged.
+	var <sliceAttack = 0.002;
+	var <sliceRelease = 0.02;
+	var <sliceMono = 0;
+	var <sliceSyncToClock = 1;
+	var <sliceRate = 1;
+	var sliceVoiceOrder;
+	var maxSliceVoices = 16;
+
+	// --- OSC -----------------------------------------------------------------
+	var scriptAddress;
+	var statusResponder;
+	var modResponder;       // live mod-bus values -> script (~15Hz UI feed)
+	var filterEnvResponder; // filter-env cutoff contribution -> script (15Hz)
+	var transportResponder;
 
 	*new { arg context, doneCallback;
 		^super.new(context, doneCallback);
+	}
+
+	// Lazy per-track state. Every track index 1..8 is equal; nothing here
+	// branches on the number.
+	track { arg n;
+		var t;
+		t = n.asInteger;
+		if((t < 1) or: { t > 8 }, { ^nil });
+		if(tracks[t].isNil, { tracks[t] = ElasticatTrack(this, t); });
+		^tracks[t];
+	}
+
+	// Every track that currently owns a chain, in index order.
+	activeTracks {
+		^(1..8).collect({ arg t; tracks[t] }).select({ arg tr;
+			tr.notNil and: { tr.isAllocated }
+		});
 	}
 
 	alloc {
@@ -291,36 +178,6 @@ Engine_Elasticat : CroneEngine {
 			"random_ola",
 			"pitch_corrected"
 		];
-
-		sendFxDrive = [0, 0, 0];
-		sendFxMix = [0.5, 0.5, 0.5];
-		sendFxDelayBeats = [1, 1, 1];
-		sendFxDelayFeedback = [0.3, 0.3, 0.3];
-		sendFxDelayTone = [1, 1, 1];
-		sendFxReverbSize = [0.5, 0.5, 0.5];
-		sendFxReverbDamp = [0.5, 0.5, 0.5];
-		sendFxLofiBits = [24, 24, 24];
-		sendFxLofiRate = [48000, 48000, 48000];
-
-		phaseBus = Bus.audio(server, 1);
-		fxBus = Bus.audio(server, 2);
-		insertBus = Bus.audio(server, 2);
-		masterBus = Bus.audio(server, 2);
-		sendBus1 = Bus.audio(server, 2);
-		sendBus2 = Bus.audio(server, 2);
-		// Per-destination modulation buses (control rate; see the mod var block).
-		modBusPitch = Bus.control(server, 1);
-		modBusCutoff = Bus.control(server, 1);
-		modBusRes = Bus.control(server, 1);
-		modBusAmp = Bus.control(server, 1);
-		modBusPan = Bus.control(server, 1);
-		macroBase = Array.fill(4, { 0 });
-		macroMatrix = Array.fill(4, { Array.fill(5, { 0 }); });
-		// Phase 1 multitrack: per-track state slots (lazy; see var block) and
-		// the shared always-zero control bus tracks 2-8 read as pitchModBus
-		// (mod routing is track-1-only in Phase 1). Neither costs any DSP.
-		trackStates = Array.fill(9, { nil });
-		trackZeroModBus = Bus.control(server, 1);
 		filterSynthNames = [
 			\elasticatFilterClassic,
 			\elasticatFilterMorph,
@@ -336,10 +193,23 @@ Engine_Elasticat : CroneEngine {
 			\elasticatFxReverb,
 			\elasticatFxLofi
 		];
-		bufL = Buffer.alloc(server, 4, 1);
-		bufR = Buffer.alloc(server, 4, 1);
-		defaultBufL = bufL;
-		defaultBufR = bufR;
+
+		sendFxDrive = [0, 0, 0];
+		sendFxMix = [0.5, 0.5, 0.5];
+		sendFxDelayBeats = [1, 1, 1];
+		sendFxDelayFeedback = [0.3, 0.3, 0.3];
+		sendFxDelayTone = [1, 1, 1];
+		sendFxReverbSize = [0.5, 0.5, 0.5];
+		sendFxReverbDamp = [0.5, 0.5, 0.5];
+		sendFxLofiBits = [24, 24, 24];
+		sendFxLofiRate = [48000, 48000, 48000];
+
+		masterBus = Bus.audio(server, 2);
+		sendBus1 = Bus.audio(server, 2);
+		sendBus2 = Bus.audio(server, 2);
+
+		defaultBufL = Buffer.alloc(server, 4, 1);
+		defaultBufR = defaultBufL;
 		poolBufL = Array.fill(poolSize, { nil });
 		poolBufR = Array.fill(poolSize, { nil });
 		poolPaths = Array.fill(poolSize, { "" });
@@ -347,31 +217,25 @@ Engine_Elasticat : CroneEngine {
 		poolFrames = Array.fill(poolSize, { 4 });
 		poolRates = Array.fill(poolSize, { 48000 });
 		poolGenerations = Array.fill(poolSize, { 0 });
-		activeSliceSynths = Array.fill(32, { nil });
+
+		tracks = Array.fill(9, { nil });
+		levelDecim = Array.fill(9, { 0 });
+		sliceVoiceOrder = [];
 
 		this.addSynthDefs;
 		server.sync;
 
+		// --- OSC responders --------------------------------------------------
+		// Every per-instance SendReply carries its 1-based track index as
+		// replyID, so one responder per stream serves all 8 tracks.
 		transportResponder = OSCFunc({
 			arg msg;
-			var track;
-			// Phase 1 multitrack: msg[2] is SendReply's replyID, which every
-			// transport synth now sets to its 1-based track index (track 1's
-			// synth defaults to 1, preserving its behavior). Tracks 2-8 get a
-			// cheap 1 Hz position report forwarded to the script and cached in
-			// their state Event (used to re-anchor on machine swaps); ONLY
-			// track 1 feeds the legacy lastPhase/correction globals.
-			track = msg[2].asInteger;
-			if(track > 1, {
-				if(track <= 8 and: { trackStates.notNil } and: { trackStates[track].notNil }, {
-					trackStates[track][\lastPhase] = msg[3].asFloat.wrap(0, 1);
-				});
-				scriptAddress.sendBundle(0, [
-					"/elasticat/track/position",
-					track,
-					msg[3].asFloat
-				]);
-			}, {
+			var t, tr;
+			t = msg[2].asInteger;
+			tr = if((t >= 1) and: { t <= 8 }, { tracks[t] }, { nil });
+			if(tr.notNil, { tr.reportPhase(msg[3].asFloat); });
+			// Track 1 is the clock-sync phase reference (an engine-level role).
+			if(t == 1, {
 				lastPhase = msg[3].asFloat;
 				correction = msg[4].asFloat;
 				if(debugLevel >= 3, {
@@ -383,29 +247,64 @@ Engine_Elasticat : CroneEngine {
 					]);
 				});
 			});
+			// UNCONDITIONAL, for every track including 1 -- one code path, no
+			// track-1 branch. This is the only phase the script gets for a
+			// BACKGROUND track: without it trig_release "return" (which needs a
+			// past playhead position to dead-reckon from) degrades to "reset" on
+			// every track that is not selected. Track 1 also appears in the
+			// legacy 30 Hz /elasticat/status stream, but that stream is track 1's
+			// alone and must not be relied on for the others.
+			//
+			// Cost: one small bundle per track per second (the SendReply above is
+			// Impulse.kr(1)), so 8 msg/s at 8 tracks. Deliberately far below the
+			// 30 Hz reader streams -- the script dead-reckons between reports, it
+			// does not need a fast feed. Do not raise this rate.
+			scriptAddress.sendBundle(0, [
+				"/elasticat/track/position",
+				t,
+				msg[3].asFloat
+			]);
 		}, path: '/elasticat/transportRaw', srcID: server.addr);
 
 		statusResponder = OSCFunc({
 			arg msg;
-			// Phase 1 multitrack: msg[2] (SendReply replyID) is the 1-based
-			// track index; only track 1's reader feeds the legacy status
-			// stream. Tracks 2-8 readers also fire statusRaw (shared
-			// SynthDefs) but are dropped here -- their position report comes
-			// from the cheaper 1 Hz transport responder above.
-			if(msg[2].asInteger <= 1, {
+			var t, tr, ui;
+			// Every reader fires this at 30Hz; the message has already arrived,
+			// so use it to keep EVERY track's phase current (a machine swap
+			// re-anchors on it). Only the reference track's FULL status stream
+			// is forwarded -- 8 x 30Hz of that would flood OSC.
+			t = msg[2].asInteger;
+			tr = if((t >= 1) and: { t <= 8 }, { tracks[t] }, { nil });
+			if(tr.notNil, {
+				tr.reportPhase(msg[4].asFloat);
+				// Per-track meter feed, for every track including 1 (one code
+				// path; track 1 is not special). Decimated 30Hz -> 15Hz, the
+				// norns screen refresh rate the mod feed already uses:
+				// forwarding all 8 readers undecimated would be 240 msg/s of
+				// meters alone.
+				levelDecim[t] = levelDecim[t] + 1;
+				if(levelDecim[t] >= 2, {
+					levelDecim[t] = 0;
+					scriptAddress.sendBundle(0, [
+						"/elasticat/track/level", t, msg[6].asFloat, msg[7].asFloat
+					]);
+				});
+			});
+			if(t == 1, {
 				lastPhase = msg[4].asFloat;
+				ui = this.uiTrackObj;
 				scriptAddress.sendBundle(0, [
 					"/elasticat/status",
-					loaded,
-					playing,
-					modeNames.wrapAt(activeMode),
+					ui.loaded,
+					ui.playing,
+					modeNames.wrapAt(ui.machine),
 					msg[3].asFloat,
 					msg[4].asFloat,
 					msg[5].asFloat,
 					msg[6].asFloat,
 					msg[7].asFloat,
 					targetBpm,
-					derivedSourceBpm,
+					ui.derivedSourceBpm,
 					correction,
 					lastExpectedPhase,
 					lastPhaseError,
@@ -419,60 +318,48 @@ Engine_Elasticat : CroneEngine {
 			});
 		}, path: '/elasticat/statusRaw', srcID: server.addr);
 
-		// Live modulation feed for the UI: forwards the five mod-bus sums so the
-		// low-profile "actual value" bars and the filter render can follow LFOs /
-		// mod-env / macros during playback. Fired at 15Hz by \elasticatMod.
+		// Live modulation feed for the UI: the five mod-bus sums, so the
+		// low-profile "actual value" bars and the filter render follow LFOs /
+		// mod-env / macros during playback. Fired at 15Hz by each track's
+		// \elasticatMod; only the UI-selected track's stream is forwarded.
+		// The track index rides along as a trailing value (appending keeps the
+		// existing positional handler working unchanged).
 		modResponder = OSCFunc({
 			arg msg;
-			scriptAddress.sendBundle(0, [
-				"/elasticat/mod",
-				msg[3].asFloat, msg[4].asFloat, msg[5].asFloat,
-				msg[6].asFloat, msg[7].asFloat
-			]);
+			if(msg[2].asInteger == uiTrack, {
+				scriptAddress.sendBundle(0, [
+					"/elasticat/mod",
+					msg[3].asFloat, msg[4].asFloat, msg[5].asFloat,
+					msg[6].asFloat, msg[7].asFloat,
+					msg[2].asInteger
+				]);
+			});
 		}, path: '/elasticat/modRaw', srcID: server.addr);
 
-		// Filter-envelope cutoff contribution (semitones) -> script, so the UI can
-		// show the filter's own envelope sweeping the render.
+		// Filter-envelope cutoff contribution (semitones) -> script, so the UI
+		// can show the filter's own envelope sweeping the render.
 		filterEnvResponder = OSCFunc({
 			arg msg;
-			scriptAddress.sendBundle(0, ["/elasticat/filterEnv", msg[3].asFloat]);
+			if(msg[2].asInteger == uiTrack, {
+				scriptAddress.sendBundle(0, [
+					"/elasticat/filterEnv", msg[3].asFloat, msg[2].asInteger
+				]);
+			});
 		}, path: '/elasticat/filterEnvRaw', srcID: server.addr);
 
-		// Voices (transport + readers + slices) live in sourceGroup and sum onto
-		// fxBus; the global filter reads fxBus in filterGroup (after sourceGroup)
-		// and writes into insertBus; Insert 1 reads insertBus in insertGroup
-		// (after filterGroup) and writes the master out. New slice voices
-		// tail-add within sourceGroup, so they always precede filter/insert in
-		// the node order.
-		sourceGroup = Group.head(context.xg);
-		filterGroup = Group.after(sourceGroup);
-		insertGroup = Group.after(filterGroup);
-		sendGroup = Group.after(insertGroup);
+		// --- Node graph: tracksGroup -> sendGroup -> masterGroup -------------
+		tracksGroup = Group.head(context.xg);
+		sendGroup = Group.after(tracksGroup);
 		masterGroup = Group.after(sendGroup);
-		// Phase 1 multitrack: container for track 2-8 chains. Created after
-		// masterGroup so Group.after(sendGroup) inserts it BETWEEN sendGroup
-		// and masterGroup: the send tap has already read masterBus (tap=post)
-		// by the time these chains write into it, so tracks 2-8 reach the
-		// master insert without leaking into track 1's sends. Empty (zero
-		// cost) until \activeTrackCount allocates chains.
-		tracksGroup = Group.after(sendGroup);
 
-		transportSynth = Synth.new(\elasticatTransport, [
-			\out, phaseBus.index,
-			\playing, playing,
-			\targetBpm, targetBpm,
-			\loopBeats, this.activeLoopBeats,
-			\correction, correction
-		], sourceGroup);
-
-		this.spawnModSynth;
-		activeSynth = this.spawnMode(activeMode, 1);
-		this.spawnFilter;
-		this.spawnInsert;
-		this.spawnSendTap;
 		this.spawnSend1;
 		this.spawnSend2;
 		this.spawnMasterFx;
+
+		// Allocate every active chain through the ONE code path. Track 1 is
+		// included here, not spawned separately.
+		this.setActiveTrackCount(activeTrackCount);
+
 		this.installCommands;
 	}
 
@@ -522,7 +409,7 @@ Engine_Elasticat : CroneEngine {
 		// machine. Returns [drivenStereoSignal, baseCutoffHz, rq].
 		// envReleaseTrig (Task 1, PRD S8) threads noteOff through to the filter
 		// envelope, which shares the amp env's trigger counter/gate window.
-		filterPrep = { arg sig, drive, cutoff, res, envMode, envAttack, envDecay, envSustain, envRelease, envHold, envDepth, envTrig, envGateSeconds, envReleaseTrig, cutoffModBus, resModBus;
+		filterPrep = { arg sig, drive, cutoff, res, envMode, envAttack, envDecay, envSustain, envRelease, envHold, envDepth, envTrig, envGateSeconds, envReleaseTrig, cutoffModBus, resModBus, trackIndex=1, slew=0.09;
 			var driven, fenv, fc, rq, resMod;
 			driven = (sig * (1 + (drive.clip(0, 1) * 12))).tanh;
 			sig = XFade2.ar(sig, driven, (drive.clip(0, 1) * 2) - 1);
@@ -530,17 +417,19 @@ Engine_Elasticat : CroneEngine {
 			// Depth is +/-6 octaves (72 semitones) of cutoff modulation; the mod
 			// bus (LFO/mod-env CUTOFF destination, -1..1) adds up to +/-3 octaves
 			// (36 semitones) on top -- both exponential, summed in semitones.
-			fc = (Lag.kr(cutoff.clip(20, 20000), 0.01)
+			fc = (Lag.kr(cutoff.clip(20, 20000), slew)
 				* ((envDepth.clip(-1, 1) * fenv * 72) + (In.kr(cutoffModBus, 1).clip(-1, 1) * 36)).midiratio).clip(20, 20000);
 			// Report the FILTER ENVELOPE's own cutoff contribution (in semitones)
 			// to the script at 15Hz. It is applied here rather than on a mod bus,
 			// so the UI's filter render/actual-value bars could not see it
-			// otherwise. Only one filter synth runs at a time, so this fires once.
+			// otherwise. Phase 2: one filter synth PER TRACK, so this carries the
+			// track index as replyID and the script keeps only the selected
+			// track's stream.
 			SendReply.kr(Impulse.kr(15), '/elasticat/filterEnvRaw',
-				[envDepth.clip(-1, 1) * fenv * 72]);
+				[envDepth.clip(-1, 1) * fenv * 72], replyID: trackIndex);
 			// RES destination: -1..1 mod adds +/-0.5 to the 0..1 resonance.
 			resMod = (res.clip(0, 1) + (In.kr(resModBus, 1).clip(-1, 1) * 0.5)).clip(0, 1);
-			rq = Lag.kr((1 - (resMod * 0.98)).clip(0.02, 1), 0.01);
+			rq = Lag.kr((1 - (resMod * 0.98)).clip(0.02, 1), slew);
 			[sig, fc, rq];
 		};
 
@@ -556,9 +445,9 @@ Engine_Elasticat : CroneEngine {
 		// Morphing per-channel filter: Morph sweeps LP -> notch -> HP at (fc, rq).
 		// morph is lagged here (matches the original single-channel synth); called
 		// once per channel this duplicates a trivial control-rate Lag, not audio DSP.
-		filterChannelMorph = { arg s, fc, rq, morph;
+		filterChannelMorph = { arg s, fc, rq, morph, slew=0.09;
 			var lp, hp, bp, notch, lowHalf, highHalf, m;
-			m = Lag.kr(morph.clip(0, 1), 0.02);
+			m = Lag.kr(morph.clip(0, 1), slew);
 			lp = RLPF.ar(s, fc, rq);
 			hp = RHPF.ar(s, fc, rq);
 			bp = BPF.ar(s, fc, rq);
@@ -588,10 +477,13 @@ Engine_Elasticat : CroneEngine {
 		// filter machine ends with, now with the AMP/PAN modulation destinations
 		// folded in. AMP is a tremolo on the output gain -- amp * (1 + mod),
 		// clipped >= 0 -- and PAN adds -1..1 to the pan position, clipped.
-		filterModOut = { arg sigL, sigR, pan, amp, panModBus, ampModBus;
+		// pan/amp were applied RAW here -- no smoothing at all -- so a stepped
+		// control (an encoder detent, or a 12Hz morph tick) landed as a jump.
+		// Lagged at `slew` like the rest of the filter stage.
+		filterModOut = { arg sigL, sigR, pan, amp, panModBus, ampModBus, slew=0.09;
 			Balance2.ar(sigL, sigR,
-				(pan + In.kr(panModBus, 1).clip(-1, 1)).clip(-1, 1),
-				(amp * (1 + In.kr(ampModBus, 1).clip(-1, 1))).max(0));
+				(Lag.kr(pan, slew) + In.kr(panModBus, 1).clip(-1, 1)).clip(-1, 1),
+				(Lag.kr(amp, slew) * (1 + In.kr(ampModBus, 1).clip(-1, 1))).max(0));
 		};
 
 		// trackIndex feeds SendReply's replyID so the responders can tell which
@@ -824,11 +716,11 @@ Engine_Elasticat : CroneEngine {
 			lengthSeconds=0, syncToClock=1, sliceRate=1, warpMode=0,
 			targetBpm=120, macro=0, grainSize=0.08, grainOverlap=8,
 			grainJitter=0, wsolaWindow=0.1, wsolaSearch=0.03,
-			pvWindow=0.2, pvDispersion=0, pitchModBus=0;
+			pvWindow=0.2, pvDispersion=0, pitchModBus=0, steal=0;
 			var frames, startFrame, endFrame, loFrame, hiFrame, continueMode, readLo, readHi, loopMode;
 			var directionSign, resetFrame, rangeFrames, duration, pitchRatio, freePitchRatio, freeRate, fitRate, readRate;
 			var pos, loopPos, sweepFrames, sweepForwardPos, sweepReversePos, sweepPos, readPhase, env, adsrEnv, ahrEnv, raw, grain, ola, pc, sig, playAmp;
-			var grainDur, grainCount, grainRandom, olaTrig, olaPos, pcRatio;
+			var grainDur, grainCount, grainRandom, olaTrig, olaPos, pcRatio, stealFade;
 
 			frames = BufFrames.kr(bufL).max(4);
 			startFrame = (startPoint.clip(0, 127.99) / 128) * (frames - 1);
@@ -899,9 +791,15 @@ Engine_Elasticat : CroneEngine {
 				Select.ar(warpMode.clip(0, 5), [raw[0], raw[0], raw[0], grain[0], ola[0], pc[0]]),
 				Select.ar(warpMode.clip(0, 5), [raw[1], raw[1], raw[1], grain[1], ola[1], pc[1]])
 			];
+			// Voice stealing (global concurrent-voice cap, Phase 2). \gate alone
+			// cannot end an AHR voice -- that envelope ignores gate-off -- so a
+			// stolen voice needs its own exit: a 20 ms fade to silence that frees
+			// the synth outright. Idle at 1 until \steal is set, so an unstolen
+			// voice is bit-identical to before.
+			stealFade = EnvGen.kr(Env([1, 0], [0.02]), steal, doneAction: 2);
 			// Track pan + volume are applied downstream at the filter output stage;
 			// the voice keeps only velocity and its per-note envelope.
-			playAmp = velocity.clip(0, 1) * env;
+			playAmp = velocity.clip(0, 1) * env * stealFade;
 			sig = [sig[0], sig[1]] * playAmp;
 			sig = LeakDC.ar(sig);
 			Out.ar(out, sig);
@@ -925,15 +823,15 @@ Engine_Elasticat : CroneEngine {
 			filterType=0, cutoff=20000, res=0, drive=0, morph=0, balance=0,
 			envMode=1, envAttack=0.0001, envDecay=0.15, envSustain=0.8, envRelease=0.0001, envHold=1000000,
 			envDepth=0, envTrig=0, envGateSeconds=0.5, envReleaseTrig=0,
-			cutoffModBus=0, resModBus=0, ampModBus=0, panModBus=0;
+			cutoffModBus=0, resModBus=0, ampModBus=0, panModBus=0, trackIndex=1, slew=0.09;
 			var sig, fc, rq, filtered;
 			sig = In.ar(in, 2);
-			# sig, fc, rq = filterPrep.value(sig, drive, cutoff, res, envMode, envAttack, envDecay, envSustain, envRelease, envHold, envDepth, envTrig, envGateSeconds, envReleaseTrig, cutoffModBus, resModBus);
+			# sig, fc, rq = filterPrep.value(sig, drive, cutoff, res, envMode, envAttack, envDecay, envSustain, envRelease, envHold, envDepth, envTrig, envGateSeconds, envReleaseTrig, cutoffModBus, resModBus, trackIndex, slew);
 			filtered = [
 				filterChannelClassic.value(sig[0], fc, rq, filterType),
 				filterChannelClassic.value(sig[1], fc, rq, filterType)
 			];
-			filtered = filterModOut.value(filtered[0], filtered[1], pan.clip(-1, 1), amp, panModBus, ampModBus);
+			filtered = filterModOut.value(filtered[0], filtered[1], pan.clip(-1, 1), amp, panModBus, ampModBus, slew);
 			Out.ar(out, LeakDC.ar(filtered));
 		}).add;
 
@@ -943,15 +841,15 @@ Engine_Elasticat : CroneEngine {
 			filterType=0, cutoff=20000, res=0, drive=0, morph=0, balance=0,
 			envMode=1, envAttack=0.0001, envDecay=0.15, envSustain=0.8, envRelease=0.0001, envHold=1000000,
 			envDepth=0, envTrig=0, envGateSeconds=0.5, envReleaseTrig=0,
-			cutoffModBus=0, resModBus=0, ampModBus=0, panModBus=0;
+			cutoffModBus=0, resModBus=0, ampModBus=0, panModBus=0, trackIndex=1, slew=0.09;
 			var sig, fc, rq, filtered;
 			sig = In.ar(in, 2);
-			# sig, fc, rq = filterPrep.value(sig, drive, cutoff, res, envMode, envAttack, envDecay, envSustain, envRelease, envHold, envDepth, envTrig, envGateSeconds, envReleaseTrig, cutoffModBus, resModBus);
+			# sig, fc, rq = filterPrep.value(sig, drive, cutoff, res, envMode, envAttack, envDecay, envSustain, envRelease, envHold, envDepth, envTrig, envGateSeconds, envReleaseTrig, cutoffModBus, resModBus, trackIndex, slew);
 			filtered = [
-				filterChannelMorph.value(sig[0], fc, rq, morph),
-				filterChannelMorph.value(sig[1], fc, rq, morph)
+				filterChannelMorph.value(sig[0], fc, rq, morph, slew),
+				filterChannelMorph.value(sig[1], fc, rq, morph, slew)
 			];
-			filtered = filterModOut.value(filtered[0], filtered[1], pan.clip(-1, 1), amp, panModBus, ampModBus);
+			filtered = filterModOut.value(filtered[0], filtered[1], pan.clip(-1, 1), amp, panModBus, ampModBus, slew);
 			Out.ar(out, LeakDC.ar(filtered));
 		}).add;
 
@@ -964,16 +862,16 @@ Engine_Elasticat : CroneEngine {
 			filterType=0, cutoff=20000, res=0, drive=0, morph=0, balance=0,
 			envMode=1, envAttack=0.0001, envDecay=0.15, envSustain=0.8, envRelease=0.0001, envHold=1000000,
 			envDepth=0, envTrig=0, envGateSeconds=0.5, envReleaseTrig=0,
-			cutoffModBus=0, resModBus=0, ampModBus=0, panModBus=0;
+			cutoffModBus=0, resModBus=0, ampModBus=0, panModBus=0, trackIndex=1, slew=0.09;
 			var sig, fc, rq, fcL, fcR, filtered;
 			sig = In.ar(in, 2);
-			# sig, fc, rq = filterPrep.value(sig, drive, cutoff, res, envMode, envAttack, envDecay, envSustain, envRelease, envHold, envDepth, envTrig, envGateSeconds, envReleaseTrig, cutoffModBus, resModBus);
+			# sig, fc, rq = filterPrep.value(sig, drive, cutoff, res, envMode, envAttack, envDecay, envSustain, envRelease, envHold, envDepth, envTrig, envGateSeconds, envReleaseTrig, cutoffModBus, resModBus, trackIndex, slew);
 			# fcL, fcR = filterBalanceCutoffs.value(fc, balance);
 			filtered = [
 				filterChannelClassic.value(sig[0], fcL, rq, filterType),
 				filterChannelClassic.value(sig[1], fcR, rq, filterType)
 			];
-			filtered = filterModOut.value(filtered[0], filtered[1], pan.clip(-1, 1), amp, panModBus, ampModBus);
+			filtered = filterModOut.value(filtered[0], filtered[1], pan.clip(-1, 1), amp, panModBus, ampModBus, slew);
 			Out.ar(out, LeakDC.ar(filtered));
 		}).add;
 
@@ -984,16 +882,16 @@ Engine_Elasticat : CroneEngine {
 			filterType=0, cutoff=20000, res=0, drive=0, morph=0, balance=0,
 			envMode=1, envAttack=0.0001, envDecay=0.15, envSustain=0.8, envRelease=0.0001, envHold=1000000,
 			envDepth=0, envTrig=0, envGateSeconds=0.5, envReleaseTrig=0,
-			cutoffModBus=0, resModBus=0, ampModBus=0, panModBus=0;
+			cutoffModBus=0, resModBus=0, ampModBus=0, panModBus=0, trackIndex=1, slew=0.09;
 			var sig, fc, rq, fcL, fcR, filtered;
 			sig = In.ar(in, 2);
-			# sig, fc, rq = filterPrep.value(sig, drive, cutoff, res, envMode, envAttack, envDecay, envSustain, envRelease, envHold, envDepth, envTrig, envGateSeconds, envReleaseTrig, cutoffModBus, resModBus);
+			# sig, fc, rq = filterPrep.value(sig, drive, cutoff, res, envMode, envAttack, envDecay, envSustain, envRelease, envHold, envDepth, envTrig, envGateSeconds, envReleaseTrig, cutoffModBus, resModBus, trackIndex, slew);
 			# fcL, fcR = filterBalanceCutoffs.value(fc, balance);
 			filtered = [
-				filterChannelMorph.value(sig[0], fcL, rq, morph),
-				filterChannelMorph.value(sig[1], fcR, rq, morph)
+				filterChannelMorph.value(sig[0], fcL, rq, morph, slew),
+				filterChannelMorph.value(sig[1], fcR, rq, morph, slew)
 			];
-			filtered = filterModOut.value(filtered[0], filtered[1], pan.clip(-1, 1), amp, panModBus, ampModBus);
+			filtered = filterModOut.value(filtered[0], filtered[1], pan.clip(-1, 1), amp, panModBus, ampModBus, slew);
 			Out.ar(out, LeakDC.ar(filtered));
 		}).add;
 
@@ -1006,17 +904,17 @@ Engine_Elasticat : CroneEngine {
 			filterType=0, cutoff=20000, res=0, drive=0, morph=0, balance=0,
 			envMode=1, envAttack=0.0001, envDecay=0.15, envSustain=0.8, envRelease=0.0001, envHold=1000000,
 			envDepth=0, envTrig=0, envGateSeconds=0.5, envReleaseTrig=0,
-			cutoffModBus=0, resModBus=0, ampModBus=0, panModBus=0;
+			cutoffModBus=0, resModBus=0, ampModBus=0, panModBus=0, trackIndex=1, slew=0.09;
 			var sig, fc, rq, fcM, fcS, mid, side, filteredMid, filteredSide, filtered;
 			sig = In.ar(in, 2);
-			# sig, fc, rq = filterPrep.value(sig, drive, cutoff, res, envMode, envAttack, envDecay, envSustain, envRelease, envHold, envDepth, envTrig, envGateSeconds, envReleaseTrig, cutoffModBus, resModBus);
+			# sig, fc, rq = filterPrep.value(sig, drive, cutoff, res, envMode, envAttack, envDecay, envSustain, envRelease, envHold, envDepth, envTrig, envGateSeconds, envReleaseTrig, cutoffModBus, resModBus, trackIndex, slew);
 			mid = (sig[0] + sig[1]) * 0.5;
 			side = (sig[0] - sig[1]) * 0.5;
 			# fcM, fcS = filterBalanceCutoffs.value(fc, balance);
 			filteredMid = filterChannelClassic.value(mid, fcM, rq, filterType);
 			filteredSide = filterChannelClassic.value(side, fcS, rq, filterType);
 			filtered = [filteredMid + filteredSide, filteredMid - filteredSide];
-			filtered = filterModOut.value(filtered[0], filtered[1], pan.clip(-1, 1), amp, panModBus, ampModBus);
+			filtered = filterModOut.value(filtered[0], filtered[1], pan.clip(-1, 1), amp, panModBus, ampModBus, slew);
 			Out.ar(out, LeakDC.ar(filtered));
 		}).add;
 
@@ -1027,17 +925,17 @@ Engine_Elasticat : CroneEngine {
 			filterType=0, cutoff=20000, res=0, drive=0, morph=0, balance=0,
 			envMode=1, envAttack=0.0001, envDecay=0.15, envSustain=0.8, envRelease=0.0001, envHold=1000000,
 			envDepth=0, envTrig=0, envGateSeconds=0.5, envReleaseTrig=0,
-			cutoffModBus=0, resModBus=0, ampModBus=0, panModBus=0;
+			cutoffModBus=0, resModBus=0, ampModBus=0, panModBus=0, trackIndex=1, slew=0.09;
 			var sig, fc, rq, fcM, fcS, mid, side, filteredMid, filteredSide, filtered;
 			sig = In.ar(in, 2);
-			# sig, fc, rq = filterPrep.value(sig, drive, cutoff, res, envMode, envAttack, envDecay, envSustain, envRelease, envHold, envDepth, envTrig, envGateSeconds, envReleaseTrig, cutoffModBus, resModBus);
+			# sig, fc, rq = filterPrep.value(sig, drive, cutoff, res, envMode, envAttack, envDecay, envSustain, envRelease, envHold, envDepth, envTrig, envGateSeconds, envReleaseTrig, cutoffModBus, resModBus, trackIndex, slew);
 			mid = (sig[0] + sig[1]) * 0.5;
 			side = (sig[0] - sig[1]) * 0.5;
 			# fcM, fcS = filterBalanceCutoffs.value(fc, balance);
-			filteredMid = filterChannelMorph.value(mid, fcM, rq, morph);
-			filteredSide = filterChannelMorph.value(side, fcS, rq, morph);
+			filteredMid = filterChannelMorph.value(mid, fcM, rq, morph, slew);
+			filteredSide = filterChannelMorph.value(side, fcS, rq, morph, slew);
 			filtered = [filteredMid + filteredSide, filteredMid - filteredSide];
-			filtered = filterModOut.value(filtered[0], filtered[1], pan.clip(-1, 1), amp, panModBus, ampModBus);
+			filtered = filterModOut.value(filtered[0], filtered[1], pan.clip(-1, 1), amp, panModBus, ampModBus, slew);
 			Out.ar(out, LeakDC.ar(filtered));
 		}).add;
 
@@ -1196,7 +1094,7 @@ Engine_Elasticat : CroneEngine {
 			lfo1Dest=0, lfo1Wave=0, lfo1Beats=4, lfo1Depth=0, lfo1Mode=0, lfoTrig1=0,
 			lfo2Dest=0, lfo2Wave=0, lfo2Beats=4, lfo2Depth=0, lfo2Mode=0, lfoTrig2=0,
 			menvDest=0, menvAttack=0.01, menvDecay=0.15, menvSustain=0.8, menvRelease=0.15,
-			menvDepth=0, menvTrig=0, menvGateSeconds=0.5, menvReleaseTrig=0,
+			menvDepth=0, menvTrig=0, menvGateSeconds=0.5, menvReleaseTrig=0, trackIndex=1,
 			macro1Base=0, macro1PitchDepth=0, macro1CutoffDepth=0, macro1ResDepth=0, macro1AmpDepth=0, macro1PanDepth=0,
 			macro2Base=0, macro2PitchDepth=0, macro2CutoffDepth=0, macro2ResDepth=0, macro2AmpDepth=0, macro2PanDepth=0,
 			macro3Base=0, macro3PitchDepth=0, macro3CutoffDepth=0, macro3ResDepth=0, macro3AmpDepth=0, macro3PanDepth=0,
@@ -1278,8 +1176,12 @@ Engine_Elasticat : CroneEngine {
 			// Report the live modulation to the script at ~15Hz -- the norns
 			// screen's own refresh rate, so the UI's "actual value" bars and the
 			// filter render can follow the modulation without oversampling it.
+			// Phase 2: every track runs its own mod synth, so the replyID says
+			// WHICH track is reporting and the script keeps only the selected
+			// track's stream (8 undifferentiated streams would both flood OSC
+			// and paint another track's modulation onto this track's page).
 			SendReply.kr(Impulse.kr(15), '/elasticat/modRaw',
-				[pitchSum, cutoffSum, resSum, ampSum, panSum]);
+				[pitchSum, cutoffSum, resSum, ampSum, panSum], replyID: trackIndex);
 		}).add;
 	}
 
@@ -1354,217 +1256,259 @@ Engine_Elasticat : CroneEngine {
 		}).add;
 	}
 
+	// =======================================================================
+	// Command surface
+	// =======================================================================
+	// EVERY per-track command takes the 1-based track index as its first
+	// argument (docs/PHASE2_CONTRACT.md). There are NO un-prefixed aliases:
+	// anything still calling a global parameter command is a bug, not a
+	// fallback. Only genuinely global things (send FX, master FX, tempo,
+	// sample pool, active track count) keep un-prefixed commands.
+	//
+	// The ~50 plain value setters are NOT hand-written: they are generated
+	// from ElasticatTrack.setSpec, so adding a per-track parameter is one
+	// spec row and nothing else.
 	installCommands {
+		var aliases;
+
+		// --- Generated: \tr<UpperCamelField> (track, value) per spec row ----
+		ElasticatTrack.setSpec.keysDo({ arg field;
+			var spec, name, format;
+			spec = ElasticatTrack.setSpec[field];
+			name = this.trCommandName(field);
+			format = if(spec[\int] == true, { "ii" }, { "if" });
+			this.addCommand(name, format, { arg msg;
+				var tr;
+				tr = this.track(msg[1]);
+				if(tr.notNil, { tr.set(field, msg[2]); });
+			});
+		});
+
+		// Legacy spellings the script still derives mechanically from its own
+		// param spec ("grainDensity" -> \trGrainDensity). One table; each row
+		// forwards to the same spec field as the generated command above.
+		aliases = [
+			[\trGrainDensity, \grainOverlap],
+			[\trDelayTime, \delayBeats],
+			[\trLfo1Speed, \lfo1Beats],
+			[\trLfo2Speed, \lfo2Beats],
+			[\trChopLoopMode, \chopMode],
+			[\trModeMacro, \macro],
+			[\trSetEnvMode, \envMode],
+			[\trSetPortamento, \portamento],
+			[\trSetSpeed, \speed],
+			[\trSetSendTap, \sendTap]
+		];
+		aliases.do({ arg pair;
+			var name, field, spec, format;
+			name = pair[0];
+			field = pair[1];
+			spec = ElasticatTrack.setSpec[field];
+			format = if(spec[\int] == true, { "ii" }, { "if" });
+			this.addCommand(name, format, { arg msg;
+				var tr;
+				tr = this.track(msg[1]);
+				if(tr.notNil, { tr.set(field, msg[2]); });
+			});
+		});
+
+		// --- Per-track commands whose logic is genuinely non-trivial --------
+		// amp is mute-gated at the filter stage; mute gates both stages.
+		this.addCommand(\trAmp, "if", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.setAmp(msg[2]); });
+		});
+		this.addCommand(\trMute, "ii", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.setMute(msg[2]); });
+		});
+		// Machine selects respawn a synth.
+		this.addCommand(\trFilterMachine, "ii", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.setFilterMachine(msg[2]); });
+		});
+		this.addCommand(\trSetFilterMachine, "ii", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.setFilterMachine(msg[2]); });
+		});
+		this.addCommand(\trFxInsertMachine, "ii", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.setInsertMachine(msg[2]); });
+		});
+		this.addCommand(\trSetInsertMachine, "ii", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.setInsertMachine(msg[2]); });
+		});
+		this.addCommand(\trSetMachine, "ii", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { this.setTrackMachine(tr, msg[2]); });
+		});
+		this.addCommand(\trSetMode, "ii", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { this.setTrackMachine(tr, msg[2]); });
+		});
+		// Indexed mod-matrix forms.
+		this.addCommand(\trMacroBase, "iif", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.setMacroBase(msg[2], msg[3]); });
+		});
+		this.addCommand(\trMacroDepth, "iiif", { arg msg;
+			var tr; tr = this.track(msg[1]);
+			if(tr.notNil, { tr.setMacroDepth(msg[2], msg[3], msg[4]); });
+		});
+		this.addCommand(\trModTrig, "iii", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.modTrig(msg[2], msg[3]); });
+		});
+		// Transport.
+		this.addCommand(\trPlay, "ii", { arg msg;
+			var tr; tr = this.track(msg[1]);
+			if(tr.notNil, {
+				tr.setPlay(msg[2]);
+				if(tr.index == 1, {
+					scriptAddress.sendBundle(0, ["/elasticat/play", tr.playing]);
+				});
+			});
+		});
+		this.addCommand(\trPlayhead, "if", { arg msg;
+			var tr; tr = this.track(msg[1]);
+			if(tr.notNil, {
+				tr.setPlayhead(msg[2]);
+				if(tr.index == 1, {
+					lastPhase = tr.lastPhase;
+					scriptAddress.sendBundle(0, ["/elasticat/reset", tr.lastPhase]);
+				});
+			});
+		});
+		this.addCommand(\trReverse, "ii", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.setReverse(msg[2]); });
+		});
+		this.addCommand(\trSetReverse, "ii", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.setReverse(msg[2]); });
+		});
+		this.addCommand(\trLoopStart, "if", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.setLoopStart(msg[2]); });
+		});
+		this.addCommand(\trLoopEnd, "if", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.setLoopEnd(msg[2]); });
+		});
+		this.addCommand(\trLoopRegionPlayhead, "ifff", { arg msg;
+			var tr; tr = this.track(msg[1]);
+			if(tr.notNil, {
+				tr.setLoopRegionPlayhead(msg[2], msg[3], msg[4]);
+				if(tr.index == 1, {
+					lastPhase = tr.lastPhase;
+					scriptAddress.sendBundle(0, ["/elasticat/reset", tr.lastPhase]);
+				});
+			});
+		});
+		this.addCommand(\trSampleSteps, "if", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.setSampleSteps(msg[2]); });
+		});
+		this.addCommand(\trSetSampleSteps, "if", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.setSampleSteps(msg[2]); });
+		});
+		this.addCommand(\trLoopBeats, "if", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.setSampleSteps(msg[2] * 4); });
+		});
+		this.addCommand(\trSourceBpm, "if", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.setSourceBpm(msg[2]); });
+		});
+		// chop steps -> beats (/4), the one unit conversion the script relies on.
+		this.addCommand(\trChopSteps, "if", { arg msg;
+			var tr; tr = this.track(msg[1]);
+			if(tr.notNil, { tr.set(\chopBeats, msg[2].max(0.03125) / 4); });
+		});
+		// Sample pool binding (the pool itself is shared and global).
+		this.addCommand(\trSampleSlot, "ii", { arg msg; this.setTrackSampleSlot(msg[1], msg[2]); });
+		this.addCommand(\trSetSampleSlot, "ii", { arg msg; this.setTrackSampleSlot(msg[1], msg[2]); });
+		this.addCommand(\trLoadPoolSlot, "iis", { arg msg; this.loadPoolSlot(msg[2], msg[3]); });
+		// Notes.
+		this.addCommand(\trNoteOn, "if", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.noteOn(msg[2]); });
+		});
+		this.addCommand(\trNoteOff, "i", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.noteOff; });
+		});
+		this.addCommand(\trRetrigNote, "if", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.retrigNote(msg[2]); });
+		});
+		// Slice voices. \trSliceTrigger is the contract name; \trTriggerSlice
+		// is what the script's mechanical tr-name derivation produces from its
+		// "triggerSlice" spec entry -- both land on the same method.
+		this.addCommand(\trSliceTrigger, "iiffiifff", { arg msg;
+			this.trackTriggerSlice(msg);
+		});
+		this.addCommand(\trTriggerSlice, "iiffiifff", { arg msg;
+			this.trackTriggerSlice(msg);
+		});
+		this.addCommand(\trReleaseSlice, "ii", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.releaseSlice(msg[2]); });
+		});
+		this.addCommand(\trReleaseAllSlices, "i", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.releaseAllSlices; });
+		});
+		// Generic warp-param escape hatch (live set only, same as before).
+		this.addCommand(\trModeParam, "isf", { arg msg;
+			var tr; tr = this.track(msg[1]);
+			if(tr.notNil, { tr.setReader(msg[2].asSymbol, msg[3]); });
+		});
+		// Engine-wide slice/loop settings the script still addresses per track.
+		// They apply globally; accepting the index keeps the script's uniform
+		// tr_call path working instead of forcing a special case up there.
+		this.addCommand(\trSliceAttack, "if", { arg msg; sliceAttack = msg[2].clip(0.0001, 0.2); });
+		this.addCommand(\trSliceRelease, "if", { arg msg; sliceRelease = msg[2].clip(0.0001, 0.5); });
+		this.addCommand(\trSetSliceMono, "ii", { arg msg; sliceMono = msg[2].asInteger.clip(0, 1); });
+		this.addCommand(\trSetSliceSyncToClock, "ii", { arg msg; sliceSyncToClock = msg[2].asInteger.clip(0, 1); });
+		this.addCommand(\trSetSliceRate, "if", { arg msg; sliceRate = msg[2].clip(0.03125, 16); });
+		this.addCommand(\trXfade, "if", { arg msg; loopXfade = msg[2].clip(0, 0.25); });
+
+		// --- Genuinely global commands --------------------------------------
+		this.addCommand(\activeTrackCount, "i", { arg msg; this.setActiveTrackCount(msg[1]); });
+		// Which track's mod / filter-env stream the script receives.
+		this.addCommand(\uiTrack, "i", { arg msg; uiTrack = msg[1].asInteger.clip(1, 8); });
+		this.addCommand(\maxSliceVoices, "i", { arg msg;
+			maxSliceVoices = msg[1].asInteger.clip(1, 64);
+		});
+
+		// Sample pool (shared by every track).
 		this.addCommand(\loadSample, "s", { arg msg; this.loadSample(msg[1]); });
 		this.addCommand(\loadPoolSlot, "is", { arg msg; this.loadPoolSlot(msg[1], msg[2]); });
 		this.addCommand(\clearPoolSlot, "i", { arg msg; this.clearPoolSlot(msg[1]); });
-		this.addCommand(\setSampleSlot, "i", { arg msg; this.setSampleSlot(msg[1]); });
-		this.addCommand(\sampleSlot, "i", { arg msg; this.setSampleSlot(msg[1]); });
-		this.addCommand(\previewSlot, "iffff", { arg msg; this.previewSlot(msg[1], msg[2], msg[3], msg[4], msg[5]); });
-		this.addCommand(\play, "i", { arg msg; this.play(msg[1]); });
-		this.addCommand(\pause, "", { this.play(0); });
+		this.addCommand(\previewSlot, "iffff", { arg msg;
+			this.previewSlot(msg[1], msg[2], msg[3], msg[4], msg[5]);
+		});
+
+		// Whole-engine transport.
 		this.addCommand(\stopAndReset, "", { this.stopAndReset; });
 		this.addCommand(\stop, "", { this.stopAndReset; });
-		this.addCommand(\reset, "", { this.setPlayhead(0); });
-		this.addCommand(\setMode, "i", { arg msg; this.setMode(msg[1]); });
-		this.addCommand(\mode, "i", { arg msg; this.setMode(msg[1]); });
+		this.addCommand(\reset, "", { this.resetAll; });
+		this.addCommand(\syncClock, "ffi", { arg msg; this.syncClock(msg[1], msg[2], msg[3]); });
+		this.addCommand(\targetBpm, "f", { arg msg;
+			targetBpm = msg[1].max(1);
+			this.updateTransport;
+		});
+
+		// Script-side echoes / engine settings.
 		this.addCommand(\setModeProfile, "i", { arg msg;
 			scriptAddress.sendBundle(0, ["/elasticat/profile", msg[1].asInteger]);
 		});
-		this.addCommand(\setModeMacro, "f", { arg msg; modeMacro = msg[1].clip(0, 1); this.setActive(\macro, modeMacro); });
-		this.addCommand(\setModeParam, "sf", { arg msg; this.setActive(msg[1].asSymbol, msg[2]); });
 		this.addCommand(\setModeSwitchFade, "f", { arg msg; modeSwitchFade = msg[1].clip(0.001, 0.25); });
 		this.addCommand(\setModeSwitchQuantization, "i", { arg msg;
 			scriptAddress.sendBundle(0, ["/elasticat/switchQuantization", msg[1].asInteger]);
 		});
-		this.addCommand(\setSampleSteps, "f", { arg msg; this.setSampleSteps(msg[1]); });
-		this.addCommand(\sampleSteps, "f", { arg msg; this.setSampleSteps(msg[1]); });
-		this.addCommand(\setLoopBeats, "f", { arg msg; this.setSampleSteps(msg[1] * 4); });
-		this.addCommand(\loopBeats, "f", { arg msg; this.setSampleSteps(msg[1] * 4); });
 		this.addCommand(\setLoopPreview, "ff", { arg msg;
 			scriptAddress.sendBundle(0, ["/elasticat/loopPreview", msg[1].clip(0, 1), msg[2].clip(0, 1)]);
 		});
 		this.addCommand(\commitLoop, "ff", { arg msg;
 			scriptAddress.sendBundle(0, ["/elasticat/commitLoopPending", msg[1].clip(0, 1), msg[2].clip(0, 1)]);
 		});
-		this.addCommand(\setPitch, "f", { arg msg; pitch = msg[1].clip(-24, 24); this.setActive(\pitch, pitch); });
-		this.addCommand(\pitch, "f", { arg msg; pitch = msg[1].clip(-24, 24); this.setActive(\pitch, pitch); });
-		this.addCommand(\setSpeed, "f", { arg msg; speed = msg[1].clip(0.03125, 8); this.setActive(\speed, speed); });
-		this.addCommand(\setReverse, "i", { arg msg; this.setReverse(msg[1]); });
-		this.addCommand(\setDirection, "f", { arg msg;
-			if(msg[1] < 0, { direction = -1; }, { direction = 1; });
-			this.setActive(\direction, direction);
-		});
-		// Track volume + pan now live at the end of the chain, on the filter
-		// output stage, so they mix the whole (filtered) track rather than each voice.
-		// applyTrack1Amp == setFilter(\amp, amp) while track1Mute is 0 (the
-		// default and the only pre-Phase-1 state); it just keeps a \trMute'd
-		// track 1 muted through amp edits.
-		this.addCommand(\setAmp, "f", { arg msg; amp = msg[1].max(0); this.applyTrack1Amp; });
-		this.addCommand(\amp, "f", { arg msg; amp = msg[1].max(0); this.applyTrack1Amp; });
-		this.addCommand(\setPan, "f", { arg msg; pan = msg[1].clip(-1, 1); this.setFilter(\pan, pan); });
-		this.addCommand(\pan, "f", { arg msg; pan = msg[1].clip(-1, 1); this.setFilter(\pan, pan); });
-		this.addCommand(\syncClock, "ffi", { arg msg; this.syncClock(msg[1], msg[2], msg[3]); });
-		this.addCommand(\setPlayhead, "f", { arg msg; this.setPlayhead(msg[1]); });
-		this.addCommand(\playhead, "f", { arg msg; this.setPlayhead(msg[1]); });
+		this.addCommand(\xfade, "f", { arg msg; loopXfade = msg[1].clip(0, 0.25); });
 		this.addCommand(\requestStatus, "", { this.sendStatus; });
 		this.addCommand(\setDebug, "i", { arg msg; debugLevel = msg[1].asInteger.clip(0, 3); });
-
-		this.addCommand(\sourceBpm, "f", { arg msg; this.setSourceBpm(msg[1]); });
-		this.addCommand(\targetBpm, "f", { arg msg; targetBpm = msg[1].max(1); this.updateTransport; this.setActive(\targetBpm, targetBpm); });
-		this.addCommand(\loopStart, "f", { arg msg; this.setLoopStart(msg[1]); });
-		this.addCommand(\loopEnd, "f", { arg msg; this.setLoopEnd(msg[1]); });
-		this.addCommand(\loopRegionPlayhead, "fff", { arg msg; this.setLoopRegionPlayhead(msg[1], msg[2], msg[3]); });
-		this.addCommand(\xfade, "f", { arg msg; loopXfade = msg[1].clip(0, 0.25); });
-		this.addCommand(\chopSteps, "f", { arg msg; chopBeats = msg[1].max(0.03125) / 4; this.setActive(\chopBeats, chopBeats); });
-		this.addCommand(\chopBeats, "f", { arg msg; chopBeats = msg[1].max(0.03125); this.setActive(\chopBeats, chopBeats); });
-		this.addCommand(\chopLoopMode, "i", { arg msg; chopMode = msg[1].asInteger.clip(0, 2); this.setActive(\chopMode, chopMode); });
-		this.addCommand(\chopAttack, "f", { arg msg; chopAttack = msg[1].max(0.0001); this.setActive(\chopAttack, chopAttack); });
-		this.addCommand(\chopHold, "f", { arg msg; chopHold = msg[1].max(0); this.setActive(\chopHold, chopHold); });
-		this.addCommand(\chopRelease, "f", { arg msg; chopRelease = msg[1].max(0.0001); this.setActive(\chopRelease, chopRelease); });
-		this.addCommand(\grainSize, "f", { arg msg; grainSize = msg[1].clip(0.002, 0.5); this.setActive(\grainSize, grainSize); });
-		this.addCommand(\grainDensity, "f", { arg msg; grainOverlap = msg[1].clip(1, 64); this.setActive(\grainOverlap, grainOverlap); });
-		this.addCommand(\grainJitter, "f", { arg msg; grainJitter = msg[1].clip(0, 0.25); grainSpray = grainJitter; this.setActive(\grainJitter, grainJitter); this.setActive(\grainSpray, grainSpray); });
-		this.addCommand(\wsolaWindow, "f", { arg msg; wsolaWindow = msg[1].clip(0.005, 0.5); this.setActive(\grainSize, wsolaWindow); });
-		this.addCommand(\wsolaSearch, "f", { arg msg; wsolaSearch = msg[1].clip(0, 0.1); this.setActive(\wander, wsolaSearch); });
-		this.addCommand(\pvWindow, "f", { arg msg; pvWindow = msg[1].clip(0.005, 2); this.setActive(\pvWindow, pvWindow); });
-		this.addCommand(\pvDispersion, "f", { arg msg; pvDispersion = msg[1].clip(0, 1); this.setActive(\pvDispersion, pvDispersion); });
-		this.addCommand(\triggerSlice, "iffiifff", { arg msg; this.triggerSlice(msg[1], msg[2], msg[3], msg[4], msg[5], msg[6], msg[7], msg[8]); });
-		this.addCommand(\releaseSlice, "i", { arg msg; this.releaseSlice(msg[1]); });
-		this.addCommand(\releaseAllSlices, "", { this.releaseAllSlices; });
 		this.addCommand(\sliceAttack, "f", { arg msg; sliceAttack = msg[1].clip(0.0001, 0.2); });
 		this.addCommand(\sliceRelease, "f", { arg msg; sliceRelease = msg[1].clip(0.0001, 0.5); });
-		this.addCommand(\setEnvMode, "i", { arg msg; envMode = msg[1].clip(0, 1); this.setActive(\envMode, envMode); });
-		this.addCommand(\envAttack, "f", { arg msg; envAttack = msg[1].max(0); this.setActive(\envAttack, envAttack); });
-		this.addCommand(\envDecay, "f", { arg msg; envDecay = msg[1].max(0); this.setActive(\envDecay, envDecay); });
-		this.addCommand(\envSustain, "f", { arg msg; envSustain = msg[1].clip(0, 1); this.setActive(\envSustain, envSustain); });
-		this.addCommand(\envRelease, "f", { arg msg; envRelease = msg[1].max(0); this.setActive(\envRelease, envRelease); });
-		this.addCommand(\envHold, "f", { arg msg; envHold = msg[1].max(0); this.setActive(\envHold, envHold); });
-		this.addCommand(\setPortamento, "i", { arg msg; portamento = msg[1].clip(0, 1); this.setActive(\portamento, portamento); });
-		// Note-on: retrigger the amp envelope on the active reader. Sets the ADSR
-		// gate window (note length) then bumps the trigger counter.
-		// Task 1 (PRD S8): seconds <= 0 is the "indefinite hold" sentinel -- a
-		// live-held note (grid key held, unknown duration) can send this instead
-		// of a fixed length; the ADSR gate then stays open until an explicit
-		// noteOff arrives (see readerAmpEnv's holdIndefinite branch) instead of
-		// auto-closing after a timed window. Any seconds > 0 (every existing
-		// call site) is untouched: msg[1].max(0.005) is byte-identical to before.
-		this.addCommand(\noteOn, "f", { arg msg;
-			if(msg[1] > 0, {
-				envNoteSeconds = msg[1].max(0.005);
-			}, {
-				envNoteSeconds = -1;  // sentinel consumed by readerAmpEnv's holdIndefinite check
-			});
-			envTrigCount = envTrigCount + 1;
-			if(activeSynth.notNil, {
-				activeSynth.set(\envGateSeconds, envNoteSeconds, \envTrig, envTrigCount);
-			});
-			// The global filter env shares the trigger counter, so it retriggers on
-			// the same note-ons as the amp env (one shared env across slice voices).
-			if(filterSynth.notNil, {
-				filterSynth.set(\envGateSeconds, envNoteSeconds, \envTrig, envTrigCount);
-			});
-			// The mod envelope is a full ADSR now, so it needs the same gate window.
-			if(modSynth.notNil, {
-				modSynth.set(\menvGateSeconds, envNoteSeconds);
-			});
-		});
-		// Note-off (Task 1, PRD S8): closes an indefinitely-held note's ADSR gate
-		// now, so its amp envelope (and the filter envelope, which shares the same
-		// gate) enters its release stage on command instead of on a timer. Bumps a
-		// separate counter (envReleaseTrig) rather than reusing envTrig, so a
-		// noteOff can't be mistaken for a new note-on retrigger. Harmless no-op on
-		// a synth that's already closed/finite -- SetResetFF's reset edge just has
-		// no open gate left to close.
-		this.addCommand(\noteOff, "", {
-			noteOffTrigCount = noteOffTrigCount + 1;
-			if(activeSynth.notNil, {
-				activeSynth.set(\envReleaseTrig, noteOffTrigCount);
-			});
-			if(filterSynth.notNil, {
-				filterSynth.set(\envReleaseTrig, noteOffTrigCount);
-			});
-			if(modSynth.notNil, {
-				modSynth.set(\menvReleaseTrig, noteOffTrigCount);
-			});
-		});
-		// Force a fresh amp/filter re-attack, for auditioning a stopped step
-		// preview (grid loop/pitch-key edits while holding a step). Unlike a
-		// plain noteOn, this ALWAYS re-attacks -- even under portamento, whose
-		// held-gate legato deliberately swallows a note-on on a still-sounding
-		// note (readerAmpEnv's port branch). A preview is monitoring, not
-		// legato, so it must be heard. With portamento off a plain note-on
-		// already re-attacks, so we just do that (no release blip). With
-		// portamento on we mimic a manual re-press: close the gate now, reopen
-		// it one block later via SystemClock.sched -- separated so SetResetFF
-		// sees reset THEN set (same-block would be reset-wins -> stuck closed).
-		this.addCommand(\retrigNote, "f", { arg msg;
-			var seconds = msg[1];
-			var applyNoteOn;
-			applyNoteOn = {
-				if(seconds > 0, { envNoteSeconds = seconds.max(0.005) }, { envNoteSeconds = -1 });
-				envTrigCount = envTrigCount + 1;
-				if(activeSynth.notNil, {
-					activeSynth.set(\envGateSeconds, envNoteSeconds, \envTrig, envTrigCount);
-				});
-				if(filterSynth.notNil, {
-					filterSynth.set(\envGateSeconds, envNoteSeconds, \envTrig, envTrigCount);
-				});
-			};
-			if(portamento > 0, {
-				noteOffTrigCount = noteOffTrigCount + 1;
-				if(activeSynth.notNil, { activeSynth.set(\envReleaseTrig, noteOffTrigCount) });
-				if(filterSynth.notNil, { filterSynth.set(\envReleaseTrig, noteOffTrigCount) });
-				SystemClock.sched(0.008, { applyNoteOn.value; nil });
-			}, {
-				applyNoteOn.value;
-			});
-		});
 		this.addCommand(\setSliceMono, "i", { arg msg; sliceMono = msg[1].asInteger.clip(0, 1); });
 		this.addCommand(\setSliceSyncToClock, "i", { arg msg; sliceSyncToClock = msg[1].asInteger.clip(0, 1); });
 		this.addCommand(\setSliceRate, "f", { arg msg; sliceRate = msg[1].clip(0.03125, 16); });
 
-		// --- Filter -----------------------------------------------------------
-		// Machine is a setting (respawns the filter synth); everything else is a
-		// live/p-lockable set on the running filter synth.
-		this.addCommand(\setFilterMachine, "i", { arg msg; this.setFilterMachine(msg[1]); });
-		this.addCommand(\filterType, "i", { arg msg; filterType = msg[1].asInteger.clip(0, 3); this.setFilter(\filterType, filterType); });
-		this.addCommand(\filterCutoff, "f", { arg msg; filterCutoff = msg[1].clip(20, 20000); this.setFilter(\cutoff, filterCutoff); });
-		this.addCommand(\filterRes, "f", { arg msg; filterRes = msg[1].clip(0, 1); this.setFilter(\res, filterRes); });
-		this.addCommand(\filterDrive, "f", { arg msg; filterDrive = msg[1].clip(0, 1); this.setFilter(\drive, filterDrive); });
-		this.addCommand(\filterMorph, "f", { arg msg; filterMorph = msg[1].clip(0, 1); this.setFilter(\morph, filterMorph); });
-		this.addCommand(\filterBalance, "f", { arg msg; filterBalance = msg[1].clip(-1, 1); this.setFilter(\balance, filterBalance); });
-		this.addCommand(\filterEnvMode, "i", { arg msg; filterEnvMode = msg[1].asInteger.clip(0, 1); this.setFilter(\envMode, filterEnvMode); });
-		this.addCommand(\filterEnvAttack, "f", { arg msg; filterEnvAttack = msg[1].max(0); this.setFilter(\envAttack, filterEnvAttack); });
-		this.addCommand(\filterEnvDecay, "f", { arg msg; filterEnvDecay = msg[1].max(0); this.setFilter(\envDecay, filterEnvDecay); });
-		this.addCommand(\filterEnvSustain, "f", { arg msg; filterEnvSustain = msg[1].clip(0, 1); this.setFilter(\envSustain, filterEnvSustain); });
-		this.addCommand(\filterEnvRelease, "f", { arg msg; filterEnvRelease = msg[1].max(0); this.setFilter(\envRelease, filterEnvRelease); });
-		this.addCommand(\filterEnvHold, "f", { arg msg; filterEnvHold = msg[1].max(0); this.setFilter(\envHold, filterEnvHold); });
-		this.addCommand(\filterEnvDepth, "f", { arg msg; filterEnvDepth = msg[1].clip(-1, 1); this.setFilter(\envDepth, filterEnvDepth); });
-
-		// --- Insert 1 FX --------------------------------------------------------
-		// Machine is a setting (respawns the insert synth); everything else is a
-		// live/p-lockable set on the running insert synth. Mirrors Filter above.
-		this.addCommand(\setInsertMachine, "i", { arg msg; this.setInsertMachine(msg[1]); });
-		this.addCommand(\fxDrive, "f", { arg msg; fxDrive = msg[1].clip(0, 1); this.setInsert(\drive, fxDrive); });
-		this.addCommand(\fxMix, "f", { arg msg; fxMix = msg[1].clip(0, 1); this.setInsert(\mix, fxMix); });
-		this.addCommand(\delayTime, "f", { arg msg; delayBeats = msg[1].clip(0.03125, 8); this.setInsert(\delayBeats, delayBeats); });
-		this.addCommand(\delayFeedback, "f", { arg msg; delayFeedback = msg[1].clip(0, 1); this.setInsert(\delayFeedback, delayFeedback); });
-		this.addCommand(\delayTone, "f", { arg msg; delayTone = msg[1].clip(0, 1); this.setInsert(\delayTone, delayTone); });
-		this.addCommand(\reverbSize, "f", { arg msg; reverbSize = msg[1].clip(0, 1); this.setInsert(\reverbSize, reverbSize); });
-		this.addCommand(\reverbDamp, "f", { arg msg; reverbDamp = msg[1].clip(0, 1); this.setInsert(\reverbDamp, reverbDamp); });
-		this.addCommand(\lofiBits, "f", { arg msg; lofiBits = msg[1].clip(1, 24); this.setInsert(\lofiBits, lofiBits); });
-		this.addCommand(\lofiRate, "f", { arg msg; lofiRate = msg[1].clip(500, 48000); this.setInsert(\lofiRate, lofiRate); });
-
-		// --- Send 1/2 + Master insert FX (PRD SS3/SS8) --------------------------
-		// Machine selects are settings (respawn); tap/level are live/p-lockable
-		// sets on the tap synth; per-slot Drive/Mix/Delay*/Reverb*/Lofi* are
-		// live/p-lockable sets on that slot's running FX synth. Mirrors Insert 1
-		// above, x3 (Send 1, Send 2, Master).
-		this.addCommand(\setSendTap, "i", { arg msg; this.setSendTap(msg[1]); });
-		this.addCommand(\sendLevel1, "f", { arg msg; this.setSendLevel1(msg[1]); });
-		this.addCommand(\sendLevel2, "f", { arg msg; this.setSendLevel2(msg[1]); });
-
+		// Send 1/2 + master insert FX (global; PRD SS3/SS8).
+		this.addCommand(\setSendTap, "i", { arg msg;
+			// Legacy no-track spelling of a now per-track setting: apply to the
+			// UI-selected track so an un-migrated caller still does something
+			// sane rather than silently vanishing.
+			this.uiTrackObj.set(\sendTap, msg[1]);
+		});
 		this.addCommand(\setSend1Machine, "i", { arg msg; this.setSend1Machine(msg[1]); });
 		this.addCommand(\send1FxDrive, "f", { arg msg; sendFxDrive[0] = msg[1].clip(0, 1); this.setSend1(\drive, sendFxDrive[0]); });
 		this.addCommand(\send1FxMix, "f", { arg msg; sendFxMix[0] = msg[1].clip(0, 1); this.setSend1(\mix, sendFxMix[0]); });
@@ -1587,51 +1531,6 @@ Engine_Elasticat : CroneEngine {
 		this.addCommand(\send2LofiBits, "f", { arg msg; sendFxLofiBits[1] = msg[1].clip(1, 24); this.setSend2(\lofiBits, sendFxLofiBits[1]); });
 		this.addCommand(\send2LofiRate, "f", { arg msg; sendFxLofiRate[1] = msg[1].clip(500, 48000); this.setSend2(\lofiRate, sendFxLofiRate[1]); });
 
-		// --- Modulation: 2 LFOs + mod envelope (MOD category) -------------------
-		// Everything is a live set on the one running \elasticatMod synth (no
-		// respawns). Dest/wave/mode are 0-based selector ints; speed arrives as
-		// beats-per-cycle (the script maps its musical-division option); depth is
-		// -1..1; menv attack/decay are seconds (script maps its 0-127 knobs via
-		// the shared env seconds curve). modTrig bumps the retrigger counters:
-		// arg 1 != 0 retrigs both LFOs (their non-FREE modes), arg 2 != 0 retrigs
-		// the mod envelope -- fired from Lua per step where lfo_reset/env_reset
-		// resolve ON.
-		// Dest 0..5 = off/pitch/cutoff/res/amp/pan; 6..9 = macro 1..4 (an LFO or
-		// the mod env can modulate a macro's value).
-		this.addCommand(\lfo1Dest, "i", { arg msg; lfo1Dest = msg[1].asInteger.clip(0, 9); this.setMod(\lfo1Dest, lfo1Dest); });
-		this.addCommand(\lfo1Wave, "i", { arg msg; lfo1Wave = msg[1].asInteger.clip(0, 5); this.setMod(\lfo1Wave, lfo1Wave); });
-		this.addCommand(\lfo1Speed, "f", { arg msg; lfo1Beats = msg[1].clip(0.0625, 128); this.setMod(\lfo1Beats, lfo1Beats); });
-		this.addCommand(\lfo1Depth, "f", { arg msg; lfo1Depth = msg[1].clip(-1, 1); this.setMod(\lfo1Depth, lfo1Depth); });
-		this.addCommand(\lfo1Mode, "i", { arg msg; lfo1Mode = msg[1].asInteger.clip(0, 3); this.setMod(\lfo1Mode, lfo1Mode); });
-		this.addCommand(\lfo2Dest, "i", { arg msg; lfo2Dest = msg[1].asInteger.clip(0, 9); this.setMod(\lfo2Dest, lfo2Dest); });
-		this.addCommand(\lfo2Wave, "i", { arg msg; lfo2Wave = msg[1].asInteger.clip(0, 5); this.setMod(\lfo2Wave, lfo2Wave); });
-		this.addCommand(\lfo2Speed, "f", { arg msg; lfo2Beats = msg[1].clip(0.0625, 128); this.setMod(\lfo2Beats, lfo2Beats); });
-		this.addCommand(\lfo2Depth, "f", { arg msg; lfo2Depth = msg[1].clip(-1, 1); this.setMod(\lfo2Depth, lfo2Depth); });
-		this.addCommand(\lfo2Mode, "i", { arg msg; lfo2Mode = msg[1].asInteger.clip(0, 3); this.setMod(\lfo2Mode, lfo2Mode); });
-		this.addCommand(\menvDest, "i", { arg msg; menvDest = msg[1].asInteger.clip(0, 9); this.setMod(\menvDest, menvDest); });
-		this.addCommand(\menvAttack, "f", { arg msg; menvAttack = msg[1].max(0.0001); this.setMod(\menvAttack, menvAttack); });
-		this.addCommand(\menvDecay, "f", { arg msg; menvDecay = msg[1].max(0.0001); this.setMod(\menvDecay, menvDecay); });
-		this.addCommand(\menvSustain, "f", { arg msg; menvSustain = msg[1].clip(0, 1); this.setMod(\menvSustain, menvSustain); });
-		this.addCommand(\menvRelease, "f", { arg msg; menvRelease = msg[1].max(0.0001); this.setMod(\menvRelease, menvRelease); });
-		this.addCommand(\menvDepth, "f", { arg msg; menvDepth = msg[1].clip(-1, 1); this.setMod(\menvDepth, menvDepth); });
-		// Macros (indexed 1..4) as a mod matrix: base 0..1 (the knob), and a
-		// signed depth per destination (dest 1..5 = pitch/cutoff/res/amp/pan).
-		this.addCommand(\macroBase, "if", { arg msg; var i = msg[1].asInteger.clip(1, 4);
-			macroBase[i - 1] = msg[2].clip(0, 1); this.setMod(("macro" ++ i ++ "Base").asSymbol, macroBase[i - 1]); });
-		this.addCommand(\macroDepth, "iif", { arg msg; this.setMacroDepth(msg[1], msg[2], msg[3]); });
-		this.addCommand(\modTrig, "ii", { arg msg;
-			if(modSynth.notNil, {
-				if(msg[1].asInteger != 0, {
-					lfoTrigCount = lfoTrigCount + 1;
-					modSynth.set(\lfoTrig1, lfoTrigCount, \lfoTrig2, lfoTrigCount);
-				});
-				if(msg[2].asInteger != 0, {
-					menvTrigCount = menvTrigCount + 1;
-					modSynth.set(\menvTrig, menvTrigCount);
-				});
-			});
-		});
-
 		this.addCommand(\setMasterMachine, "i", { arg msg; this.setMasterMachine(msg[1]); });
 		this.addCommand(\masterFxDrive, "f", { arg msg; sendFxDrive[2] = msg[1].clip(0, 1); this.setMasterFx(\drive, sendFxDrive[2]); });
 		this.addCommand(\masterFxMix, "f", { arg msg; sendFxMix[2] = msg[1].clip(0, 1); this.setMasterFx(\mix, sendFxMix[2]); });
@@ -1642,408 +1541,135 @@ Engine_Elasticat : CroneEngine {
 		this.addCommand(\masterReverbDamp, "f", { arg msg; sendFxReverbDamp[2] = msg[1].clip(0, 1); this.setMasterFx(\reverbDamp, sendFxReverbDamp[2]); });
 		this.addCommand(\masterLofiBits, "f", { arg msg; sendFxLofiBits[2] = msg[1].clip(1, 24); this.setMasterFx(\lofiBits, sendFxLofiBits[2]); });
 		this.addCommand(\masterLofiRate, "f", { arg msg; sendFxLofiRate[2] = msg[1].clip(500, 48000); this.setMasterFx(\lofiRate, sendFxLofiRate[2]); });
+	}
 
-		// --- Phase 1 multitrack: tr*-prefixed commands ---------------------------
-		// Every command takes a LEADING 1-based track index. Index 1 routes to
-		// the legacy track-1 path (so \trLoopStart 1 x == \loopStart x,
-		// byte-for-byte); 2-8 route to the per-track methods above. Track-1
-		// branches replicate the matching legacy handler bodies verbatim.
-		this.addCommand(\activeTrackCount, "i", { arg msg; this.setActiveTrackCount(msg[1]); });
-		this.addCommand(\trPlay, "ii", { arg msg; var t; t = msg[1].asInteger;
-			if(t == 1, { this.play(msg[2]); }, { this.setTrackPlay(t, msg[2]); }); });
-		this.addCommand(\trPlayhead, "if", { arg msg; var t; t = msg[1].asInteger;
-			if(t == 1, { this.setPlayhead(msg[2]); }, { this.setTrackPlayhead(t, msg[2]); }); });
-		this.addCommand(\trLoopStart, "if", { arg msg; var t; t = msg[1].asInteger;
-			if(t == 1, { this.setLoopStart(msg[2]); }, { this.setTrackLoopStart(t, msg[2]); }); });
-		this.addCommand(\trLoopEnd, "if", { arg msg; var t; t = msg[1].asInteger;
-			if(t == 1, { this.setLoopEnd(msg[2]); }, { this.setTrackLoopEnd(t, msg[2]); }); });
-		this.addCommand(\trLoopRegionPlayhead, "ifff", { arg msg; var t; t = msg[1].asInteger;
-			if(t == 1, {
-				this.setLoopRegionPlayhead(msg[2], msg[3], msg[4]);
+	// field -> \tr<UpperCamelField>, the contract's mechanical naming rule.
+	trCommandName { arg field;
+		var s;
+		s = field.asString;
+		^("tr" ++ s.copyRange(0, 0).toUpper ++ s.copyToEnd(1)).asSymbol;
+	}
+
+	// The track whose single-track OSC streams (status, mod, filter env, file
+	// page) reach the script. Defaults to 1, so an un-migrated script sees
+	// exactly what it saw before.
+	uiTrackObj { ^this.track(uiTrack) }
+
+	// =======================================================================
+	// Track lifecycle + fan-out
+	// =======================================================================
+	// \activeTrackCount: allocate chains for 1..count, free the rest. The clip
+	// guarantees count >= 1, so track 1's chain is never freed -- it is the
+	// clock reference -- but it goes through the SAME alloc as every other
+	// track. There is no track-1 branch anywhere below.
+	setActiveTrackCount { arg count;
+		activeTrackCount = count.asInteger.clip(1, 8);
+		(1..8).do({ arg t;
+			var tr;
+			tr = this.track(t);
+			if(t <= activeTrackCount, { tr.alloc; }, { tr.free; });
+		});
+	}
+
+	setTrackMachine { arg tr, modeIndex;
+		tr.setMachine(modeIndex);
+		if(tr.index == uiTrack, {
+			modeSwitchCount = modeSwitchCount + 1;
+			scriptAddress.sendBundle(0, [
+				"/elasticat/mode", modeNames.wrapAt(tr.machine), tr.machine, modeSwitchCount
+			]);
+		});
+	}
+
+	setTrackSampleSlot { arg track, slot;
+		var tr;
+		tr = this.track(track);
+		if(tr.isNil, { ^nil });
+		tr.bindSampleSlot(slot);
+		this.reportTrackSlot(tr);
+	}
+
+	reportTrackSlot { arg tr;
+		scriptAddress.sendBundle(0, [
+			"/elasticat/track/slot",
+			tr.index,
+			tr.sampleSlot,
+			tr.loaded,
+			tr.sourceFrames,
+			tr.sourceRate
+		]);
+		// The script's file page still listens on the single-track pool
+		// stream; feed it from whichever track the UI is showing.
+		if(tr.index == uiTrack, {
+			if(tr.sampleSlot < 1, {
+				scriptAddress.sendBundle(0, ["/elasticat/pool/slot/active", 0, 0, 0, ""]);
 			}, {
-				this.setTrackLoopRegionPlayhead(t, msg[2], msg[3], msg[4]);
-			}); });
-		this.addCommand(\trPitch, "if", { arg msg; var t; t = msg[1].asInteger;
-			if(t == 1, {
-				pitch = msg[2].clip(-24, 24); this.setActive(\pitch, pitch);
-			}, {
-				var st; st = this.trackState(t);
-				if(st.notNil, { st[\pitch] = msg[2].clip(-24, 24); this.setTrackReader(t, \pitch, st[\pitch]); });
-			}); });
-		this.addCommand(\trSpeed, "if", { arg msg; var t; t = msg[1].asInteger;
-			if(t == 1, {
-				speed = msg[2].clip(0.03125, 8); this.setActive(\speed, speed);
-			}, {
-				var st; st = this.trackState(t);
-				if(st.notNil, { st[\speed] = msg[2].clip(0.03125, 8); this.setTrackReader(t, \speed, st[\speed]); });
-			}); });
-		this.addCommand(\trReverse, "ii", { arg msg; var t; t = msg[1].asInteger;
-			if(t == 1, {
-				this.setReverse(msg[2]);
-			}, {
-				var st; st = this.trackState(t);
-				if(st.notNil, {
-					st[\direction] = if(msg[2].asInteger == 1, { -1 }, { 1 });
-					this.setTrackReader(t, \direction, st[\direction]);
+				if(tr.loaded == 1, {
+					scriptAddress.sendBundle(0, [
+						"/elasticat/pool/slot/active",
+						tr.sampleSlot, tr.sourceFrames, tr.sourceRate,
+						poolPaths[tr.sampleSlot - 1]
+					]);
+				}, {
+					scriptAddress.sendBundle(0, ["/elasticat/pool/slot/missing", tr.sampleSlot]);
 				});
-			}); });
-		this.addCommand(\trSetMachine, "ii", { arg msg; var t; t = msg[1].asInteger;
-			if(t == 1, { this.setMode(msg[2]); }, { this.setTrackMachine(t, msg[2]); }); });
-		this.addCommand(\trModeMacro, "if", { arg msg; var t; t = msg[1].asInteger;
-			if(t == 1, {
-				modeMacro = msg[2].clip(0, 1); this.setActive(\macro, modeMacro);
-			}, {
-				var st; st = this.trackState(t);
-				if(st.notNil, { st[\macro] = msg[2].clip(0, 1); this.setTrackReader(t, \macro, st[\macro]); });
-			}); });
-		// Generic warp-param set (mirror of \setModeParam). Live-set only for
-		// tracks 2-8, same as track 1: neither survives a machine respawn --
-		// the script re-sends warp params after a machine change today.
-		this.addCommand(\trModeParam, "isf", { arg msg; var t; t = msg[1].asInteger;
-			if(t == 1, {
-				this.setActive(msg[2].asSymbol, msg[3]);
-			}, {
-				this.setTrackReader(t, msg[2].asSymbol, msg[3]);
-			}); });
-		this.addCommand(\trSampleSteps, "if", { arg msg; var t; t = msg[1].asInteger;
-			if(t == 1, { this.setSampleSteps(msg[2]); }, { this.setTrackSampleSteps(t, msg[2]); }); });
-		this.addCommand(\trSourceBpm, "if", { arg msg; var t; t = msg[1].asInteger;
-			if(t == 1, { this.setSourceBpm(msg[2]); }, { this.setTrackSourceBpm(t, msg[2]); }); });
-		this.addCommand(\trSampleSlot, "ii", { arg msg; var t; t = msg[1].asInteger;
-			if(t == 1, { this.setSampleSlot(msg[2]); }, { this.setTrackSampleSlot(t, msg[2]); }); });
-		// The pool is shared, so loading is track-agnostic: this is exactly
-		// \loadPoolSlot with a leading index. Tracks watching the slot are
-		// repointed by installPoolBuffers once the async load lands.
-		this.addCommand(\trLoadPoolSlot, "iis", { arg msg; this.loadPoolSlot(msg[2], msg[3]); });
-		this.addCommand(\trAmp, "if", { arg msg; var t; t = msg[1].asInteger;
-			if(t == 1, {
-				amp = msg[2].max(0); this.applyTrack1Amp;
-			}, {
-				this.setTrackAmp(t, msg[2]);
-			}); });
-		this.addCommand(\trPan, "if", { arg msg; var t; t = msg[1].asInteger;
-			if(t == 1, {
-				pan = msg[2].clip(-1, 1); this.setFilter(\pan, pan);
-			}, {
-				this.setTrackPan(t, msg[2]);
-			}); });
-		this.addCommand(\trMute, "ii", { arg msg; this.setTrackMute(msg[1], msg[2]); });
-		this.addCommand(\trNoteOn, "if", { arg msg; var t; t = msg[1].asInteger;
-			if(t == 1, {
-				// Replicates \noteOn (incl. the shared filter-env retrigger).
-				if(msg[2] > 0, { envNoteSeconds = msg[2].max(0.005); }, { envNoteSeconds = -1; });
-				envTrigCount = envTrigCount + 1;
-				if(activeSynth.notNil, {
-					activeSynth.set(\envGateSeconds, envNoteSeconds, \envTrig, envTrigCount);
-				});
-				if(filterSynth.notNil, {
-					filterSynth.set(\envGateSeconds, envNoteSeconds, \envTrig, envTrigCount);
-				});
-			}, {
-				this.trackNoteOn(t, msg[2]);
-			}); });
-		this.addCommand(\trNoteOff, "i", { arg msg; var t; t = msg[1].asInteger;
-			if(t == 1, {
-				noteOffTrigCount = noteOffTrigCount + 1;
-				if(activeSynth.notNil, { activeSynth.set(\envReleaseTrig, noteOffTrigCount); });
-				if(filterSynth.notNil, { filterSynth.set(\envReleaseTrig, noteOffTrigCount); });
-			}, {
-				this.trackNoteOff(t);
-			}); });
-		// Named warp params, mirroring the legacy handlers (same clipping and
-		// the same \grainSize/\wander aliasing for the wsola knobs).
-		this.addCommand(\trChopBeats, "if", { arg msg; var t, v; t = msg[1].asInteger; v = msg[2].max(0.03125);
-			if(t == 1, { chopBeats = v; this.setActive(\chopBeats, chopBeats); }, { this.setTrackReader(t, \chopBeats, v); }); });
-		// Per-track mirror of the legacy \chopSteps (steps -> beats, /4) so the
-		// Lua warp param's mechanical tr-name resolution lands (Phase 1 seam).
-		this.addCommand(\trChopSteps, "if", { arg msg; var t, v; t = msg[1].asInteger; v = msg[2].max(0.03125) / 4;
-			if(t == 1, { chopBeats = v; this.setActive(\chopBeats, chopBeats); }, { this.setTrackReader(t, \chopBeats, v); }); });
-		this.addCommand(\trChopLoopMode, "ii", { arg msg; var t, v; t = msg[1].asInteger; v = msg[2].asInteger.clip(0, 2);
-			if(t == 1, { chopMode = v; this.setActive(\chopMode, chopMode); }, { this.setTrackReader(t, \chopMode, v); }); });
-		this.addCommand(\trChopAttack, "if", { arg msg; var t, v; t = msg[1].asInteger; v = msg[2].max(0.0001);
-			if(t == 1, { chopAttack = v; this.setActive(\chopAttack, chopAttack); }, { this.setTrackReader(t, \chopAttack, v); }); });
-		this.addCommand(\trChopHold, "if", { arg msg; var t, v; t = msg[1].asInteger; v = msg[2].max(0);
-			if(t == 1, { chopHold = v; this.setActive(\chopHold, chopHold); }, { this.setTrackReader(t, \chopHold, v); }); });
-		this.addCommand(\trChopRelease, "if", { arg msg; var t, v; t = msg[1].asInteger; v = msg[2].max(0.0001);
-			if(t == 1, { chopRelease = v; this.setActive(\chopRelease, chopRelease); }, { this.setTrackReader(t, \chopRelease, v); }); });
-		this.addCommand(\trGrainSize, "if", { arg msg; var t, v; t = msg[1].asInteger; v = msg[2].clip(0.002, 0.5);
-			if(t == 1, { grainSize = v; this.setActive(\grainSize, grainSize); }, { this.setTrackReader(t, \grainSize, v); }); });
-		this.addCommand(\trGrainDensity, "if", { arg msg; var t, v; t = msg[1].asInteger; v = msg[2].clip(1, 64);
-			if(t == 1, { grainOverlap = v; this.setActive(\grainOverlap, grainOverlap); }, { this.setTrackReader(t, \grainOverlap, v); }); });
-		this.addCommand(\trGrainJitter, "if", { arg msg; var t, v; t = msg[1].asInteger; v = msg[2].clip(0, 0.25);
-			if(t == 1, {
-				grainJitter = v; grainSpray = grainJitter;
-				this.setActive(\grainJitter, grainJitter); this.setActive(\grainSpray, grainSpray);
-			}, {
-				this.setTrackReader(t, \grainJitter, v); this.setTrackReader(t, \grainSpray, v);
-			}); });
-		this.addCommand(\trWsolaWindow, "if", { arg msg; var t, v; t = msg[1].asInteger; v = msg[2].clip(0.005, 0.5);
-			if(t == 1, { wsolaWindow = v; this.setActive(\grainSize, wsolaWindow); }, { this.setTrackReader(t, \grainSize, v); }); });
-		this.addCommand(\trWsolaSearch, "if", { arg msg; var t, v; t = msg[1].asInteger; v = msg[2].clip(0, 0.1);
-			if(t == 1, { wsolaSearch = v; this.setActive(\wander, wsolaSearch); }, { this.setTrackReader(t, \wander, v); }); });
-		this.addCommand(\trPvWindow, "if", { arg msg; var t, v; t = msg[1].asInteger; v = msg[2].clip(0.005, 2);
-			if(t == 1, { pvWindow = v; this.setActive(\pvWindow, pvWindow); }, { this.setTrackReader(t, \pvWindow, v); }); });
-		this.addCommand(\trPvDispersion, "if", { arg msg; var t, v; t = msg[1].asInteger; v = msg[2].clip(0, 1);
-			if(t == 1, { pvDispersion = v; this.setActive(\pvDispersion, pvDispersion); }, { this.setTrackReader(t, \pvDispersion, v); }); });
-	}
-
-	spawnMode { arg modeIndex, startAmp;
-		var synth;
-		if(transportSynth.notNil, {
-			synth = Synth.after(transportSynth, modeSynthNames.wrapAt(modeIndex.asInteger), this.commonArgs(startAmp));
-		}, {
-			synth = Synth.tail(sourceGroup, modeSynthNames.wrapAt(modeIndex.asInteger), this.commonArgs(startAmp));
-		});
-		^synth;
-	}
-
-	commonArgs { arg startAmp;
-		^[
-			\out, fxBus.index,
-			\phaseBus, phaseBus.index,
-			\bufL, bufL.bufnum,
-			\bufR, bufR.bufnum,
-			\modeAmp, startAmp,
-			\fadeTime, modeSwitchFade,
-			\playing, playing,
-			\resetTrig, resetCount,
-			\resetPos, lastPhase,
-			\amp, amp,
-			\pan, pan,
-			\pitch, pitch,
-			\speed, speed,
-			\direction, direction,
-			\targetBpm, targetBpm,
-			\derivedSourceBpm, derivedSourceBpm,
-			\loopBeats, this.activeLoopBeats,
-			\startPoint, loopStart,
-			\endPoint, loopEnd,
-			\macro, modeMacro,
-			\envMode, envMode,
-			\envAttack, envAttack,
-			\envDecay, envDecay,
-			\envSustain, envSustain,
-			\envRelease, envRelease,
-			\envHold, envHold,
-			\envTrig, envTrigCount,
-			\envGateSeconds, envNoteSeconds,
-			\envReleaseTrig, noteOffTrigCount,  // Task 1 (PRD S8): engine noteOff
-			\portamento, portamento,
-			\pitchModBus, modBusPitch.index
-		];
-	}
-
-	setActive { arg key, value;
-		if(activeSynth.notNil, {
-			activeSynth.set(key, value);
+			});
 		});
 	}
 
-	setFilter { arg key, value;
-		if(filterSynth.notNil, {
-			filterSynth.set(key, value);
+	// A track whose modulation has just been switched off stops running a mod
+	// synth, so its 15Hz /elasticat/mod stream stops too. Send one final all-
+	// zero frame so the UI's live "actual value" bars fall back to the base
+	// value instead of freezing on the last modulated one.
+	reportIdleMod { arg tr;
+		if(tr.index == uiTrack, {
+			scriptAddress.sendBundle(0, ["/elasticat/mod", 0, 0, 0, 0, 0, tr.index]);
 		});
 	}
 
-	setMod { arg key, value;
-		if(modSynth.notNil, {
-			modSynth.set(key, value);
+	trackTriggerSlice { arg msg;
+		var tr;
+		tr = this.track(msg[1]);
+		if(tr.isNil, { ^nil });
+		tr.triggerSlice(msg[2], msg[3], msg[4], msg[5], msg[6], msg[7], msg[8], msg[9]);
+	}
+
+	// =======================================================================
+	// Global slice voice cap
+	// =======================================================================
+	// Voices live in their own track's sourceGroup; this list is the only
+	// engine-wide bookkeeping -- oldest first, across ALL tracks. 8 tracks x 8
+	// voices would cliff the CPU, so hitting the cap steals the oldest voice.
+	// The per-track limit (the 32-slot map + slice mono) is untouched.
+	registerSliceVoice { arg tr, slot, synth;
+		var oldest;
+		while({ sliceVoiceOrder.size >= maxSliceVoices }, {
+			oldest = sliceVoiceOrder[0];
+			sliceVoiceOrder = sliceVoiceOrder.drop(1);
+			oldest[\track].stealSlice(oldest[\slot], oldest[\synth]);
 		});
+		sliceVoiceOrder = sliceVoiceOrder.add((track: tr, slot: slot, synth: synth));
 	}
 
-	modSynthArgs {
-		^[
-			\pitchOut, modBusPitch.index,
-			\cutoffOut, modBusCutoff.index,
-			\resOut, modBusRes.index,
-			\ampOut, modBusAmp.index,
-			\panOut, modBusPan.index,
-			\targetBpm, targetBpm,
-			\lfo1Dest, lfo1Dest,
-			\lfo1Wave, lfo1Wave,
-			\lfo1Beats, lfo1Beats,
-			\lfo1Depth, lfo1Depth,
-			\lfo1Mode, lfo1Mode,
-			\lfoTrig1, lfoTrigCount,
-			\lfo2Dest, lfo2Dest,
-			\lfo2Wave, lfo2Wave,
-			\lfo2Beats, lfo2Beats,
-			\lfo2Depth, lfo2Depth,
-			\lfo2Mode, lfo2Mode,
-			\lfoTrig2, lfoTrigCount,
-			\menvDest, menvDest,
-			\menvAttack, menvAttack,
-			\menvDecay, menvDecay,
-			\menvSustain, menvSustain,
-			\menvRelease, menvRelease,
-			\menvDepth, menvDepth,
-			\menvTrig, menvTrigCount
-		] ++ this.macroSynthArgs;
+	forgetSliceVoice { arg synth;
+		if(synth.isNil, { ^nil });
+		sliceVoiceOrder = sliceVoiceOrder.reject({ arg e; e[\synth] === synth });
 	}
 
-	// Flatten the 4 macros' base + 5-slot matrix into synth arg pairs
-	// (macro{k}Base, macro{k}PitchDepth, ...CutoffDepth, ...ResDepth,
-	// ...AmpDepth, ...PanDepth). Destination order matches macroMatrix indices.
-	macroSynthArgs {
-		var names = ["Pitch", "Cutoff", "Res", "Amp", "Pan"];
-		var out = [];
-		4.do { arg k;
-			out = out ++ [("macro" ++ (k + 1) ++ "Base").asSymbol, macroBase[k]];
-			5.do { arg d;
-				out = out ++ [("macro" ++ (k + 1) ++ names[d] ++ "Depth").asSymbol, macroMatrix[k][d]];
-			};
-		};
-		^out;
+	forgetSliceVoicesOf { arg tr;
+		if(sliceVoiceOrder.isNil, { ^nil });
+		sliceVoiceOrder = sliceVoiceOrder.reject({ arg e; e[\track] === tr });
 	}
 
-	// Set one cell of a macro's matrix live: macro 1..4, dest 1..5 (pitch/
-	// cutoff/res/amp/pan), signed depth. Kept as one indexed command.
-	setMacroDepth { arg macroIdx, destIdx, value;
-		var k = macroIdx.asInteger.clip(1, 4) - 1;
-		var d = destIdx.asInteger.clip(1, 5) - 1;
-		var names = ["Pitch", "Cutoff", "Res", "Amp", "Pan"];
-		macroMatrix[k][d] = value.clip(-1, 1);
-		this.setMod(("macro" ++ (k + 1) ++ names[d] ++ "Depth").asSymbol, macroMatrix[k][d]);
+	releaseAllSlices {
+		this.activeTracks.do({ arg tr; tr.releaseAllSlices; });
 	}
 
-	// One mod synth for the track, at the head of sourceGroup so every reader,
-	// slice voice and the downstream filter read this block's fresh bus values.
-	spawnModSynth {
-		if(modSynth.notNil, { modSynth.free; });
-		modSynth = Synth.head(sourceGroup, \elasticatMod, this.modSynthArgs);
-		^modSynth;
-	}
-
-	setInsert { arg key, value;
-		if(insertSynth.notNil, {
-			insertSynth.set(key, value);
-		});
-	}
-
-	filterArgs {
-		^[
-			// Insert 1 sits after the filter now: the filter writes into
-			// insertBus instead of straight to master (see spawnInsert/
-			// fxInsertArgs below, which reads insertBus and writes out_b).
-			\out, insertBus.index,
-			\in, fxBus.index,
-			// Effective amp: 0 while \trMute 1 1 is engaged, else `amp` (the
-			// pre-Phase-1 value) -- keeps a muted track 1 muted across filter
-			// machine respawns.
-			\amp, if(track1Mute == 1, { 0 }, { amp }),
-			\pan, pan,
-			\filterType, filterType,
-			\cutoff, filterCutoff,
-			\res, filterRes,
-			\drive, filterDrive,
-			\morph, filterMorph,
-			\balance, filterBalance,
-			\envMode, filterEnvMode,
-			\envAttack, filterEnvAttack,
-			\envDecay, filterEnvDecay,
-			\envSustain, filterEnvSustain,
-			\envRelease, filterEnvRelease,
-			\envHold, filterEnvHold,
-			\envDepth, filterEnvDepth,
-			\envTrig, envTrigCount,
-			\envGateSeconds, envNoteSeconds,
-			\envReleaseTrig, noteOffTrigCount,  // Task 1 (PRD S8): engine noteOff
-			\cutoffModBus, modBusCutoff.index,
-			\resModBus, modBusRes.index,
-			\ampModBus, modBusAmp.index,
-			\panModBus, modBusPan.index
-		];
-	}
-
-	// Spawn (or respawn) the global filter at the tail of filterGroup, seeded with
-	// current state so a machine change is seamless.
-	spawnFilter {
-		if(filterSynth.notNil, { filterSynth.free; });
-		filterSynth = Synth.tail(filterGroup, filterSynthNames.wrapAt(filterMachine.asInteger), this.filterArgs);
-		^filterSynth;
-	}
-
-	setFilterMachine { arg idx;
-		filterMachine = idx.asInteger.clip(0, filterSynthNames.size - 1);
-		this.spawnFilter;
-	}
-
-	fxInsertArgs {
-		^[
-			// Insert 1 now writes into masterBus, not straight to context.out_b --
-			// masterGroup's master insert synth (spawnMasterFx below) is the only
-			// thing writing context.out_b for this track (PRD SS3/SS8: Send 1/2 +
-			// Master bus + master insert land after Insert 1, before the chain's
-			// only stereo output path).
-			\out, masterBus.index,
-			\in, insertBus.index,
-			\mix, fxMix,
-			\drive, fxDrive,
-			\delayBeats, delayBeats,
-			\delayFeedback, delayFeedback,
-			\delayTone, delayTone,
-			\reverbSize, reverbSize,
-			\reverbDamp, reverbDamp,
-			\lofiBits, lofiBits,
-			\lofiRate, lofiRate,
-			\targetBpm, targetBpm
-		];
-	}
-
-	// Spawn (or respawn) Insert 1 at the tail of insertGroup, seeded with current
-	// state so a machine change is seamless. Mirrors spawnFilter.
-	spawnInsert {
-		if(insertSynth.notNil, { insertSynth.free; });
-		insertSynth = Synth.tail(insertGroup, fxInsertNames.wrapAt(fxInsertMachine.asInteger), this.fxInsertArgs);
-		^insertSynth;
-	}
-
-	setInsertMachine { arg idx;
-		fxInsertMachine = idx.asInteger.clip(0, fxInsertNames.size - 1);
-		this.spawnInsert;
-	}
-
-	// --- Send 1/2 + Master insert FX (global; PRD SS3/SS8) --------------------
-	sendTapArgs {
-		^[
-			\preIn, insertBus.index,
-			\postIn, masterBus.index,
-			\tap, sendTap,
-			\level1, sendLevel1,
-			\level2, sendLevel2,
-			\sendOut1, sendBus1.index,
-			\sendOut2, sendBus2.index
-		];
-	}
-
-	// Spawn (or respawn) the send tap at the head of sendGroup -- it must run
-	// before send1Synth/send2Synth (below) so they read a current-block send
-	// bus, not stale data from the previous block.
-	spawnSendTap {
-		if(sendTapSynth.notNil, { sendTapSynth.free; });
-		sendTapSynth = Synth.head(sendGroup, \elasticatSendTap, this.sendTapArgs);
-		^sendTapSynth;
-	}
-
-	setSendTap { arg idx;
-		sendTap = idx.asInteger.clip(0, 1);
-		if(sendTapSynth.notNil, { sendTapSynth.set(\tap, sendTap); });
-	}
-
-	setSendLevel1 { arg value;
-		sendLevel1 = value.clip(0, 1);
-		if(sendTapSynth.notNil, { sendTapSynth.set(\level1, sendLevel1); });
-	}
-
-	setSendLevel2 { arg value;
-		sendLevel2 = value.clip(0, 1);
-		if(sendTapSynth.notNil, { sendTapSynth.set(\level2, sendLevel2); });
-	}
-
+	// =======================================================================
+	// Send 1/2 + master insert FX (global; PRD SS3/SS8)
+	// =======================================================================
 	// Shared arg list for any send/master FX slot -- slotIdx indexes the
-	// sendFx* per-slot arrays (0 = Send 1, 1 = Send 2, 2 = Master). Mirrors
-	// fxInsertArgs but reads/writes the given in/out busses instead of the
-	// fixed insertBus -> masterBus path.
+	// sendFx* arrays (0 = Send 1, 1 = Send 2, 2 = Master).
 	sendFxArgs { arg slotIdx, inBusIndex, outBusIndex;
 		^[
 			\out, outBusIndex,
@@ -2061,11 +1687,10 @@ Engine_Elasticat : CroneEngine {
 		];
 	}
 
-	// Send 1: reads sendBus1, writes into masterBus (adds to Insert 1's
-	// already-written output; see sendGroup/masterGroup ordering above).
 	spawnSend1 {
 		if(send1Synth.notNil, { send1Synth.free; });
-		send1Synth = Synth.tail(sendGroup, fxInsertNames.wrapAt(send1Machine.asInteger), this.sendFxArgs(0, sendBus1.index, masterBus.index));
+		send1Synth = Synth.tail(sendGroup, fxInsertNames.wrapAt(send1Machine.asInteger),
+			this.sendFxArgs(0, sendBus1.index, masterBus.index));
 		^send1Synth;
 	}
 
@@ -2078,10 +1703,10 @@ Engine_Elasticat : CroneEngine {
 		if(send1Synth.notNil, { send1Synth.set(key, value); });
 	}
 
-	// Send 2: same shape as Send 1, its own bus.
 	spawnSend2 {
 		if(send2Synth.notNil, { send2Synth.free; });
-		send2Synth = Synth.tail(sendGroup, fxInsertNames.wrapAt(send2Machine.asInteger), this.sendFxArgs(1, sendBus2.index, masterBus.index));
+		send2Synth = Synth.tail(sendGroup, fxInsertNames.wrapAt(send2Machine.asInteger),
+			this.sendFxArgs(1, sendBus2.index, masterBus.index));
 		^send2Synth;
 	}
 
@@ -2094,12 +1719,13 @@ Engine_Elasticat : CroneEngine {
 		if(send2Synth.notNil, { send2Synth.set(key, value); });
 	}
 
-	// Master insert: reads masterBus (Insert 1 + both send returns, all
-	// written by the time masterGroup runs) and is the only thing writing
-	// context.out_b for this track's chain.
+	// Master insert: reads masterBus (every track's mix + both send returns,
+	// all written by the time masterGroup runs) and is the only thing writing
+	// context.out_b.
 	spawnMasterFx {
 		if(masterSynth.notNil, { masterSynth.free; });
-		masterSynth = Synth.tail(masterGroup, fxInsertNames.wrapAt(masterFxMachine.asInteger), this.sendFxArgs(2, masterBus.index, context.out_b.index));
+		masterSynth = Synth.tail(masterGroup, fxInsertNames.wrapAt(masterFxMachine.asInteger),
+			this.sendFxArgs(2, masterBus.index, context.out_b.index));
 		^masterSynth;
 	}
 
@@ -2112,788 +1738,49 @@ Engine_Elasticat : CroneEngine {
 		if(masterSynth.notNil, { masterSynth.set(key, value); });
 	}
 
-	// --- Phase 1 multitrack (tracks 2-8; PHASE1_CONTRACT.md) -----------------
-	// Track 1 stays on the legacy instance vars/synths above; every method
-	// here operates on a track's state Event and (when its chain is
-	// allocated) its transport/reader/mix synths. The tr* commands in
-	// installCommands dispatch on the leading track index: 1 routes to the
-	// legacy track-1 path, 2-8 route here. Deliberately boring, obvious
-	// mirrors of the single-track methods rather than a clever unification.
-
-	// Lazy per-track state. nil for out-of-range indices (incl. 1: track 1
-	// has no Event -- its state is the legacy instance vars).
-	trackState { arg track;
-		var t;
-		t = track.asInteger;
-		if((t < 2) or: { t > 8 }, { ^nil });
-		if(trackStates[t].isNil, { trackStates[t] = this.trackDefaultState; });
-		^trackStates[t];
-	}
-
-	// Defaults mirror the track-1 instance-var defaults above, field for
-	// field, so a fresh track 2-8 behaves exactly like a fresh track 1.
-	trackDefaultState {
-		^(
-			machine: 0,
-			playing: 0,
-			muted: 0,
-			sampleSlot: 1,
-			loaded: 0,
-			bufL: nil,
-			bufR: nil,
-			sourceFrames: 4,
-			sourceRate: 48000,
-			derivedSourceBpm: 120,
-			sampleSteps: 16,
-			loopStart: 0,
-			loopEnd: 128,
-			pitch: 0,
-			speed: 1,
-			direction: 1,
-			amp: 0.8,
-			pan: 0,
-			macro: 0,
-			envMode: 1,
-			envAttack: 0.0001,
-			envDecay: 0.15,
-			envSustain: 0.8,
-			envRelease: 0.0001,
-			envHold: 1000000,
-			envTrigCount: 0,
-			envNoteSeconds: 0.5,
-			noteOffTrigCount: 0,
-			portamento: 0,
-			resetCount: 0,
-			lastPhase: 0,
-			group: nil,
-			phaseBus: nil,
-			mixBus: nil,
-			transportSynth: nil,
-			activeSynth: nil,
-			mixSynth: nil
-		);
-	}
-
-	// Per-track activeLoopBeats (same formula as the track-1 method).
-	trackLoopBeats { arg st;
-		var region;
-		region = ((st[\loopEnd] - st[\loopStart]).max(0.01) / 128).clip(0.0001, 1);
-		^((st[\sampleSteps].max(1) / 4) * region).max(0.03125);
-	}
-
-	// Per-track recalculateNativeTempo.
-	recalcTrackNativeTempo { arg st;
-		var duration;
-		duration = st[\sourceFrames].max(1) / st[\sourceRate].max(1);
-		st[\derivedSourceBpm] = ((st[\sampleSteps].max(1) / 4) * 60 / duration).max(1);
-	}
-
-	// Live set on a track's reader synth (no-op while the chain is inactive).
-	setTrackReader { arg track, key, value;
-		var st;
-		st = this.trackState(track);
-		if(st.notNil and: { st[\activeSynth].notNil }, {
-			st[\activeSynth].set(key, value);
-		});
-	}
-
-	// Mirror of commonArgs, fed from the track's state Event. Readers get the
-	// shared always-zero mod bus as pitchModBus (mod is track-1-only in
-	// Phase 1) and their track index for SendReply routing.
-	commonTrackArgs { arg track, st, startAmp;
-		^[
-			\out, st[\mixBus].index,
-			\phaseBus, st[\phaseBus].index,
-			\bufL, (st[\bufL] ? defaultBufL).bufnum,
-			\bufR, (st[\bufR] ? defaultBufR).bufnum,
-			\modeAmp, startAmp,
-			\fadeTime, modeSwitchFade,
-			\playing, st[\playing],
-			\resetTrig, st[\resetCount],
-			\resetPos, st[\lastPhase],
-			\amp, st[\amp],
-			\pan, st[\pan],
-			\pitch, st[\pitch],
-			\speed, st[\speed],
-			\direction, st[\direction],
-			\targetBpm, targetBpm,
-			\derivedSourceBpm, st[\derivedSourceBpm],
-			\loopBeats, this.trackLoopBeats(st),
-			\startPoint, st[\loopStart],
-			\endPoint, st[\loopEnd],
-			\macro, st[\macro],
-			\envMode, st[\envMode],
-			\envAttack, st[\envAttack],
-			\envDecay, st[\envDecay],
-			\envSustain, st[\envSustain],
-			\envRelease, st[\envRelease],
-			\envHold, st[\envHold],
-			\envTrig, st[\envTrigCount],
-			\envGateSeconds, st[\envNoteSeconds],
-			\envReleaseTrig, st[\noteOffTrigCount],
-			\portamento, st[\portamento],
-			\pitchModBus, trackZeroModBus.index,
-			\trackIndex, track
-		];
-	}
-
-	// Mirror of spawnMode for a track chain: the reader always sits after the
-	// track's own transport synth, inside the track's group.
-	spawnTrackMode { arg track, st, startAmp;
-		^Synth.after(
-			st[\transportSynth],
-			modeSynthNames.wrapAt(st[\machine].asInteger),
-			this.commonTrackArgs(track, st, startAmp)
-		);
-	}
-
-	// Allocate a track's chain: private phase + mix busses, its own group in
-	// tracksGroup, then transport -> reader -> mix in node order. Idempotent.
-	allocateTrackChain { arg track;
-		var st, server;
-		st = this.trackState(track);
-		if(st.isNil or: { st[\group].notNil }, { ^nil });
-		server = context.server;
-		st[\phaseBus] = Bus.audio(server, 1);
-		st[\mixBus] = Bus.audio(server, 2);
-		st[\group] = Group.tail(tracksGroup);
-		st[\transportSynth] = Synth.new(\elasticatTransport, [
-			\out, st[\phaseBus].index,
-			\playing, st[\playing],
-			\targetBpm, targetBpm,
-			\loopBeats, this.trackLoopBeats(st),
-			\correction, correction,
-			\resetTrig, st[\resetCount],
-			\resetPos, st[\lastPhase],
-			\trackIndex, track
-		], st[\group]);
-		st[\activeSynth] = this.spawnTrackMode(track, st, 1);
-		st[\mixSynth] = Synth.tail(st[\group], \elasticatTrackMix, [
-			\out, masterBus.index,
-			\in, st[\mixBus].index,
-			\amp, st[\amp],
-			\pan, st[\pan],
-			\mute, st[\muted],
-			\alive, 1
-		]);
-		// Bind whatever the track's selected pool slot currently holds.
-		this.setTrackSampleSlot(track, st[\sampleSlot]);
-	}
-
-	// Free a track's chain click-free: fade the mix gain (~30 ms Lag on
-	// `alive`), then free the group (transport + reader + mix) and busses.
-	// The state Event survives, so re-raising \activeTrackCount restores the
-	// track exactly as it was.
-	freeTrackChain { arg track;
-		var st, group, phaseBus2, mixBus2, mixSynth2;
-		st = trackStates[track.asInteger];
-		if(st.isNil or: { st[\group].isNil }, { ^nil });
-		group = st[\group];
-		phaseBus2 = st[\phaseBus];
-		mixBus2 = st[\mixBus];
-		mixSynth2 = st[\mixSynth];
-		st[\group] = nil;
-		st[\phaseBus] = nil;
-		st[\mixBus] = nil;
-		st[\transportSynth] = nil;
-		st[\activeSynth] = nil;
-		st[\mixSynth] = nil;
-		if(mixSynth2.notNil, { mixSynth2.set(\alive, 0); });
-		Routine({
-			0.08.wait;  // > the 30 ms alive Lag: silence before the free
-			if(group.notNil, { group.free; });
-			if(phaseBus2.notNil, { phaseBus2.free; });
-			if(mixBus2.notNil, { mixBus2.free; });
-		}).play(SystemClock);
-	}
-
-	// \activeTrackCount: allocate chains for tracks 2..count, free chains
-	// above count. Track 1 always runs; count 1 (the default) allocates
-	// nothing -- zero added cost.
-	setActiveTrackCount { arg count;
-		activeTrackCount = count.asInteger.clip(1, 8);
-		(2..8).do({ arg t;
-			if(t <= activeTrackCount, {
-				this.allocateTrackChain(t);
-			}, {
-				this.freeTrackChain(t);
-			});
-		});
-	}
-
-	setTrackPlay { arg track, state;
-		var st;
-		st = this.trackState(track);
-		if(st.isNil, { ^nil });
-		st[\playing] = state.asInteger.clip(0, 1);
-		if(st[\transportSynth].notNil, { st[\transportSynth].set(\playing, st[\playing]); });
-		if(st[\activeSynth].notNil, { st[\activeSynth].set(\playing, st[\playing]); });
-	}
-
-	setTrackPlayhead { arg track, phase;
-		var st;
-		st = this.trackState(track);
-		if(st.isNil, { ^nil });
-		st[\resetCount] = st[\resetCount] + 1;
-		st[\lastPhase] = phase.wrap(0, 1);
-		if(st[\transportSynth].notNil, {
-			st[\transportSynth].set(\resetPos, st[\lastPhase], \resetTrig, st[\resetCount]);
-		});
-		if(st[\activeSynth].notNil, {
-			st[\activeSynth].set(\resetPos, st[\lastPhase], \resetTrig, st[\resetCount]);
-		});
-	}
-
-	// Push a track's loop region to its transport + reader (shared tail of
-	// the loop-start/end/region setters below).
-	applyTrackLoop { arg st;
-		if(st[\transportSynth].notNil, {
-			st[\transportSynth].set(\loopBeats, this.trackLoopBeats(st));
-		});
-		if(st[\activeSynth].notNil, {
-			st[\activeSynth].set(
-				\loopBeats, this.trackLoopBeats(st),
-				\startPoint, st[\loopStart],
-				\endPoint, st[\loopEnd]
-			);
-		});
-	}
-
-	setTrackLoopStart { arg track, position;
-		var st;
-		st = this.trackState(track);
-		if(st.isNil, { ^nil });
-		st[\loopStart] = position.clip(0, 127.99);
-		if(st[\loopEnd] <= st[\loopStart], {
-			st[\loopEnd] = (st[\loopStart] + 0.01).clip(0.01, 128);
-		});
-		this.applyTrackLoop(st);
-	}
-
-	setTrackLoopEnd { arg track, position;
-		var st;
-		st = this.trackState(track);
-		if(st.isNil, { ^nil });
-		st[\loopEnd] = position.clip(0.01, 128);
-		if(st[\loopEnd] <= st[\loopStart], {
-			st[\loopStart] = (st[\loopEnd] - 0.01).clip(0, 127.99);
-		});
-		this.applyTrackLoop(st);
-	}
-
-	// Mirror of setLoopRegionPlayhead: atomically set region + reset phase.
-	setTrackLoopRegionPlayhead { arg track, startPosition, endPosition, phase;
-		var st;
-		st = this.trackState(track);
-		if(st.isNil, { ^nil });
-		st[\loopStart] = startPosition.clip(0, 127.99);
-		st[\loopEnd] = endPosition.clip(0.01, 128);
-		if(st[\loopEnd] <= st[\loopStart], {
-			st[\loopEnd] = (st[\loopStart] + 0.01).clip(0.01, 128);
-		});
-		st[\resetCount] = st[\resetCount] + 1;
-		st[\lastPhase] = phase.wrap(0, 1);
-		if(st[\transportSynth].notNil, {
-			st[\transportSynth].set(
-				\playing, st[\playing],
-				\targetBpm, targetBpm,
-				\loopBeats, this.trackLoopBeats(st),
-				\correction, correction,
-				\resetPos, st[\lastPhase],
-				\resetTrig, st[\resetCount]
-			);
-		});
-		if(st[\activeSynth].notNil, {
-			st[\activeSynth].set(
-				\playing, st[\playing],
-				\targetBpm, targetBpm,
-				\loopBeats, this.trackLoopBeats(st),
-				\startPoint, st[\loopStart],
-				\endPoint, st[\loopEnd],
-				\resetPos, st[\lastPhase],
-				\resetTrig, st[\resetCount]
-			);
-		});
-	}
-
-	// Mirror of setMode: crossfade-swap the track's reader synth. While the
-	// chain is inactive only the state changes; allocation re-seeds from it.
-	setTrackMachine { arg track, modeIndex;
-		var st, newMode, oldMode, oldSynth, newSynth;
-		st = this.trackState(track);
-		if(st.isNil, { ^nil });
-		newMode = modeIndex.asInteger.clip(0, modeSynthNames.size - 1);
-		oldMode = st[\machine];
-		if((newMode == oldMode) and: { st[\activeSynth].notNil }, { ^nil });
-		st[\machine] = newMode;
-		if(st[\group].isNil, { ^nil });
-		if((oldMode == 0) and: { newMode != 0 }, {
-			this.setTrackPlayhead(track, st[\lastPhase]);
-		});
-		oldSynth = st[\activeSynth];
-		newSynth = this.spawnTrackMode(track, st, 0);
-		st[\activeSynth] = newSynth;
-		newSynth.set(\modeAmp, 1, \fadeTime, modeSwitchFade);
-		if(oldSynth.notNil, {
-			oldSynth.set(\modeAmp, 0, \fadeTime, modeSwitchFade);
-			Routine({
-				modeSwitchFade.wait;
-				oldSynth.free;
-			}).play(SystemClock);
-		});
-	}
-
-	// Mirror of setSampleSlot: point the track's reader at a shared pool
-	// slot's buffers (slot < 1 or an empty slot -> the default silent
-	// buffers). No buffer duplication -- tracks share poolBufL/poolBufR, and
-	// repointing after an async (re)load happens in installPoolBuffers,
-	// downstream of its generation check.
-	setTrackSampleSlot { arg track, slot;
-		var st, idx;
-		st = this.trackState(track);
-		if(st.isNil, { ^nil });
-		slot = slot.asInteger;
-		if(slot < 1, {
-			st[\sampleSlot] = 0;
-			st[\loaded] = 0;
-			st[\bufL] = defaultBufL;
-			st[\bufR] = defaultBufR;
-		}, {
-			slot = slot.clip(1, poolSize);
-			idx = slot - 1;
-			st[\sampleSlot] = slot;
-			if(poolLoaded[idx] != 1, {
-				st[\loaded] = 0;
-				st[\bufL] = defaultBufL;
-				st[\bufR] = defaultBufR;
-			}, {
-				st[\loaded] = 1;
-				st[\bufL] = poolBufL[idx];
-				st[\bufR] = poolBufR[idx];
-				st[\sourceFrames] = poolFrames[idx].max(1);
-				st[\sourceRate] = poolRates[idx].max(1);
-				this.recalcTrackNativeTempo(st);
-			});
-		});
-		if(st[\activeSynth].notNil, {
-			st[\activeSynth].set(
-				\bufL, (st[\bufL] ? defaultBufL).bufnum,
-				\bufR, (st[\bufR] ? defaultBufR).bufnum,
-				\derivedSourceBpm, st[\derivedSourceBpm]
-			);
-		});
-		scriptAddress.sendBundle(0, [
-			"/elasticat/track/slot",
-			track.asInteger,
-			st[\sampleSlot],
-			st[\loaded],
-			st[\sourceFrames],
-			st[\sourceRate]
-		]);
-	}
-
-	setTrackSampleSteps { arg track, steps;
-		var st;
-		st = this.trackState(track);
-		if(st.isNil, { ^nil });
-		st[\sampleSteps] = steps.clip(1, 512);
-		this.recalcTrackNativeTempo(st);
-		if(st[\transportSynth].notNil, {
-			st[\transportSynth].set(\loopBeats, this.trackLoopBeats(st));
-		});
-		if(st[\activeSynth].notNil, {
-			st[\activeSynth].set(
-				\loopBeats, this.trackLoopBeats(st),
-				\derivedSourceBpm, st[\derivedSourceBpm]
-			);
-		});
-	}
-
-	setTrackSourceBpm { arg track, bpm;
-		var st;
-		st = this.trackState(track);
-		if(st.isNil, { ^nil });
-		st[\derivedSourceBpm] = bpm.max(1);
-		this.setTrackReader(track, \derivedSourceBpm, st[\derivedSourceBpm]);
-	}
-
-	// Track volume/pan for tracks 2-8 live on the mix synth (the job track
-	// 1's filter output stage does).
-	setTrackAmp { arg track, value;
-		var st;
-		st = this.trackState(track);
-		if(st.isNil, { ^nil });
-		st[\amp] = value.max(0);
-		if(st[\mixSynth].notNil, { st[\mixSynth].set(\amp, st[\amp]); });
-	}
-
-	setTrackPan { arg track, value;
-		var st;
-		st = this.trackState(track);
-		if(st.isNil, { ^nil });
-		st[\pan] = value.clip(-1, 1);
-		if(st[\mixSynth].notNil, { st[\mixSynth].set(\pan, st[\pan]); });
-	}
-
-	// \trMute: track 1 gates the filter-stage amp (its chain has no mix
-	// synth); tracks 2-8 gate their mix synth. Muted tracks keep advancing.
-	setTrackMute { arg track, state;
-		var st, m;
-		m = state.asInteger.clip(0, 1);
-		if(track.asInteger == 1, {
-			track1Mute = m;
-			this.applyTrack1Amp;
-			^nil;
-		});
-		st = this.trackState(track);
-		if(st.isNil, { ^nil });
-		st[\muted] = m;
-		if(st[\mixSynth].notNil, { st[\mixSynth].set(\mute, m); });
-	}
-
-	// Track 1's effective filter-stage amp: 0 while muted, else the amp the
-	// legacy \amp command maintains. When track1Mute == 0 this is exactly the
-	// old setFilter(\amp, amp).
-	applyTrack1Amp {
-		this.setFilter(\amp, if(track1Mute == 1, { 0 }, { amp }));
-	}
-
-	// Mirror of \noteOn for a track's reader (no filter env for tracks 2-8 in
-	// Phase 1). seconds <= 0 is the same indefinite-hold sentinel.
-	trackNoteOn { arg track, seconds;
-		var st;
-		st = this.trackState(track);
-		if(st.isNil, { ^nil });
-		if(seconds > 0, {
-			st[\envNoteSeconds] = seconds.max(0.005);
-		}, {
-			st[\envNoteSeconds] = -1;
-		});
-		st[\envTrigCount] = st[\envTrigCount] + 1;
-		if(st[\activeSynth].notNil, {
-			st[\activeSynth].set(\envGateSeconds, st[\envNoteSeconds], \envTrig, st[\envTrigCount]);
-		});
-	}
-
-	trackNoteOff { arg track;
-		var st;
-		st = this.trackState(track);
-		if(st.isNil, { ^nil });
-		st[\noteOffTrigCount] = st[\noteOffTrigCount] + 1;
-		if(st[\activeSynth].notNil, {
-			st[\activeSynth].set(\envReleaseTrig, st[\noteOffTrigCount]);
-		});
-	}
-
-	applyGlobals { arg synth;
-		if(synth.notNil, {
-			synth.set(
-				\amp, amp,
-				\pan, pan,
-				\bufL, bufL.bufnum,
-				\bufR, bufR.bufnum,
-				\pitch, pitch,
-				\speed, speed,
-				\direction, direction,
-				\playing, playing,
-				\resetTrig, resetCount,
-				\resetPos, lastPhase,
-				\targetBpm, targetBpm,
-				\derivedSourceBpm, derivedSourceBpm,
-				\loopBeats, this.activeLoopBeats,
-				\startPoint, loopStart,
-				\endPoint, loopEnd,
-				\macro, modeMacro,
-				\fadeTime, modeSwitchFade
-			);
-		});
-	}
-
-	play { arg state;
-		playing = state.asInteger.clip(0, 1);
-		if(playing == 0, { this.releaseAllSlices; });
-		this.updateTransport;
-		this.setActive(\playing, playing);
-		scriptAddress.sendBundle(0, ["/elasticat/play", playing]);
-	}
-
-	stopAndReset {
-		this.play(0);
-		this.releaseAllSlices;
-		this.setPlayhead(0);
-	}
-
-	setReverse { arg value;
-		if(value.asInteger == 1, {
-			direction = -1;
-		}, {
-			direction = 1;
-		});
-		this.setActive(\direction, direction);
-	}
-
-	triggerSlice { arg sliceIndex, startPoint, endPoint, playMode, reverse, velocity, lengthSeconds, notePitch;
-		var idx, startPos, endPos, mode, rev, pitchValue, pitchRatio, duration, sliceRatio, synth;
-		idx = sliceIndex.asInteger.clip(1, 32);
-		startPos = startPoint.asFloat.clip(0, 127.99);
-		endPos = endPoint.asFloat.clip(0.01, 128);
-		if(endPos <= startPos, { endPos = (startPos + 0.01).clip(0.01, 128); });
-		mode = playMode.asInteger.clip(0, 3);
-		rev = reverse.asInteger.clip(0, 1);
-		pitchValue = notePitch.asFloat.clip(-48, 48);
-		pitchRatio = pitchValue.midiratio.max(0.001);
-		duration = lengthSeconds.asFloat;
-
-		if(duration <= 0, {
-			if(mode >= 2, {
-				duration = 60;
-			}, {
-				sliceRatio = ((endPos - startPos).abs / 128).max(0.0001);
-				duration = ((sourceFrames.max(1) * sliceRatio) / sourceRate.max(1)) / pitchRatio;
-			});
-		});
-		duration = duration.clip(0.005, 60);
-
-		if(sliceMono == 1, { this.releaseAllSlices; });
-		if(activeSliceSynths.notNil and: { activeSliceSynths[idx - 1].notNil }, {
-			activeSliceSynths[idx - 1].set(\gate, 0);
-		});
-
-		synth = Synth.tail(sourceGroup, \elasticatSliceVoice, [
-			\out, fxBus.index,
-			\bufL, bufL.bufnum,
-			\bufR, bufR.bufnum,
-			\startPoint, startPos,
-			\endPoint, endPos,
-			\playMode, mode,
-			\reverse, rev,
-			\amp, amp,
-			\pan, pan,
-			\pitch, pitchValue,
-			\velocity, velocity.asFloat.clip(0, 1),
-			\sliceAttack, sliceAttack,
-			\sliceRelease, sliceRelease,
-			\envMode, envMode,
-			\envAttack, envAttack,
-			\envDecay, envDecay,
-			\envSustain, envSustain,
-			\envRelease, envRelease,
-			\envHold, envHold,
-			\lengthSeconds, duration,
-			\syncToClock, sliceSyncToClock,
-			\sliceRate, sliceRate,
-			\warpMode, activeMode,
-			\targetBpm, targetBpm,
-			\macro, modeMacro,
-			\grainSize, grainSize,
-			\grainOverlap, grainOverlap,
-			\grainJitter, grainJitter + grainSpray,
-			\wsolaWindow, wsolaWindow,
-			\wsolaSearch, wsolaSearch,
-			\pvWindow, pvWindow,
-			\pvDispersion, pvDispersion,
-			\pitchModBus, modBusPitch.index,
-			\gate, 1
-		]);
-		if(activeSliceSynths.notNil, { activeSliceSynths[idx - 1] = synth; });
-		Routine({
-			duration.wait;
-			if(synth.notNil, { synth.set(\gate, 0); });
-			if(activeSliceSynths.notNil and: { activeSliceSynths[idx - 1] == synth }, {
-				activeSliceSynths[idx - 1] = nil;
-			});
-		}).play(SystemClock);
-	}
-
-	releaseSlice { arg sliceIndex;
-		var idx;
-		idx = sliceIndex.asInteger.clip(1, 32);
-		if(activeSliceSynths.notNil and: { activeSliceSynths[idx - 1].notNil }, {
-			activeSliceSynths[idx - 1].set(\gate, 0);
-			activeSliceSynths[idx - 1] = nil;
-		});
-	}
-
-	releaseAllSlices {
-		if(activeSliceSynths.notNil, {
-			activeSliceSynths.do({ arg synth, i;
-				if(synth.notNil, {
-					synth.set(\gate, 0);
-					activeSliceSynths[i] = nil;
-				});
-			});
-		});
-	}
-
-	activeLoopBeats {
-		var region;
-		region = ((loopEnd - loopStart).max(0.01) / 128).clip(0.0001, 1);
-		^((sampleSteps.max(1) / 4) * region).max(0.03125);
-	}
-
-	setSampleSteps { arg steps;
-		sampleSteps = steps.clip(1, 512);
-		this.recalculateNativeTempo;
-		this.updateTransport;
-		this.setActive(\loopBeats, this.activeLoopBeats);
-	}
-
-	setSourceBpm { arg bpm;
-		sourceBpm = bpm.max(1);
-		derivedSourceBpm = sourceBpm;
-		this.setActive(\derivedSourceBpm, derivedSourceBpm);
-	}
-
-	setLoopStart { arg position;
-		loopStart = position.clip(0, 127.99);
-		if(loopEnd <= loopStart, { loopEnd = (loopStart + 0.01).clip(0.01, 128); });
-		this.updateTransport;
-		this.setActive(\loopBeats, this.activeLoopBeats);
-		this.setActive(\startPoint, loopStart);
-		this.setActive(\endPoint, loopEnd);
-	}
-
-	setLoopEnd { arg position;
-		loopEnd = position.clip(0.01, 128);
-		if(loopEnd <= loopStart, { loopStart = (loopEnd - 0.01).clip(0, 127.99); });
-		this.updateTransport;
-		this.setActive(\loopBeats, this.activeLoopBeats);
-		this.setActive(\startPoint, loopStart);
-		this.setActive(\endPoint, loopEnd);
-	}
-
-	setLoopRegionPlayhead { arg startPosition, endPosition, phase;
-		loopStart = startPosition.clip(0, 127.99);
-		loopEnd = endPosition.clip(0.01, 128);
-		if(loopEnd <= loopStart, { loopEnd = (loopStart + 0.01).clip(0.01, 128); });
-		resetCount = resetCount + 1;
-		lastPhase = phase.wrap(0, 1);
-		if(transportSynth.notNil, {
-			transportSynth.set(
-				\playing, playing,
-				\targetBpm, targetBpm,
-				\loopBeats, this.activeLoopBeats,
-				\correction, correction,
-				\resetPos, lastPhase,
-				\resetTrig, resetCount
-			);
-		});
-		if(activeSynth.notNil, {
-			activeSynth.set(
-				\playing, playing,
-				\targetBpm, targetBpm,
-				\loopBeats, this.activeLoopBeats,
-				\startPoint, loopStart,
-				\endPoint, loopEnd,
-				\resetPos, lastPhase,
-				\resetTrig, resetCount
-			);
-		});
-		scriptAddress.sendBundle(0, ["/elasticat/reset", lastPhase]);
-	}
-
+	// =======================================================================
+	// Global transport / clock
+	// =======================================================================
+	// The one choke point every tempo change (direct set, clock sync, reset)
+	// routes through: push tempo + clock correction to every allocated track,
+	// then to the tempo-reading global FX slots.
 	updateTransport {
-		if(transportSynth.notNil, {
-			transportSynth.set(
-				\playing, playing,
-				\targetBpm, targetBpm,
-				\loopBeats, this.activeLoopBeats,
-				\correction, correction
-			);
-		});
-		this.setActive(\playing, playing);
-		this.setActive(\targetBpm, targetBpm);
-		this.setActive(\loopBeats, this.activeLoopBeats);
-		// Delay is the only insert FX that reads tempo, but this is the one
-		// choke point every tempo change (direct set, clock sync, reset) already
-		// routes through, so push it here rather than duplicating at each call site.
-		this.setInsert(\targetBpm, targetBpm);
+		this.activeTracks.do({ arg tr; tr.pushTempo; });
 		this.setSend1(\targetBpm, targetBpm);
 		this.setSend2(\targetBpm, targetBpm);
 		this.setMasterFx(\targetBpm, targetBpm);
-		// LFO rates are musical divisions of targetBpm; this is the same choke
-		// point every tempo change (direct set, clock sync, reset) routes through.
-		this.setMod(\targetBpm, targetBpm);
-		// Phase 1 multitrack: tempo is global (MASTER scope), so push it and
-		// the clock-sync correction to every active track chain here -- the
-		// same choke point track 1 uses. Per-track loopBeats/playing ride
-		// along so the transports stay coherent after a tempo change.
-		(2..8).do({ arg t;
-			var st;
-			st = trackStates[t];
-			if(st.notNil and: { st[\group].notNil }, {
-				if(st[\transportSynth].notNil, {
-					st[\transportSynth].set(
-						\playing, st[\playing],
-						\targetBpm, targetBpm,
-						\loopBeats, this.trackLoopBeats(st),
-						\correction, correction
-					);
-				});
-				if(st[\activeSynth].notNil, {
-					st[\activeSynth].set(
-						\targetBpm, targetBpm,
-						\loopBeats, this.trackLoopBeats(st)
-					);
-				});
-			});
-		});
 	}
 
-	setPlayhead { arg phase;
-		resetCount = resetCount + 1;
-		lastPhase = phase.wrap(0, 1);
-		if(transportSynth.notNil, {
-			transportSynth.set(\resetPos, lastPhase, \resetTrig, resetCount);
-		});
-		this.setActive(\resetPos, lastPhase);
-		this.setActive(\resetTrig, resetCount);
-		scriptAddress.sendBundle(0, ["/elasticat/reset", lastPhase]);
+	stopAndReset {
+		this.activeTracks.do({ arg tr; tr.setPlay(0); });
+		this.updateTransport;
+		this.resetAll;
+		scriptAddress.sendBundle(0, ["/elasticat/play", 0]);
 	}
 
-	setMode { arg modeIndex;
-		var newMode, oldMode, oldSynth, newSynth;
-		newMode = modeIndex.asInteger.clip(0, modeSynthNames.size - 1);
-		if(newMode == activeMode and: { activeSynth.notNil }, {
-			^nil;
-		});
-
-		oldMode = activeMode;
-		oldSynth = activeSynth;
-		if(oldMode == 0 and: { newMode != 0 }, {
-			this.setPlayhead(lastPhase);
-		});
-		activeMode = newMode;
-		newSynth = this.spawnMode(activeMode, 0);
-		this.applyGlobals(newSynth);
-		activeSynth = newSynth;
-		activeSynth.set(\modeAmp, 1, \fadeTime, modeSwitchFade);
-
-		if(oldSynth.notNil, {
-			oldSynth.set(\modeAmp, 0, \fadeTime, modeSwitchFade);
-			Routine({
-				modeSwitchFade.wait;
-				oldSynth.free;
-			}).play(SystemClock);
-		});
-
-		modeSwitchCount = modeSwitchCount + 1;
-		scriptAddress.sendBundle(0, ["/elasticat/mode", modeNames.wrapAt(activeMode), activeMode, modeSwitchCount]);
+	resetAll {
+		this.activeTracks.do({ arg tr; tr.setPlayhead(0); });
+		lastPhase = 0;
+		scriptAddress.sendBundle(0, ["/elasticat/reset", 0]);
 	}
 
+	// Track 1's loop is the clock reference: one loop has to be, and the
+	// transport `correction` derived from it is pushed to EVERY track by
+	// updateTransport. This is an engine-level role, not per-track behavior.
 	syncClock { arg expectedPhase, tempo, sequence;
-		var err, absMs, loopSeconds;
+		var err, absMs, loopSeconds, reference;
 		if(sequence <= lastClockSeq, {
 			staleClockCount = staleClockCount + 1;
 			^nil;
 		});
+		reference = this.track(1);
 		lastClockSeq = sequence;
 		targetBpm = tempo.max(1);
 		lastExpectedPhase = expectedPhase.wrap(0, 1);
 		err = lastExpectedPhase - lastPhase;
 		if(err > 0.5, { err = err - 1; });
 		if(err < -0.5, { err = err + 1; });
-		loopSeconds = this.activeLoopBeats * 60 / targetBpm;
+		loopSeconds = reference.loopBeats * 60 / targetBpm;
 		absMs = err.abs * loopSeconds * 1000;
 		lastPhaseError = err;
 		lastErrorMs = absMs;
@@ -2901,7 +1788,9 @@ Engine_Elasticat : CroneEngine {
 		if(err.abs > hardThreshold, {
 			correction = 0;
 			hardRealignCount = hardRealignCount + 1;
-			this.setPlayhead(lastExpectedPhase);
+			reference.setPlayhead(lastExpectedPhase);
+			lastPhase = reference.lastPhase;
+			scriptAddress.sendBundle(0, ["/elasticat/reset", lastPhase]);
 		}, {
 			if(absMs < 0.5, {
 				correction = 0;
@@ -2911,32 +1800,37 @@ Engine_Elasticat : CroneEngine {
 		});
 
 		this.updateTransport;
-		this.setActive(\targetBpm, targetBpm);
-		this.setActive(\loopBeats, this.activeLoopBeats);
 	}
 
+	// =======================================================================
+	// Shared sample pool
+	// =======================================================================
+	// The slot the single-track file-page stream reports on.
+	activeSampleSlot { ^this.uiTrackObj.sampleSlot }
+
 	loadSample { arg path;
-		this.loadPoolSlot(sampleSlot, path);
+		this.loadPoolSlot(this.activeSampleSlot, path);
 	}
 
 	loadPoolSlot { arg slot, path;
-		var sf, channels, frames, rate, generation, idx;
+		var sf, channels, frames, rate, generation, idx, activeSlot;
 		if(path.isNil, { ^nil; });
 		slot = slot.asInteger.clip(1, poolSize);
 		idx = slot - 1;
 		path = path.asString;
+		activeSlot = this.activeSampleSlot;
 		loadGeneration = loadGeneration + 1;
 		generation = loadGeneration;
 		poolGenerations[idx] = generation;
 		scriptAddress.sendBundle(0, ["/elasticat/pool/load/request", slot, path, generation]);
-		if(slot == sampleSlot, {
+		if(slot == activeSlot, {
 			scriptAddress.sendBundle(0, ["/elasticat/load/request", path, generation]);
 		});
 
 		sf = SoundFile.openRead(path);
 		if(sf.isNil, {
 			scriptAddress.sendBundle(0, ["/elasticat/pool/load/failed", slot, path, generation]);
-			if(slot == sampleSlot, {
+			if(slot == activeSlot, {
 				scriptAddress.sendBundle(0, ["/elasticat/load/failed", path, generation]);
 			});
 			^nil;
@@ -2946,7 +1840,7 @@ Engine_Elasticat : CroneEngine {
 		rate = sf.sampleRate;
 		sf.close;
 		scriptAddress.sendBundle(0, ["/elasticat/pool/load/opened", slot, path, channels, frames, rate, generation]);
-		if(slot == sampleSlot, {
+		if(slot == activeSlot, {
 			scriptAddress.sendBundle(0, ["/elasticat/load/opened", path, channels, frames, rate, generation]);
 		});
 
@@ -2959,12 +1853,12 @@ Engine_Elasticat : CroneEngine {
 				if(newL.numFrames <= 0, {
 					newL.free;
 					scriptAddress.sendBundle(0, ["/elasticat/pool/load/failed", slot, path, generation]);
-					if(slot == sampleSlot, {
+					if(slot == activeSlot, {
 						scriptAddress.sendBundle(0, ["/elasticat/load/failed", path, generation]);
 					});
 				}, {
 					scriptAddress.sendBundle(0, ["/elasticat/pool/load/readDone", slot, 0, newL.numFrames, newL.numChannels, generation]);
-					if(slot == sampleSlot, {
+					if(slot == activeSlot, {
 						scriptAddress.sendBundle(0, ["/elasticat/load/readDone", 0, newL.numFrames, newL.numChannels, generation]);
 					});
 					if(channels > 1, {
@@ -2975,7 +1869,7 @@ Engine_Elasticat : CroneEngine {
 								newR.free;
 							}, {
 								scriptAddress.sendBundle(0, ["/elasticat/pool/load/readDone", slot, 1, newR.numFrames, newR.numChannels, generation]);
-								if(slot == sampleSlot, {
+								if(slot == activeSlot, {
 									scriptAddress.sendBundle(0, ["/elasticat/load/readDone", 1, newR.numFrames, newR.numChannels, generation]);
 								});
 								this.installPoolBuffers(slot, newL, newR, path, frames, rate, generation);
@@ -2990,7 +1884,7 @@ Engine_Elasticat : CroneEngine {
 	}
 
 	installPoolBuffers { arg slot, newL, newR, path, frames, rate, generation;
-		var idx, oldL, oldR;
+		var idx, oldL, oldR, ui;
 		slot = slot.asInteger.clip(1, poolSize);
 		idx = slot - 1;
 		if(generation != poolGenerations[idx], {
@@ -3008,15 +1902,26 @@ Engine_Elasticat : CroneEngine {
 		poolFrames[idx] = frames;
 		poolRates[idx] = rate;
 
-		if(slot == sampleSlot, {
-			this.setSampleSlot(slot);
+		// Repoint EVERY track sitting on this slot at the freshly installed
+		// buffers, BEFORE the old ones are freed below. Downstream of the
+		// generation check, so all tracks obey the same stale-load protection.
+		(1..8).do({ arg t;
+			var tr;
+			tr = tracks[t];
+			if(tr.notNil and: { tr.sampleSlot == slot }, {
+				this.setTrackSampleSlot(t, slot);
+			});
+		});
+
+		ui = this.uiTrackObj;
+		if(slot == ui.sampleSlot, {
 			scriptAddress.sendBundle(0, [
 				"/elasticat/load/installed",
-				bufL.bufnum,
-				bufR.bufnum,
-				bufL.numFrames,
-				bufL.sampleRate,
-				derivedSourceBpm,
+				newL.bufnum,
+				newR.bufnum,
+				newL.numFrames,
+				newL.sampleRate,
+				ui.derivedSourceBpm,
 				generation
 			]);
 		});
@@ -3030,18 +1935,6 @@ Engine_Elasticat : CroneEngine {
 			newL.sampleRate,
 			generation
 		]);
-
-		// Phase 1 multitrack: repoint any track 2-8 currently on this slot at
-		// the freshly installed buffers, BEFORE the old ones are freed below.
-		// This runs downstream of the generation check above, so tracks obey
-		// the same stale-load protection as track 1.
-		(2..8).do({ arg t;
-			var st;
-			st = trackStates[t];
-			if(st.notNil and: { st[\sampleSlot] == slot }, {
-				this.setTrackSampleSlot(t, slot);
-			});
-		});
 
 		if(oldL.notNil, { oldL.free; });
 		if(oldR.notNil and: { oldR != oldL }, { oldR.free; });
@@ -3066,78 +1959,18 @@ Engine_Elasticat : CroneEngine {
 		poolLoaded[idx] = 0;
 		poolFrames[idx] = 4;
 		poolRates[idx] = 48000;
-		// Phase 1 multitrack: any track 2-8 on this slot must let go of the
-		// buffers BEFORE they are freed below (setTrackSampleSlot sees
-		// poolLoaded == 0 and swaps in the default silent buffers).
-		(2..8).do({ arg t;
-			var st;
-			st = trackStates[t];
-			if(st.notNil and: { st[\sampleSlot] == slot }, {
+		// Every track on this slot must let go of the buffers BEFORE they are
+		// freed below (bindSampleSlot sees poolLoaded == 0 and swaps in the
+		// default silent buffers).
+		(1..8).do({ arg t;
+			var tr;
+			tr = tracks[t];
+			if(tr.notNil and: { tr.sampleSlot == slot }, {
 				this.setTrackSampleSlot(t, slot);
 			});
 		});
 		if(oldL.notNil, { oldL.free; });
 		if(oldR.notNil and: { oldR != oldL }, { oldR.free; });
-		// If the active reader was on this slot, repoint it at silence now
-		// (setSampleSlot sees poolLoaded == 0 and swaps in the default buffers).
-		if(slot == sampleSlot, {
-			this.setSampleSlot(slot);
-		});
-	}
-
-	setSampleSlot { arg slot;
-		var idx;
-		slot = slot.asInteger;
-
-		// Slot 0 (Off): a deliberate silence slot -- point the reader at the
-		// default (zeroed) buffers so it outputs silence while the transport
-		// keeps running. Useful for sequencing gaps.
-		if(slot < 1, {
-			sampleSlot = 0;
-			this.releaseAllSlices;
-			loaded = 0;
-			bufL = defaultBufL;
-			bufR = defaultBufR;
-			this.setActive(\bufL, bufL.bufnum);
-			this.setActive(\bufR, bufR.bufnum);
-			scriptAddress.sendBundle(0, ["/elasticat/pool/slot/active", 0, 0, 0, ""]);
-			^nil;
-		});
-
-		slot = slot.clip(1, poolSize);
-		idx = slot - 1;
-		sampleSlot = slot;
-
-		if(poolLoaded[idx] != 1, {
-			// Empty slot -> silence too (was: keep the previous buffer, so the
-			// last-loaded sample kept playing).
-			this.releaseAllSlices;
-			loaded = 0;
-			bufL = defaultBufL;
-			bufR = defaultBufR;
-			this.setActive(\bufL, bufL.bufnum);
-			this.setActive(\bufR, bufR.bufnum);
-			scriptAddress.sendBundle(0, ["/elasticat/pool/slot/missing", sampleSlot]);
-			^nil;
-		});
-
-		this.releaseAllSlices;
-		bufL = poolBufL[idx];
-		bufR = poolBufR[idx];
-		loaded = 1;
-		sourceFrames = poolFrames[idx].max(1);
-		sourceRate = poolRates[idx].max(1);
-		this.recalculateNativeTempo;
-		this.setActive(\bufL, bufL.bufnum);
-		this.setActive(\bufR, bufR.bufnum);
-		this.applyGlobals(activeSynth);
-		scriptAddress.sendBundle(0, [
-			"/elasticat/pool/slot/active",
-			sampleSlot,
-			sourceFrames,
-			sourceRate,
-			poolPaths[idx]
-		]);
 	}
 
 	previewSlot { arg slot, startFrac, endFrac, gain, on;
@@ -3160,27 +1993,19 @@ Engine_Elasticat : CroneEngine {
 		});
 	}
 
-	recalculateNativeTempo {
-		var duration;
-		duration = sourceFrames.max(1) / sourceRate.max(1);
-		derivedSourceBpm = ((sampleSteps.max(1) / 4) * 60 / duration).max(1);
-		sourceBpm = derivedSourceBpm;
-		if(activeSynth.notNil, {
-			activeSynth.set(\derivedSourceBpm, derivedSourceBpm);
-		});
-	}
-
 	sendStatus {
+		var ui;
+		ui = this.uiTrackObj;
 		scriptAddress.sendBundle(0, [
 			"/elasticat/requestedStatus",
-			loaded,
-			playing,
-			modeNames.wrapAt(activeMode),
-			lastPhase,
-			sourceFrames,
-			sourceRate,
+			ui.loaded,
+			ui.playing,
+			modeNames.wrapAt(ui.machine),
+			ui.lastPhase,
+			ui.sourceFrames,
+			ui.sourceRate,
 			targetBpm,
-			derivedSourceBpm,
+			ui.derivedSourceBpm,
 			correction,
 			lastPhaseError,
 			lastErrorMs,
@@ -3199,40 +2024,19 @@ Engine_Elasticat : CroneEngine {
 		if(filterEnvResponder.notNil, { filterEnvResponder.free; });
 		if(transportResponder.notNil, { transportResponder.free; });
 		if(previewSynth.notNil, { previewSynth.free; });
-		if(modSynth.notNil, { modSynth.free; });
-		if(activeSynth.notNil, { activeSynth.free; });
-		if(filterSynth.notNil, { filterSynth.free; });
-		if(insertSynth.notNil, { insertSynth.free; });
-		if(sendTapSynth.notNil, { sendTapSynth.free; });
 		if(send1Synth.notNil, { send1Synth.free; });
 		if(send2Synth.notNil, { send2Synth.free; });
 		if(masterSynth.notNil, { masterSynth.free; });
-		if(transportSynth.notNil, { transportSynth.free; });
-		// Phase 1 multitrack: freeing a track's group frees its transport +
-		// reader + mix synths together.
-		if(trackStates.notNil, {
-			(2..8).do({ arg t;
-				var st;
-				st = trackStates[t];
-				if(st.notNil, {
-					if(st[\group].notNil, { st[\group].free; });
-					if(st[\phaseBus].notNil, { st[\phaseBus].free; });
-					if(st[\mixBus].notNil, { st[\mixBus].free; });
-					st[\group] = nil;
-					st[\phaseBus] = nil;
-					st[\mixBus] = nil;
-					st[\transportSynth] = nil;
-					st[\activeSynth] = nil;
-					st[\mixSynth] = nil;
-				});
+		// One teardown path for all 8 tracks; freeing a track's group frees
+		// every synth in its chain, and freeNow releases all nine of its busses.
+		if(tracks.notNil, {
+			(1..8).do({ arg t;
+				if(tracks[t].notNil, { tracks[t].freeNow; });
 			});
 		});
 		if(tracksGroup.notNil, { tracksGroup.free; });
 		if(masterGroup.notNil, { masterGroup.free; });
 		if(sendGroup.notNil, { sendGroup.free; });
-		if(insertGroup.notNil, { insertGroup.free; });
-		if(filterGroup.notNil, { filterGroup.free; });
-		if(sourceGroup.notNil, { sourceGroup.free; });
 		if(poolBufL.notNil, {
 			poolBufL.do({ arg buffer, i;
 				if(buffer.notNil, { buffer.free; });
@@ -3241,17 +2045,1097 @@ Engine_Elasticat : CroneEngine {
 		});
 		if(defaultBufL.notNil, { defaultBufL.free; });
 		if(defaultBufR.notNil and: { defaultBufR != defaultBufL }, { defaultBufR.free; });
-		if(phaseBus.notNil, { phaseBus.free; });
-		if(fxBus.notNil, { fxBus.free; });
-		if(insertBus.notNil, { insertBus.free; });
 		if(masterBus.notNil, { masterBus.free; });
 		if(sendBus1.notNil, { sendBus1.free; });
 		if(sendBus2.notNil, { sendBus2.free; });
-		if(modBusPitch.notNil, { modBusPitch.free; });
-		if(modBusCutoff.notNil, { modBusCutoff.free; });
-		if(modBusRes.notNil, { modBusRes.free; });
-		if(modBusAmp.notNil, { modBusAmp.free; });
-		if(modBusPan.notNil, { modBusPan.free; });
-		if(trackZeroModBus.notNil, { trackZeroModBus.free; });
+	}
+}
+
+// ============================================================================
+// ElasticatTrack -- one class, one instance per track, no bespoke per-track
+// behavior anywhere (docs/PHASE2_CONTRACT.md).
+//
+// Defined in THIS file on purpose: the norns crone loader only discovers one
+// Engine_* class file, and companion class files have never been verified on
+// the device -- a companion that fails to load takes the whole class library
+// (and therefore the script) down. SuperCollider is happy with several class
+// definitions per file, so this costs nothing.
+//
+// Node graph, identical for all 8 tracks:
+//
+//   group
+//     sourceGroup { mod (kr) -> transport -> reader -> slice voices } -> fxBus
+//     filter     fxBus     -> insertBus   (ALSO the amp/pan/mod output stage)
+//     insert FX  insertBus -> mixBus      (NO synth at all when machine None)
+//     sendTap    insertBus | mixBus       -> sendBus1 / sendBus2 (global)
+//     trackMix   insertBus | mixBus       -> masterBus (mute + teardown fade)
+//
+// Two invariants that are easy to get wrong:
+//   1. amp/pan live on the FILTER synth, never the mix synth -- filterModOut
+//      applies the AMP/PAN mod destinations there, so a track's own LFO can
+//      only reach them at the filter. The mix synth stays at unity; applying
+//      amp in both places would square the gain.
+//   2. Insert machine None spawns NO synth; postInsertBus re-points the send
+//      tap and the mix synth at insertBus instead. Re-point on every change.
+// ============================================================================
+ElasticatTrack {
+	// One spec table drives every plain value setter: field -> which synth arg
+	// it maps to, on which synth, and its range. Adding a per-track parameter
+	// is one row here plus one addCommand line -- never eight copies of
+	// anything. Bespoke methods exist ONLY where the logic is genuinely
+	// non-trivial (machine respawns, mute gating, indexed macros).
+	classvar <setSpec;
+	classvar <macroDestNames;
+
+	var <engine;     // back-reference: server, groups, global busses, defs, tempo
+	var <index;      // 1-based track number; also every SendReply's replyID
+
+	// --- transport / reader state -------------------------------------------
+	var <machine = 0, <playing = 0, <muted = 0;
+	var <sampleSlot = 1, <loaded = 0, <bufL, <bufR;
+	var <sourceFrames = 4, <sourceRate = 48000, <derivedSourceBpm = 120;
+	var <sampleSteps = 16, <loopStart = 0, <loopEnd = 128;
+	var <pitch = 0, <speed = 1, <direction = 1, <amp = 0.8, <pan = 0, <macro = 0;
+	var <envMode = 1, <envAttack = 0.0001, <envDecay = 0.15, <envSustain = 0.8;
+	var <envRelease = 0.0001, <envHold = 1000000;
+	// Crossfade duration used when this track swaps warp machine. Per-track
+	// (the script registers it per track), and state-only: there is no synth
+	// arg to push, spawnMode reads it at swap time.
+	var <modeSwitchFade = 0.05;
+	// Smoothing time for the filter stage (cutoff / res / morph / pan / amp).
+	//
+	// 0.09s is deliberately just OVER the script send interval (1/12 s =
+	// 0.083s). Every one of these params is `queue = true`, so its value
+	// arrives on the 12Hz coalescing queue whether it came from a crossfader
+	// morph or a deliberate encoder turn. With the old 0.01-0.02s lag the
+	// value settled in 10-20ms and then sat still for ~70ms: a STAIRCASE,
+	// which is worse than either a zipper or smooth motion. Smoothing must be
+	// at least the send interval for the motion to be continuous.
+	//
+	// There is no "snappy manual vs smooth morph" trade-off to make here --
+	// both paths are already rate-limited by the same queue, so one value
+	// serves both. \trFilterSlew exists to override it per track if a future
+	// path ever sends faster.
+	var <filterSlew = 0.09;
+	var <envTrigCount = 0, <envNoteSeconds = 0.5, <noteOffTrigCount = 0, <portamento = 0;
+	var <resetCount = 0, <lastPhase = 0;
+
+	// --- warp machine params (seeded on every reader respawn) ---------------
+	var <chopBeats = 0.25, <chopMode = 0;
+	var <chopAttack = 0.002, <chopHold = 0.04, <chopRelease = 0.01;
+	var <grainSize = 0.08, <grainOverlap = 8, <grainJitter = 0;
+	var <wsolaWindow = 0.1, <wsolaSearch = 0.03;
+	var <pvWindow = 0.2, <pvDispersion = 0;
+
+	// --- filter + filter envelope -------------------------------------------
+	var <filterMachine = 0, <filterType = 0, <filterCutoff = 20000;
+	var <filterRes = 0, <filterDrive = 0, <filterMorph = 0, <filterBalance = 0;
+	var <filterEnvMode = 1, <filterEnvAttack = 0.0001, <filterEnvDecay = 0.15;
+	var <filterEnvSustain = 0.8, <filterEnvRelease = 0.0001, <filterEnvHold = 1000000;
+	var <filterEnvDepth = 0;
+
+	// --- insert FX -----------------------------------------------------------
+	var <fxInsertMachine = 0, <fxDrive = 0, <fxMix = 0.5;
+	var <delayBeats = 1, <delayFeedback = 0.3, <delayTone = 1;
+	var <reverbSize = 0.5, <reverbDamp = 0.5, <lofiBits = 24, <lofiRate = 48000;
+
+	// --- send levels into the two GLOBAL send busses ------------------------
+	var <sendTap = 0, <sendLevel1 = 0, <sendLevel2 = 0;
+
+	// --- mod: 2 LFOs + mod env + 4 macros (base + 4x5 depth matrix) ---------
+	var <lfo1Dest = 0, <lfo1Wave = 0, <lfo1Beats = 4, <lfo1Depth = 0, <lfo1Mode = 0;
+	var <lfo2Dest = 0, <lfo2Wave = 0, <lfo2Beats = 4, <lfo2Depth = 0, <lfo2Mode = 0;
+	var <menvDest = 0, <menvAttack = 0.01, <menvDecay = 0.15;
+	var <menvSustain = 0.8, <menvRelease = 0.15, <menvDepth = 0;
+	var <lfoTrigCount = 0, <menvTrigCount = 0;
+	var <macroBase, <macroMatrix;
+	var badIndexedWarned;   // warn-once set for malformed indexed commands
+
+	// --- nodes / busses (nil while the chain is not allocated) --------------
+	var <group, <sourceGroup;
+	var <phaseBus, <fxBus, <insertBus, <mixBus;
+	var <modBusPitch, <modBusCutoff, <modBusRes, <modBusAmp, <modBusPan;
+	var <transportSynth, <modSynth, <activeSynth;
+	var <filterSynth, <insertSynth, <sendTapSynth, <mixSynth;
+	var <sliceVoices;
+
+	*initClass {
+		macroDestNames = [\Pitch, \Cutoff, \Res, \Amp, \Pan];
+		// field -> (arg: synth-arg name(s), synth: which synth, lo:, hi:, int:)
+		// `synth` is resolved by synthFor below. `arg` may be an Array when one
+		// field drives several synth args.
+		setSpec = IdentityDictionary[
+			// reader / voice
+			\pitch        -> (arg: \pitch,        synth: \reader, lo: -24, hi: 24),
+			\speed        -> (arg: \speed,        synth: \reader, lo: 0.03125, hi: 8),
+			\macro        -> (arg: \macro,        synth: \reader, lo: 0, hi: 1),
+			\portamento   -> (arg: \portamento,   synth: \reader, lo: 0, hi: 1, int: true),
+			\envMode      -> (arg: \envMode,      synth: \reader, lo: 0, hi: 1, int: true),
+			\envAttack    -> (arg: \envAttack,    synth: \reader, lo: 0),
+			\envDecay     -> (arg: \envDecay,     synth: \reader, lo: 0),
+			\envSustain   -> (arg: \envSustain,   synth: \reader, lo: 0, hi: 1),
+			\envRelease   -> (arg: \envRelease,   synth: \reader, lo: 0),
+			\envHold      -> (arg: \envHold,      synth: \reader, lo: 0),
+			// State-only: synthFor(\state) is nil, so set() stores the value and
+			// pushes nothing. spawnMode reads it when this track swaps machine.
+			// The script registers mode_switch_fade per track, so without this
+			// row every edit derived \trModeSwitchFade, found no command, and
+			// was silently dropped.
+			\modeSwitchFade -> (arg: \fadeTime, synth: \state, lo: 0.001, hi: 0.25),
+			\filterSlew   -> (arg: \slew,     synth: \filter, lo: 0.001, hi: 0.5),
+			// warp machine params. wsola* deliberately alias the RandomOla
+			// reader's \grainSize / \wander args (see warpArgs).
+			\chopBeats    -> (arg: \chopBeats,    synth: \reader, lo: 0.03125),
+			\chopMode     -> (arg: \chopMode,     synth: \reader, lo: 0, hi: 2, int: true),
+			\chopAttack   -> (arg: \chopAttack,   synth: \reader, lo: 0.0001),
+			\chopHold     -> (arg: \chopHold,     synth: \reader, lo: 0),
+			\chopRelease  -> (arg: \chopRelease,  synth: \reader, lo: 0.0001),
+			\grainSize    -> (arg: \grainSize,    synth: \reader, lo: 0.002, hi: 0.5),
+			\grainOverlap -> (arg: \grainOverlap, synth: \reader, lo: 1, hi: 64),
+			\grainJitter  -> (arg: [\grainJitter, \grainSpray], synth: \reader, lo: 0, hi: 0.25),
+			\wsolaWindow  -> (arg: \grainSize,    synth: \reader, lo: 0.005, hi: 0.5),
+			\wsolaSearch  -> (arg: \wander,       synth: \reader, lo: 0, hi: 0.1),
+			\pvWindow     -> (arg: \pvWindow,     synth: \reader, lo: 0.005, hi: 2),
+			\pvDispersion -> (arg: \pvDispersion, synth: \reader, lo: 0, hi: 1),
+			// filter stage (also the amp/pan output stage -- see setAmp)
+			\pan              -> (arg: \pan,        synth: \filter, lo: -1, hi: 1),
+			\filterType       -> (arg: \filterType, synth: \filter, lo: 0, hi: 3, int: true),
+			\filterCutoff     -> (arg: \cutoff,     synth: \filter, lo: 20, hi: 20000),
+			\filterRes        -> (arg: \res,        synth: \filter, lo: 0, hi: 1),
+			\filterDrive      -> (arg: \drive,      synth: \filter, lo: 0, hi: 1),
+			\filterMorph      -> (arg: \morph,      synth: \filter, lo: 0, hi: 1),
+			\filterBalance    -> (arg: \balance,    synth: \filter, lo: -1, hi: 1),
+			\filterEnvMode    -> (arg: \envMode,    synth: \filter, lo: 0, hi: 1, int: true),
+			\filterEnvAttack  -> (arg: \envAttack,  synth: \filter, lo: 0),
+			\filterEnvDecay   -> (arg: \envDecay,   synth: \filter, lo: 0),
+			\filterEnvSustain -> (arg: \envSustain, synth: \filter, lo: 0, hi: 1),
+			\filterEnvRelease -> (arg: \envRelease, synth: \filter, lo: 0),
+			\filterEnvHold    -> (arg: \envHold,    synth: \filter, lo: 0),
+			\filterEnvDepth   -> (arg: \envDepth,   synth: \filter, lo: -1, hi: 1),
+			// insert FX
+			\fxDrive       -> (arg: \drive,         synth: \insert, lo: 0, hi: 1),
+			\fxMix         -> (arg: \mix,           synth: \insert, lo: 0, hi: 1),
+			\delayBeats    -> (arg: \delayBeats,    synth: \insert, lo: 0.03125, hi: 8),
+			\delayFeedback -> (arg: \delayFeedback, synth: \insert, lo: 0, hi: 1),
+			\delayTone     -> (arg: \delayTone,     synth: \insert, lo: 0, hi: 1),
+			\reverbSize    -> (arg: \reverbSize,    synth: \insert, lo: 0, hi: 1),
+			\reverbDamp    -> (arg: \reverbDamp,    synth: \insert, lo: 0, hi: 1),
+			\lofiBits      -> (arg: \lofiBits,      synth: \insert, lo: 1, hi: 24),
+			\lofiRate      -> (arg: \lofiRate,      synth: \insert, lo: 500, hi: 48000),
+			// send tap
+			\sendTap    -> (arg: \tap,    synth: \sendTap, lo: 0, hi: 1, int: true),
+			\sendLevel1 -> (arg: \level1, synth: \sendTap, lo: 0, hi: 1),
+			\sendLevel2 -> (arg: \level2, synth: \sendTap, lo: 0, hi: 1),
+			// modulation. dest 0 off, 1..5 pitch/cutoff/res/amp/pan, 6..9 macro 1..4
+			\lfo1Dest  -> (arg: \lfo1Dest,  synth: \mod, lo: 0, hi: 9, int: true),
+			\lfo1Wave  -> (arg: \lfo1Wave,  synth: \mod, lo: 0, hi: 5, int: true),
+			\lfo1Beats -> (arg: \lfo1Beats, synth: \mod, lo: 0.0625, hi: 128),
+			\lfo1Depth -> (arg: \lfo1Depth, synth: \mod, lo: -1, hi: 1),
+			\lfo1Mode  -> (arg: \lfo1Mode,  synth: \mod, lo: 0, hi: 3, int: true),
+			\lfo2Dest  -> (arg: \lfo2Dest,  synth: \mod, lo: 0, hi: 9, int: true),
+			\lfo2Wave  -> (arg: \lfo2Wave,  synth: \mod, lo: 0, hi: 5, int: true),
+			\lfo2Beats -> (arg: \lfo2Beats, synth: \mod, lo: 0.0625, hi: 128),
+			\lfo2Depth -> (arg: \lfo2Depth, synth: \mod, lo: -1, hi: 1),
+			\lfo2Mode  -> (arg: \lfo2Mode,  synth: \mod, lo: 0, hi: 3, int: true),
+			\menvDest    -> (arg: \menvDest,    synth: \mod, lo: 0, hi: 9, int: true),
+			\menvAttack  -> (arg: \menvAttack,  synth: \mod, lo: 0.0001),
+			\menvDecay   -> (arg: \menvDecay,   synth: \mod, lo: 0.0001),
+			\menvSustain -> (arg: \menvSustain, synth: \mod, lo: 0, hi: 1),
+			\menvRelease -> (arg: \menvRelease, synth: \mod, lo: 0.0001),
+			\menvDepth   -> (arg: \menvDepth,   synth: \mod, lo: -1, hi: 1)
+		];
+	}
+
+	*new { arg engineArg, indexArg;
+		^super.new.init(engineArg, indexArg);
+	}
+
+	init { arg engineArg, indexArg;
+		engine = engineArg;
+		index = indexArg.asInteger;
+		macroBase = Array.fill(4, { 0 });
+		macroMatrix = Array.fill(4, { Array.fill(5, { 0 }) });
+		sliceVoices = Array.fill(32, { nil });
+	}
+
+	isAllocated { ^group.notNil }
+
+	// ---- generic parameter dispatch ----------------------------------------
+	// The ONE path every plain value setter takes: clip per the spec, store on
+	// the instance, push to whichever synth owns it. A nil synth (chain not
+	// allocated, or an insert set while the machine is None) is a no-op -- the
+	// value is seeded back in by the next spawn.
+	set { arg field, value;
+		var spec, v;
+		spec = setSpec[field];
+		if(spec.isNil, { ^nil });
+		v = value;
+		if(spec[\int] == true, { v = v.asInteger; });
+		if(spec[\lo].notNil, { v = v.max(spec[\lo]); });
+		if(spec[\hi].notNil, { v = v.min(spec[\hi]); });
+		this.instVarPut(field, v);
+		this.push(spec, v);
+		// A mod field may have just switched this track's modulation on or off.
+		if(spec[\synth] == \mod, { this.refreshModSynth; });
+		^v;
+	}
+
+	push { arg spec, v;
+		var synth;
+		synth = this.synthFor(spec[\synth]);
+		if(synth.isNil, { ^nil });
+		spec[\arg].asArray.do({ arg name; synth.set(name, v); });
+	}
+
+	synthFor { arg which;
+		^switch(which,
+			\reader,  { activeSynth },
+			\filter,  { filterSynth },
+			\insert,  { insertSynth },
+			\sendTap, { sendTapSynth },
+			\mod,     { modSynth },
+			{ nil });
+	}
+
+	// Raw live set on the reader: the generic \trModeParam escape hatch for
+	// warp params that have no spec row.
+	setReader { arg key, value;
+		if(activeSynth.notNil, { activeSynth.set(key, value); });
+	}
+
+	// ---- bespoke setters (genuinely non-trivial logic only) ----------------
+
+	// amp is gated by mute at the FILTER stage: that is the one place a track's
+	// own AMP-destination LFO can reach it (filterModOut). The mix synth stays
+	// at unity -- applying amp there too would square the gain.
+	setAmp { arg value;
+		amp = value.max(0);
+		this.pushAmp;
+	}
+
+	setMute { arg state;
+		muted = state.asInteger.clip(0, 1);
+		this.pushAmp;
+		if(mixSynth.notNil, { mixSynth.set(\mute, muted); });
+	}
+
+	pushAmp {
+		if(filterSynth.notNil, {
+			filterSynth.set(\amp, if(muted == 1, { 0 }, { amp }));
+		});
+	}
+
+	// One line per command name, not one per message. If this ever prints, the
+	// script and the compiled engine class disagree about a command's argument
+	// count -- most often because Engine_Elasticat.sc is a CLASS and only
+	// recompiles when sclang restarts, so reloading the script alone can leave
+	// a stale class library behind. A full norns restart is the first thing to
+	// try.
+	warnBadIndexedCommand { arg name;
+		badIndexedWarned = badIndexedWarned ? IdentityDictionary.new;
+		if(badIndexedWarned[name.asSymbol].isNil, {
+			badIndexedWarned[name.asSymbol] = true;
+			("elasticat: " ++ name ++ " arrived with missing arguments -- script/engine"
+				" disagree on its format. Restart norns fully (the engine is a"
+				" SuperCollider class and does not reload with the script).").postln;
+		});
+	}
+
+	setMacroBase { arg macroIdx, value;
+		var k;
+		if(macroIdx.isNil or: { value.isNil }, {
+			this.warnBadIndexedCommand("trMacroBase");
+			^nil;
+		});
+		k = macroIdx.asInteger.clip(1, 4) - 1;
+		macroBase[k] = value.clip(0, 1);
+		if(modSynth.notNil, {
+			modSynth.set(("macro" ++ (k + 1) ++ "Base").asSymbol, macroBase[k]);
+		});
+	}
+
+	// nil-guarded: an indexed command that arrives with the wrong argument
+	// count (a stale compiled class library disagreeing with the script about
+	// this command's format, say) would otherwise hit `nil.asInteger` and throw
+	// a DoesNotUnderstand PER MESSAGE -- at param-sync rates that is a log
+	// flood that can stall sclang, turning a dropped macro into a dead engine.
+	// Drop the message instead; the next correct one still lands.
+	setMacroDepth { arg macroIdx, destIdx, value;
+		var k, d;
+		if(macroIdx.isNil or: { destIdx.isNil } or: { value.isNil }, {
+			this.warnBadIndexedCommand("trMacroDepth");
+			^nil;
+		});
+		k = macroIdx.asInteger.clip(1, 4) - 1;
+		d = destIdx.asInteger.clip(1, 5) - 1;
+		macroMatrix[k][d] = value.clip(-1, 1);
+		if(modSynth.notNil, {
+			modSynth.set(
+				("macro" ++ (k + 1) ++ macroDestNames[d] ++ "Depth").asSymbol,
+				macroMatrix[k][d]);
+		});
+		this.refreshModSynth;
+	}
+
+	// ---- modulation on demand ----------------------------------------------
+	// \elasticatMod is 257 control-rate UGens -- measured as the single largest
+	// per-track cost, ~35% of the engine's DSP at 8 tracks. At default settings
+	// it computes identically ZERO: every source is multiplied by its depth
+	// (lfo1/lfo2/menv) and every macro contributes value * matrix depth, so
+	// with all depths at 0 all five destination sums are exactly 0. Rather than
+	// pay for 8 copies of nothing, a track runs a mod synth only once some
+	// depth is non-zero -- the same "None spawns no synth" principle the insert
+	// FX already uses. Destination selectors are irrelevant here: a zero depth
+	// zeroes the contribution whatever it points at.
+	needsMod {
+		if(lfo1Depth != 0, { ^true });
+		if(lfo2Depth != 0, { ^true });
+		if(menvDepth != 0, { ^true });
+		macroMatrix.do({ arg row;
+			row.do({ arg v; if(v != 0, { ^true }); });
+		});
+		^false;
+	}
+
+	// Bring the mod synth in line with the current state. Called from the one
+	// generic setter (for any \mod-routed field) and from setMacroDepth, so
+	// there is a single place that decides whether a track modulates.
+	refreshModSynth {
+		if(sourceGroup.isNil, { ^nil });
+		if(this.needsMod, {
+			if(modSynth.isNil, { this.spawnMod; });
+		}, {
+			if(modSynth.notNil, {
+				modSynth.free;
+				modSynth = nil;
+				this.zeroModBusses;
+				engine.reportIdleMod(this);
+			});
+		});
+	}
+
+	// A control bus keeps whatever was last written to it, and a freed bus can
+	// come back with stale contents, so an idle track must park its five mod
+	// busses at 0 explicitly -- otherwise the filter/readers would keep reading
+	// the last modulation value forever.
+	zeroModBusses {
+		[modBusPitch, modBusCutoff, modBusRes, modBusAmp, modBusPan].do({ arg b;
+			if(b.notNil, { b.set(0); });
+		});
+	}
+
+	// Machine changes respawn a synth, so they are not spec-table material.
+	setFilterMachine { arg idx;
+		filterMachine = idx.asInteger.clip(0, engine.filterSynthNames.size - 1);
+		this.spawnFilter;
+	}
+
+	setInsertMachine { arg idx;
+		fxInsertMachine = idx.asInteger.clip(0, engine.fxInsertNames.size - 1);
+		this.spawnInsert;
+	}
+
+	// Reader machine: crossfade-swap. While the chain is inactive only the
+	// state changes -- alloc re-seeds the reader from it.
+	setMachine { arg modeIndex;
+		var newMode, oldMode, oldSynth, newSynth;
+		newMode = modeIndex.asInteger.clip(0, engine.modeSynthNames.size - 1);
+		oldMode = machine;
+		if((newMode == oldMode) and: { activeSynth.notNil }, { ^nil });
+		machine = newMode;
+		if(group.isNil, { ^nil });
+		// Leaving the free-running tape reader: re-anchor on the shared phase.
+		if((oldMode == 0) and: { newMode != 0 }, { this.setPlayhead(lastPhase); });
+		oldSynth = activeSynth;
+		newSynth = this.spawnMode(0);
+		activeSynth = newSynth;
+		newSynth.set(\modeAmp, 1, \fadeTime, modeSwitchFade);
+		if(oldSynth.notNil, {
+			oldSynth.set(\modeAmp, 0, \fadeTime, modeSwitchFade);
+			Routine({ modeSwitchFade.wait; oldSynth.free; }).play(SystemClock);
+		});
+	}
+
+	// ---- derived values -----------------------------------------------------
+	loopBeats {
+		var region;
+		region = ((loopEnd - loopStart).max(0.01) / 128).clip(0.0001, 1);
+		^((sampleSteps.max(1) / 4) * region).max(0.03125);
+	}
+
+	recalcNativeTempo {
+		var duration;
+		duration = sourceFrames.max(1) / sourceRate.max(1);
+		derivedSourceBpm = ((sampleSteps.max(1) / 4) * 60 / duration).max(1);
+		^derivedSourceBpm;
+	}
+
+	// ---- transport ----------------------------------------------------------
+	setPlay { arg state;
+		playing = state.asInteger.clip(0, 1);
+		if(playing == 0, { this.releaseAllSlices; });
+		if(transportSynth.notNil, { transportSynth.set(\playing, playing); });
+		this.setReader(\playing, playing);
+	}
+
+	setPlayhead { arg phase;
+		resetCount = resetCount + 1;
+		lastPhase = phase.wrap(0, 1);
+		if(transportSynth.notNil, {
+			transportSynth.set(\resetPos, lastPhase, \resetTrig, resetCount);
+		});
+		if(activeSynth.notNil, {
+			activeSynth.set(\resetPos, lastPhase, \resetTrig, resetCount);
+		});
+	}
+
+	// Phase reported back by this track's own transport/reader SendReply.
+	reportPhase { arg phase;
+		lastPhase = phase.wrap(0, 1);
+	}
+
+	setReverse { arg value;
+		direction = if(value.asInteger == 1, { -1 }, { 1 });
+		this.setReader(\direction, direction);
+	}
+
+	applyLoop {
+		if(transportSynth.notNil, { transportSynth.set(\loopBeats, this.loopBeats); });
+		if(activeSynth.notNil, {
+			activeSynth.set(
+				\loopBeats, this.loopBeats,
+				\startPoint, loopStart,
+				\endPoint, loopEnd
+			);
+		});
+	}
+
+	setLoopStart { arg position;
+		loopStart = position.clip(0, 127.99);
+		if(loopEnd <= loopStart, { loopEnd = (loopStart + 0.01).clip(0.01, 128); });
+		this.applyLoop;
+	}
+
+	setLoopEnd { arg position;
+		loopEnd = position.clip(0.01, 128);
+		if(loopEnd <= loopStart, { loopStart = (loopEnd - 0.01).clip(0, 127.99); });
+		this.applyLoop;
+	}
+
+	// Atomically set the loop region AND reset the phase (live region scrubbing).
+	setLoopRegionPlayhead { arg startPosition, endPosition, phase;
+		loopStart = startPosition.clip(0, 127.99);
+		loopEnd = endPosition.clip(0.01, 128);
+		if(loopEnd <= loopStart, { loopEnd = (loopStart + 0.01).clip(0.01, 128); });
+		resetCount = resetCount + 1;
+		lastPhase = phase.wrap(0, 1);
+		if(transportSynth.notNil, {
+			transportSynth.set(
+				\playing, playing,
+				\targetBpm, engine.targetBpm,
+				\loopBeats, this.loopBeats,
+				\correction, engine.correction,
+				\resetPos, lastPhase,
+				\resetTrig, resetCount
+			);
+		});
+		if(activeSynth.notNil, {
+			activeSynth.set(
+				\playing, playing,
+				\targetBpm, engine.targetBpm,
+				\loopBeats, this.loopBeats,
+				\startPoint, loopStart,
+				\endPoint, loopEnd,
+				\resetPos, lastPhase,
+				\resetTrig, resetCount
+			);
+		});
+	}
+
+	setSampleSteps { arg steps;
+		sampleSteps = steps.clip(1, 512);
+		this.recalcNativeTempo;
+		if(transportSynth.notNil, { transportSynth.set(\loopBeats, this.loopBeats); });
+		if(activeSynth.notNil, {
+			activeSynth.set(\loopBeats, this.loopBeats, \derivedSourceBpm, derivedSourceBpm);
+		});
+	}
+
+	setSourceBpm { arg bpm;
+		derivedSourceBpm = bpm.max(1);
+		this.setReader(\derivedSourceBpm, derivedSourceBpm);
+	}
+
+	// Tempo/clock-correction fan-out. Every global tempo change routes through
+	// engine.updateTransport, which calls this on each allocated track.
+	pushTempo {
+		if(group.isNil, { ^nil });
+		if(transportSynth.notNil, {
+			transportSynth.set(
+				\playing, playing,
+				\targetBpm, engine.targetBpm,
+				\loopBeats, this.loopBeats,
+				\correction, engine.correction
+			);
+		});
+		if(activeSynth.notNil, {
+			activeSynth.set(
+				\playing, playing,
+				\targetBpm, engine.targetBpm,
+				\loopBeats, this.loopBeats
+			);
+		});
+		// Delay is the only insert FX that reads tempo; LFO rates are musical
+		// divisions of it.
+		if(insertSynth.notNil, { insertSynth.set(\targetBpm, engine.targetBpm); });
+		if(modSynth.notNil, { modSynth.set(\targetBpm, engine.targetBpm); });
+	}
+
+	// ---- notes --------------------------------------------------------------
+	// seconds <= 0 is the indefinite-hold sentinel: the gate stays open until
+	// noteOff. The filter env shares the amp env's trigger counter and gate.
+	noteOn { arg seconds;
+		envNoteSeconds = if(seconds > 0, { seconds.max(0.005) }, { -1 });
+		envTrigCount = envTrigCount + 1;
+		if(activeSynth.notNil, {
+			activeSynth.set(\envGateSeconds, envNoteSeconds, \envTrig, envTrigCount);
+		});
+		if(filterSynth.notNil, {
+			filterSynth.set(\envGateSeconds, envNoteSeconds, \envTrig, envTrigCount);
+		});
+		if(modSynth.notNil, { modSynth.set(\menvGateSeconds, envNoteSeconds); });
+	}
+
+	noteOff {
+		noteOffTrigCount = noteOffTrigCount + 1;
+		if(activeSynth.notNil, { activeSynth.set(\envReleaseTrig, noteOffTrigCount); });
+		if(filterSynth.notNil, { filterSynth.set(\envReleaseTrig, noteOffTrigCount); });
+		if(modSynth.notNil, { modSynth.set(\menvReleaseTrig, noteOffTrigCount); });
+	}
+
+	// Force a fresh amp/filter re-attack for a stopped step preview. Unlike a
+	// plain noteOn this ALWAYS re-attacks, even under portamento (whose legato
+	// deliberately swallows a note-on on a still-sounding note): a preview is
+	// monitoring, not legato, so it must be heard. Under portamento we mimic a
+	// manual re-press -- close the gate now, reopen one block later, since a
+	// same-block set/reset on SetResetFF is reset-wins (stuck closed).
+	retrigNote { arg seconds;
+		var applyNoteOn;
+		applyNoteOn = {
+			envNoteSeconds = if(seconds > 0, { seconds.max(0.005) }, { -1 });
+			envTrigCount = envTrigCount + 1;
+			if(activeSynth.notNil, {
+				activeSynth.set(\envGateSeconds, envNoteSeconds, \envTrig, envTrigCount);
+			});
+			if(filterSynth.notNil, {
+				filterSynth.set(\envGateSeconds, envNoteSeconds, \envTrig, envTrigCount);
+			});
+		};
+		if(portamento > 0, {
+			noteOffTrigCount = noteOffTrigCount + 1;
+			if(activeSynth.notNil, { activeSynth.set(\envReleaseTrig, noteOffTrigCount); });
+			if(filterSynth.notNil, { filterSynth.set(\envReleaseTrig, noteOffTrigCount); });
+			SystemClock.sched(0.008, { applyNoteOn.value; nil });
+		}, {
+			applyNoteOn.value;
+		});
+	}
+
+	// Per-step modulation retrigger: arg 1 != 0 retriggers both LFOs (their
+	// non-FREE modes), arg 2 != 0 retriggers the mod envelope.
+	modTrig { arg lfo, env;
+		if(lfo.asInteger != 0, {
+			lfoTrigCount = lfoTrigCount + 1;
+			if(modSynth.notNil, {
+				modSynth.set(\lfoTrig1, lfoTrigCount, \lfoTrig2, lfoTrigCount);
+			});
+		});
+		if(env.asInteger != 0, {
+			menvTrigCount = menvTrigCount + 1;
+			if(modSynth.notNil, { modSynth.set(\menvTrig, menvTrigCount); });
+		});
+	}
+
+	// ---- sample pool binding ------------------------------------------------
+	// Tracks SHARE the pool buffers -- no duplication. Slot 0 / an empty slot
+	// points the reader at the default (silent) buffers so the transport keeps
+	// running. installPoolBuffers/clearPoolSlot re-call this after an async
+	// load lands, downstream of the generation check.
+	bindSampleSlot { arg slot;
+		var idx;
+		slot = slot.asInteger;
+		this.releaseAllSlices;
+		if(slot < 1, {
+			sampleSlot = 0;
+			loaded = 0;
+			bufL = engine.defaultBufL;
+			bufR = engine.defaultBufR;
+		}, {
+			slot = slot.clip(1, engine.poolSize);
+			idx = slot - 1;
+			sampleSlot = slot;
+			if(engine.poolLoaded[idx] != 1, {
+				loaded = 0;
+				bufL = engine.defaultBufL;
+				bufR = engine.defaultBufR;
+			}, {
+				loaded = 1;
+				bufL = engine.poolBufL[idx];
+				bufR = engine.poolBufR[idx];
+				sourceFrames = engine.poolFrames[idx].max(1);
+				sourceRate = engine.poolRates[idx].max(1);
+				this.recalcNativeTempo;
+			});
+		});
+		if(activeSynth.notNil, {
+			activeSynth.set(
+				\bufL, (bufL ? engine.defaultBufL).bufnum,
+				\bufR, (bufR ? engine.defaultBufR).bufnum,
+				\derivedSourceBpm, derivedSourceBpm
+			);
+		});
+		^sampleSlot;
+	}
+
+	// ---- synth argument lists ----------------------------------------------
+	commonArgs { arg startAmp;
+		^[
+			\out, fxBus.index,
+			\phaseBus, phaseBus.index,
+			\bufL, (bufL ? engine.defaultBufL).bufnum,
+			\bufR, (bufR ? engine.defaultBufR).bufnum,
+			\modeAmp, startAmp,
+			\fadeTime, modeSwitchFade,
+			\playing, playing,
+			\resetTrig, resetCount,
+			\resetPos, lastPhase,
+			\amp, amp,
+			\pan, pan,
+			\pitch, pitch,
+			\speed, speed,
+			\direction, direction,
+			\targetBpm, engine.targetBpm,
+			\derivedSourceBpm, derivedSourceBpm,
+			\loopBeats, this.loopBeats,
+			\startPoint, loopStart,
+			\endPoint, loopEnd,
+			\macro, macro,
+			\envMode, envMode,
+			\envAttack, envAttack,
+			\envDecay, envDecay,
+			\envSustain, envSustain,
+			\envRelease, envRelease,
+			\envHold, envHold,
+			\envTrig, envTrigCount,
+			\envGateSeconds, envNoteSeconds,
+			\envReleaseTrig, noteOffTrigCount,
+			\portamento, portamento,
+			\pitchModBus, modBusPitch.index,
+			\trackIndex, index
+		] ++ this.warpArgs;
+	}
+
+	// Warp params seeded on every reader spawn, so a machine swap no longer
+	// drops them. random_ola (machine 4) is the one reader whose window/search
+	// controls are named \grainSize / \wander -- the same aliasing the
+	// wsolaWindow / wsolaSearch spec rows use.
+	warpArgs {
+		var out;
+		out = [
+			\chopBeats, chopBeats,
+			\chopMode, chopMode,
+			\chopAttack, chopAttack,
+			\chopHold, chopHold,
+			\chopRelease, chopRelease,
+			\grainOverlap, grainOverlap,
+			\grainJitter, grainJitter,
+			\grainSpray, grainJitter,
+			\pvWindow, pvWindow,
+			\pvDispersion, pvDispersion
+		];
+		^if(machine.asInteger == 4, {
+			out ++ [\grainSize, wsolaWindow, \wander, wsolaSearch];
+		}, {
+			out ++ [\grainSize, grainSize];
+		});
+	}
+
+	filterArgs {
+		^[
+			\out, insertBus.index,
+			\in, fxBus.index,
+			// Effective amp: 0 while muted, so a muted track stays muted across
+			// filter machine respawns. The mix synth gates again for the fade.
+			\amp, if(muted == 1, { 0 }, { amp }),
+			\pan, pan,
+			\filterType, filterType,
+			\cutoff, filterCutoff,
+			\res, filterRes,
+			\drive, filterDrive,
+			\morph, filterMorph,
+			\balance, filterBalance,
+			\envMode, filterEnvMode,
+			\envAttack, filterEnvAttack,
+			\envDecay, filterEnvDecay,
+			\envSustain, filterEnvSustain,
+			\envRelease, filterEnvRelease,
+			\envHold, filterEnvHold,
+			\envDepth, filterEnvDepth,
+			\envTrig, envTrigCount,
+			\envGateSeconds, envNoteSeconds,
+			\envReleaseTrig, noteOffTrigCount,
+			\cutoffModBus, modBusCutoff.index,
+			\resModBus, modBusRes.index,
+			\ampModBus, modBusAmp.index,
+			\panModBus, modBusPan.index,
+			\trackIndex, index,
+			\slew, filterSlew
+		];
+	}
+
+	fxInsertArgs {
+		^[
+			\out, mixBus.index,
+			\in, insertBus.index,
+			\mix, fxMix,
+			\drive, fxDrive,
+			\delayBeats, delayBeats,
+			\delayFeedback, delayFeedback,
+			\delayTone, delayTone,
+			\reverbSize, reverbSize,
+			\reverbDamp, reverbDamp,
+			\lofiBits, lofiBits,
+			\lofiRate, lofiRate,
+			\targetBpm, engine.targetBpm
+		];
+	}
+
+	// Insert machine None spawns no synth at all, so nothing carries
+	// insertBus -> mixBus: the post-insert readers read insertBus directly
+	// instead of paying for a passthrough synth.
+	postInsertBus {
+		^if(fxInsertMachine.asInteger == 0, { insertBus }, { mixBus });
+	}
+
+	repointPostInsert {
+		var post;
+		if(group.isNil, { ^nil });
+		post = this.postInsertBus;
+		if(sendTapSynth.notNil, { sendTapSynth.set(\postIn, post.index); });
+		if(mixSynth.notNil, { mixSynth.set(\in, post.index); });
+	}
+
+	sendTapArgs {
+		^[
+			\preIn, insertBus.index,
+			\postIn, this.postInsertBus.index,
+			\tap, sendTap,
+			\level1, sendLevel1,
+			\level2, sendLevel2,
+			\sendOut1, engine.sendBus1.index,
+			\sendOut2, engine.sendBus2.index
+		];
+	}
+
+	modArgs {
+		^[
+			\pitchOut, modBusPitch.index,
+			\cutoffOut, modBusCutoff.index,
+			\resOut, modBusRes.index,
+			\ampOut, modBusAmp.index,
+			\panOut, modBusPan.index,
+			\targetBpm, engine.targetBpm,
+			\lfo1Dest, lfo1Dest,
+			\lfo1Wave, lfo1Wave,
+			\lfo1Beats, lfo1Beats,
+			\lfo1Depth, lfo1Depth,
+			\lfo1Mode, lfo1Mode,
+			\lfoTrig1, lfoTrigCount,
+			\lfo2Dest, lfo2Dest,
+			\lfo2Wave, lfo2Wave,
+			\lfo2Beats, lfo2Beats,
+			\lfo2Depth, lfo2Depth,
+			\lfo2Mode, lfo2Mode,
+			\lfoTrig2, lfoTrigCount,
+			\menvDest, menvDest,
+			\menvAttack, menvAttack,
+			\menvDecay, menvDecay,
+			\menvSustain, menvSustain,
+			\menvRelease, menvRelease,
+			\menvDepth, menvDepth,
+			\menvTrig, menvTrigCount,
+			\menvGateSeconds, envNoteSeconds,
+			\menvReleaseTrig, noteOffTrigCount,
+			\trackIndex, index
+		] ++ this.macroArgs;
+	}
+
+	// 4 macros x (base + one signed depth per destination), flattened into the
+	// \macroNBase / \macroN<Dest>Depth args \elasticatMod declares.
+	macroArgs {
+		var out = [];
+		4.do({ arg m;
+			out = out ++ [("macro" ++ (m + 1) ++ "Base").asSymbol, macroBase[m]];
+			macroDestNames.do({ arg name, d;
+				out = out ++ [
+					("macro" ++ (m + 1) ++ name ++ "Depth").asSymbol,
+					macroMatrix[m][d]
+				];
+			});
+		});
+		^out;
+	}
+
+	// ---- spawns -------------------------------------------------------------
+	spawnMode { arg startAmp;
+		if(group.isNil, { ^nil });
+		^Synth.after(transportSynth,
+			engine.modeSynthNames.wrapAt(machine.asInteger), this.commonArgs(startAmp));
+	}
+
+	spawnMod {
+		if(sourceGroup.isNil, { ^nil });
+		if(modSynth.notNil, { modSynth.free; });
+		modSynth = Synth.head(sourceGroup, \elasticatMod, this.modArgs);
+		^modSynth;
+	}
+
+	spawnFilter {
+		if(group.isNil, { ^nil });
+		if(filterSynth.notNil, { filterSynth.free; });
+		filterSynth = Synth.after(sourceGroup,
+			engine.filterSynthNames.wrapAt(filterMachine.asInteger), this.filterArgs);
+		^filterSynth;
+	}
+
+	spawnInsert {
+		if(group.isNil, { ^nil });
+		if(insertSynth.notNil, { insertSynth.free; insertSynth = nil; });
+		if(fxInsertMachine.asInteger > 0, {
+			insertSynth = Synth.after(filterSynth ? sourceGroup,
+				engine.fxInsertNames.wrapAt(fxInsertMachine.asInteger), this.fxInsertArgs);
+		});
+		this.repointPostInsert;
+		^insertSynth;
+	}
+
+	spawnSendTap {
+		if(group.isNil, { ^nil });
+		if(sendTapSynth.notNil, { sendTapSynth.free; });
+		sendTapSynth = Synth.before(mixSynth, \elasticatSendTap, this.sendTapArgs);
+		^sendTapSynth;
+	}
+
+	// ---- lifecycle ----------------------------------------------------------
+	alloc {
+		var server;
+		if(group.notNil, { ^nil });
+		server = engine.context.server;
+		phaseBus = Bus.audio(server, 1);
+		fxBus = Bus.audio(server, 2);
+		insertBus = Bus.audio(server, 2);
+		mixBus = Bus.audio(server, 2);
+		modBusPitch = Bus.control(server, 1);
+		modBusCutoff = Bus.control(server, 1);
+		modBusRes = Bus.control(server, 1);
+		modBusAmp = Bus.control(server, 1);
+		modBusPan = Bus.control(server, 1);
+		group = Group.tail(engine.tracksGroup);
+		sourceGroup = Group.head(group);
+		// Fresh busses can carry whatever a previous owner left behind.
+		this.zeroModBusses;
+		// Only spawns if this track actually modulates something (see needsMod);
+		// it lands at the head of sourceGroup whenever it does, so the readers,
+		// slice voices and the downstream filter all read this block's values.
+		this.refreshModSynth;
+		transportSynth = Synth.tail(sourceGroup, \elasticatTransport, [
+			\out, phaseBus.index,
+			\playing, playing,
+			\targetBpm, engine.targetBpm,
+			\loopBeats, this.loopBeats,
+			\correction, engine.correction,
+			\resetTrig, resetCount,
+			\resetPos, lastPhase,
+			\trackIndex, index
+		]);
+		activeSynth = this.spawnMode(1);
+		// mixSynth first so spawnSendTap has a node to sit before, and the
+		// filter/insert have somewhere to land between sourceGroup and it. It
+		// stays at UNITY amp/pan: the filter stage carries this track's amp/pan
+		// (that is where the AMP/PAN mod destinations apply).
+		mixSynth = Synth.tail(group, \elasticatTrackMix, [
+			\out, engine.masterBus.index,
+			\in, this.postInsertBus.index,
+			\amp, 1,
+			\pan, 0,
+			\mute, muted,
+			\alive, 1
+		]);
+		this.spawnFilter;
+		this.spawnInsert;
+		this.spawnSendTap;
+		// Bind whatever the track's selected pool slot currently holds.
+		this.bindSampleSlot(sampleSlot);
+		^group;
+	}
+
+	// Click-free teardown: fade the mix gain (30 ms Lag on \alive), wait past
+	// it, then free the group and ALL NINE busses. The instance survives, so
+	// re-raising \activeTrackCount restores the track exactly as it was.
+	free {
+		var doomedGroup, doomedBusses, doomedMix;
+		if(group.isNil, { ^nil });
+		doomedGroup = group;
+		doomedMix = mixSynth;
+		doomedBusses = this.chainBusses;
+		this.forgetNodes;
+		if(doomedMix.notNil, { doomedMix.set(\alive, 0); });
+		Routine({
+			0.08.wait;  // > the 30 ms alive Lag: silence before the free
+			doomedGroup.free;
+			doomedBusses.do({ arg b; if(b.notNil, { b.free; }); });
+		}).play(SystemClock);
+	}
+
+	// Immediate teardown for engine shutdown (no fade, no Routine).
+	freeNow {
+		var doomedBusses;
+		if(group.isNil, { ^nil });
+		doomedBusses = this.chainBusses;
+		group.free;
+		doomedBusses.do({ arg b; if(b.notNil, { b.free; }); });
+		this.forgetNodes;
+	}
+
+	// ALL NINE busses a chain owns -- one list, used by both teardown paths so
+	// neither can drift and leak.
+	chainBusses {
+		^[
+			phaseBus, fxBus, insertBus, mixBus,
+			modBusPitch, modBusCutoff, modBusRes, modBusAmp, modBusPan
+		];
+	}
+
+	forgetNodes {
+		engine.forgetSliceVoicesOf(this);
+		sliceVoices = Array.fill(32, { nil });
+		group = nil; sourceGroup = nil;
+		phaseBus = nil; fxBus = nil; insertBus = nil; mixBus = nil;
+		modBusPitch = nil; modBusCutoff = nil; modBusRes = nil;
+		modBusAmp = nil; modBusPan = nil;
+		transportSynth = nil; modSynth = nil; activeSynth = nil;
+		filterSynth = nil; insertSynth = nil; sendTapSynth = nil; mixSynth = nil;
+	}
+
+	// ---- slice voices -------------------------------------------------------
+	// Voices tail-add inside THIS track's sourceGroup, so they always precede
+	// this track's filter -- a slice on track 3 must never play through track
+	// 1's filter. The 32 slots are the per-track voice map; engine-side there
+	// is also a hard cap on total concurrent voices across all 8 tracks.
+	triggerSlice { arg sliceIndex, startPoint, endPoint, playMode, reverse, velocity, lengthSeconds, notePitch;
+		var idx, startPos, endPos, mode, rev, pitchValue, pitchRatio, duration, sliceRatio, synth;
+		if(group.isNil, { ^nil });
+		idx = sliceIndex.asInteger.clip(1, 32);
+		startPos = startPoint.asFloat.clip(0, 127.99);
+		endPos = endPoint.asFloat.clip(0.01, 128);
+		if(endPos <= startPos, { endPos = (startPos + 0.01).clip(0.01, 128); });
+		mode = playMode.asInteger.clip(0, 3);
+		rev = reverse.asInteger.clip(0, 1);
+		pitchValue = notePitch.asFloat.clip(-48, 48);
+		pitchRatio = pitchValue.midiratio.max(0.001);
+		duration = lengthSeconds.asFloat;
+		if(duration <= 0, {
+			if(mode >= 2, {
+				duration = 60;
+			}, {
+				sliceRatio = ((endPos - startPos).abs / 128).max(0.0001);
+				duration = ((sourceFrames.max(1) * sliceRatio) / sourceRate.max(1)) / pitchRatio;
+			});
+		});
+		duration = duration.clip(0.005, 60);
+
+		if(engine.sliceMono == 1, { this.releaseAllSlices; });
+		this.releaseSlice(idx);
+
+		synth = Synth.tail(sourceGroup, \elasticatSliceVoice, [
+			\out, fxBus.index,
+			\bufL, (bufL ? engine.defaultBufL).bufnum,
+			\bufR, (bufR ? engine.defaultBufR).bufnum,
+			\startPoint, startPos,
+			\endPoint, endPos,
+			\playMode, mode,
+			\reverse, rev,
+			\amp, amp,
+			\pan, pan,
+			\pitch, pitchValue,
+			\velocity, velocity.asFloat.clip(0, 1),
+			\sliceAttack, engine.sliceAttack,
+			\sliceRelease, engine.sliceRelease,
+			\envMode, envMode,
+			\envAttack, envAttack,
+			\envDecay, envDecay,
+			\envSustain, envSustain,
+			\envRelease, envRelease,
+			\envHold, envHold,
+			\lengthSeconds, duration,
+			\syncToClock, engine.sliceSyncToClock,
+			\sliceRate, engine.sliceRate,
+			\warpMode, machine,
+			\targetBpm, engine.targetBpm,
+			\macro, macro,
+			\grainSize, grainSize,
+			\grainOverlap, grainOverlap,
+			\grainJitter, grainJitter,
+			\wsolaWindow, wsolaWindow,
+			\wsolaSearch, wsolaSearch,
+			\pvWindow, pvWindow,
+			\pvDispersion, pvDispersion,
+			\pitchModBus, modBusPitch.index,
+			\gate, 1
+		]);
+		sliceVoices[idx - 1] = synth;
+		engine.registerSliceVoice(this, idx, synth);
+		Routine({
+			duration.wait;
+			// Only close the gate if this voice still owns the slot: a stolen or
+			// replaced voice is already gone, and setting a freed node just
+			// makes the server log a failure.
+			if(sliceVoices[idx - 1] == synth, {
+				synth.set(\gate, 0);
+				sliceVoices[idx - 1] = nil;
+			});
+			engine.forgetSliceVoice(synth);
+		}).play(SystemClock);
+		^synth;
+	}
+
+	releaseSlice { arg sliceIndex;
+		var idx, synth;
+		idx = sliceIndex.asInteger.clip(1, 32);
+		synth = sliceVoices[idx - 1];
+		if(synth.notNil, {
+			synth.set(\gate, 0);
+			sliceVoices[idx - 1] = nil;
+			engine.forgetSliceVoice(synth);
+		});
+	}
+
+	// Voice stealing (global cap): the engine has already dropped this entry
+	// from its order list, so do NOT call back into forgetSliceVoice here.
+	// \steal runs the voice's own 20 ms fade-and-free -- \gate alone would
+	// leave an AHR voice sounding, since that envelope ignores gate-off.
+	stealSlice { arg slot, synth;
+		if(synth.notNil, { synth.set(\steal, 1); });
+		if(sliceVoices[slot - 1] == synth, { sliceVoices[slot - 1] = nil; });
+	}
+
+	releaseAllSlices {
+		sliceVoices.do({ arg synth, i;
+			if(synth.notNil, {
+				synth.set(\gate, 0);
+				sliceVoices[i] = nil;
+				engine.forgetSliceVoice(synth);
+			});
+		});
 	}
 }

@@ -92,17 +92,38 @@ local quiet_osc_paths = {
   ["/elasticat/pool/slot/active"] = true,
   -- 15Hz live-modulation feed: never log it (it would flood maiden).
   ["/elasticat/mod"] = true,
-  ["/elasticat/filterEnv"] = true
+  ["/elasticat/filterEnv"] = true,
+  -- Per-track playhead (1Hz x 8) and level (30Hz x 8) reports: same reasoning,
+  -- and they arrive for every active track rather than just one.
+  ["/elasticat/track/position"] = true,
+  ["/elasticat/track/level"] = true
 }
+-- Phase 2 (docs/PHASE2_CONTRACT.md): every reading the UI used to hold as "the
+-- one track's" is now keyed by 1-based track index, and the screen shows
+-- whichever track is SELECTED. Sub-TABLES rather than new file-scope locals:
+-- elasticat.lua's main chunk sits at LuaJIT's 200-local ceiling, so per-track
+-- state has to hang off something that already exists.
+--   phase/phase_time  the visual playhead anchor + when it was set. Dead
+--                     reckoned forward from there by display_phase().
+--   amp_l/amp_r       header meter peaks, per track.
+--   amp_time          when that peak arrived, so a track the engine is not
+--                     reporting draws an EMPTY meter rather than another
+--                     track's level (never show track 5's audio on track 3).
+--   derived_bpm       engine-derived source BPM (drives tape-mode playhead rate).
 local status = {
-  phase = 0,
-  phase_time = 0,
+  phase = {},
+  phase_time = {},
   frames = 0,
-  amp_l = 0,
-  amp_r = 0,
-  derived_bpm = 0,
+  amp_l = {},
+  amp_r = {},
+  amp_time = {},
+  derived_bpm = {},
   menu_was_active = false
 }
+-- A track whose level report is older than this reads as "no data" (empty
+-- meter). On the module table, not a new local: the main chunk is AT the
+-- 200-local ceiling -- one more `local` here fails to compile outright.
+elasticat.METER_STALE_SECONDS = 0.75
 
 -- Leaving the norns system menu with K1 hands the script no key-UP for that
 -- press (the menu consumed it), so FN stayed latched on until you pressed and
@@ -193,12 +214,79 @@ local function ui_id(name)
 end
 elasticat.ui_id = ui_id
 
+-- Which sample-pool slot the SELECTED track plays. `sample_slot` is a per-track
+-- suffix in ParamsSpec.SPEC, so this is just the id funnel again -- no per-track
+-- branching. On track 1 the param mirrors the facade's active_pool_slot (they
+-- are kept in sync both ways by set_active_pool_slot), so this returns exactly
+-- what the waveform view used before. Falls back to the facade for the case
+-- where the param is not registered yet (early init) or reads 0 = OFF.
+-- Module table, not a local: the main chunk is at LuaJIT's 200-local ceiling.
+elasticat.ui_sample_slot = function()
+  local pid = ui_id("sample_slot")
+  if elasticat.param_exists(pid) then
+    local slot = math.floor((params:get(pid) or 0) + 0.5)
+    if slot >= 1 then
+      return slot
+    end
+    -- Slot 0 = OFF. Report it as-is so the view shows NO SAMPLE for that track
+    -- instead of silently borrowing the playback slot.
+    return 0
+  end
+  return (elasticat.active_pool_slot ~= nil and elasticat.active_pool_slot()) or 1
+end
+
+-- The selected track's pool metadata (duration/trim/bpm/steps/channels/gain).
+-- Everything that used to read the single "active" slot goes through here.
+-- `track` defaults to the selected one, so every existing caller is unchanged;
+-- a background track passes its own index to read ITS slot metadata.
+elasticat.ui_sample_meta = function(track)
+  local slot = track ~= nil and elasticat.track_slot(track) or elasticat.ui_sample_slot()
+  if slot < 1 or elasticat.pool_meta == nil then
+    return {}
+  end
+  return elasticat.pool_meta(slot) or {}
+end
+
+-- The last reported output level of `track`, as (left, right) linear amps, or
+-- nil,nil when that track has not reported inside METER_STALE_SECONDS. Every
+-- track's reader fires its own level at 30Hz with the track index as SendReply's
+-- replyID; the UI keeps them apart here so a meter only ever shows its own
+-- track. nil (rather than 0) is deliberate: "no data" and "silence" are
+-- different things, and only the former should be indistinguishable from a
+-- track the engine is not running.
+-- Coerce a track index arriving over OSC (SendReply replyID) into a valid
+-- 1..TRACK_COUNT_MAX integer. Anything unparseable becomes track 1, so a
+-- malformed report can never index the per-track tables with nil.
+elasticat.osc_track = function(value)
+  return util.clamp(math.floor((tonumber(value) or 1) + 0.5), 1, ParamsSpec.TRACK_COUNT_MAX)
+end
+
+elasticat.track_level = function(track)
+  track = track or elasticat.selected_track or 1
+  local reported = status.amp_time[track]
+  if reported == nil or (util.time() - reported) > elasticat.METER_STALE_SECONDS then
+    return nil, nil
+  end
+  return status.amp_l[track] or 0, status.amp_r[track] or 0
+end
+
 -- Track selection (grid row 4). Updates the id funnel and points the engine
 -- facade's live-gesture calls (region/pitch/note/play) at the track's chain.
 elasticat.select_ui_track = function(track)
   elasticat.selected_track = util.clamp(math.floor((tonumber(track) or 1) + 0.5), 1, ParamsSpec.TRACK_COUNT_MAX)
   if elasticat.set_engine_track ~= nil then
     elasticat.set_engine_track(elasticat.selected_track)
+  end
+  -- The facade holds ONE live-modulation snapshot (the selected track's -- see
+  -- the /elasticat/mod handler). Zero it on every switch: without this the
+  -- outgoing track's LFO/mod-env offsets stayed frozen on the incoming track's
+  -- bars and filter render until its own first report arrived, which for a
+  -- track with no modulation running is never.
+  if elasticat.set_mod_values ~= nil then
+    elasticat.set_mod_values(0, 0, 0, 0, 0)
+  end
+  if elasticat.set_filter_env_mod ~= nil then
+    elasticat.set_filter_env_mod(0)
   end
 end
 
@@ -209,9 +297,17 @@ local function verbose_osc_logging()
   return param ~= nil and params:get(id("debug")) >= 4
 end
 
+-- Display name for the FILE page's `sample` item (the only item flagged
+-- `file = true`). That page edits the FILE-EDITOR slot, which is deliberately
+-- independent of what is playing -- so this reads file_edit_slot, not the
+-- playback slot. Reading the playback slot showed the wrong filename whenever
+-- the editor was pointed at a different slot, and with 8 tracks pulling from
+-- one pool that is now the normal case rather than the exception.
 local function sample_name()
   if elasticat.pool_label ~= nil then
-    return elasticat.pool_label(elasticat.active_pool_slot ~= nil and elasticat.active_pool_slot() or nil)
+    local slot = elasticat.file_edit_slot ~= nil and elasticat.file_edit_slot()
+      or (elasticat.active_pool_slot ~= nil and elasticat.active_pool_slot()) or nil
+    return elasticat.pool_label(slot)
   end
 
   local path = params:get(id("sample"))
@@ -232,7 +328,12 @@ local function cache_sample_waveform(slot, path)
 end
 
 local function active_waveform(slot)
-  slot = slot or (elasticat.active_pool_slot ~= nil and elasticat.active_pool_slot()) or 1
+  -- Default to the SELECTED track's slot (Phase 2), not the one global playback
+  -- slot -- the waveform view has to show the sample of the track being edited.
+  slot = slot or elasticat.ui_sample_slot()
+  if slot < 1 then
+    return nil
+  end
   local waveform = sample_waveforms[slot]
   local path = elasticat.pool_path ~= nil and elasticat.pool_path(slot) or nil
   if path == nil or path == "" or path == "-" or path:sub(-1) == "/" then
@@ -268,20 +369,163 @@ local function fn_active()
   return alt or (grid_ui ~= nil and grid_ui.fn_down == true)
 end
 
-local function set_visual_phase(phase)
+-- The playhead anchor is PER TRACK (Phase 2). `track` defaults to the selected
+-- track, so every existing caller (transport start/stop, region moves, engine
+-- reset echoes) keeps addressing whatever the user is looking at -- which for a
+-- single-track session is track 1, exactly as before. The OSC handler passes an
+-- explicit track so a background track's report never moves the selected
+-- track's playhead.
+local function set_visual_phase(phase, track)
+  track = track or elasticat.selected_track or 1
   if phase ~= nil then
-    status.phase = util.clamp(tonumber(phase) or status.phase, 0, 1)
+    status.phase[track] = util.clamp(tonumber(phase) or status.phase[track] or 0, 0, 1)
   end
-  status.phase_time = util.time()
+  status.phase_time[track] = util.time()
 end
 
+-- Module table, not file-scope locals: the main chunk is AT LuaJIT's 200-local
+-- ceiling, so two more `local function`s here fail to compile the script.
+elasticat.visual_phase = function(track)
+  return status.phase[track or elasticat.selected_track or 1] or 0
+end
+
+elasticat.visual_phase_time = function(track)
+  return status.phase_time[track or elasticat.selected_track or 1] or util.time()
+end
+
+-- Transport reset is global: every track's playhead returns to its own start,
+-- so all 8 anchors are cleared, not just the selected one. (Leaving the others
+-- stale made a background track's playhead jump on the next track switch.)
 local function reset_visual_phase()
-  set_visual_phase(0)
+  for track = 1, ParamsSpec.TRACK_COUNT_MAX do
+    set_visual_phase(0, track)
+  end
   phase_report_ignore_until = util.time() + 1
 end
 
 local function phase_reports_allowed()
   return (not playing) and util.time() >= phase_report_ignore_until
+end
+
+-- ---- Per-track engine reports (Phase 2) ------------------------------------
+-- Every /elasticat/* report that carries per-track state is routed here, out of
+-- init()'s osc.event closure. Two reasons: init() sits at LuaJIT's 60-upvalue
+-- limit, and this is the code that decides WHICH track a reading belongs to --
+-- the thing that has to be right for 8 tracks and the thing worth testing on
+-- its own (bin/test-elasticat-lua cannot call init(), but it can call this).
+--
+-- Returns true when the message was a per-track report. Logging, redraw
+-- scheduling and the non-track paths stay in osc.event.
+elasticat.osc_report = function(path, args)
+  args = args or {}
+  if path == "/elasticat/status" then
+    -- The legacy status stream is track 1's (Engine_Elasticat.sc's
+    -- statusResponder forwards replyID <= 1 only), so it is attributed to
+    -- track 1 explicitly rather than to whatever happens to be selected.
+    if phase_reports_allowed() then
+      set_visual_phase(args[5], 1)
+    end
+    status.frames = tonumber(args[6]) or status.frames
+    status.amp_l[1] = tonumber(args[7]) or status.amp_l[1]
+    status.amp_r[1] = tonumber(args[8]) or status.amp_r[1]
+    status.amp_time[1] = util.time()
+    status.derived_bpm[1] = tonumber(args[10]) or status.derived_bpm[1] or 0
+    if status.derived_bpm[1] > 0 then
+      params:set(id("source_bpm"), status.derived_bpm[1], true)
+    end
+    return true
+  elseif path == "/elasticat/track/position" then
+    -- Per-track playhead report (1Hz, tracks 2-8). This is what lets the visual
+    -- playhead follow the selected track: set_visual_phase re-anchors ONLY that
+    -- track, and display_phase dead-reckons from the selected track's own
+    -- anchor at that track's own loop rate.
+    if phase_reports_allowed() then
+      set_visual_phase(args[2], elasticat.osc_track(args[1]))
+    end
+    return true
+  elseif path == "/elasticat/track/level" then
+    -- Per-track output level (track, ampL, ampR). Forward-compatible: the
+    -- engine's per-track readers already measure this and tag it with the track
+    -- index, but the responder currently drops everything above track 1. Until
+    -- it forwards them, tracks 2-8 have no level data and their meters draw
+    -- empty (see elasticat.track_level) rather than borrowing track 1's.
+    local track = elasticat.osc_track(args[1])
+    status.amp_l[track] = tonumber(args[2]) or 0
+    status.amp_r[track] = tonumber(args[3]) or 0
+    status.amp_time[track] = util.time()
+    return true
+  elseif path == "/elasticat/mod" then
+    -- Live mod-bus values (pitch/cutoff/res/amp/pan, -1..1) at 15Hz: the UI's
+    -- "actual value" bars and the filter render read these.
+    --
+    -- All 8 tracks run their own mod synth, so the script keeps ONLY the
+    -- selected track's stream (PHASE2_CONTRACT, "OSC reporting"). Two message
+    -- shapes are accepted so this works either side of the engine change
+    -- landing: 6 args = the track index leads, filter on it; 5 args = the
+    -- legacy un-routed message, which is track 1's whenever only one track is
+    -- running. Attributing the legacy shape to track 1 (rather than to
+    -- "whatever is selected") is what stops track 5's LFO bleeding into
+    -- track 3's bars.
+    if #args >= 6 then
+      if elasticat.osc_track(args[1]) == (elasticat.selected_track or 1) then
+        elasticat.set_mod_values(args[2], args[3], args[4], args[5], args[6])
+      end
+    elseif (elasticat.selected_track or 1) == 1 then
+      elasticat.set_mod_values(args[1], args[2], args[3], args[4], args[5])
+    end
+    return true
+  elseif path == "/elasticat/filterEnv" then
+    -- Filter-envelope cutoff contribution (semitones), 15Hz. Same two-shape,
+    -- selected-track-only handling as /elasticat/mod above.
+    if #args >= 2 then
+      if elasticat.osc_track(args[1]) == (elasticat.selected_track or 1) then
+        elasticat.set_filter_env_mod(args[2])
+      end
+    elseif (elasticat.selected_track or 1) == 1 then
+      elasticat.set_filter_env_mod(args[1])
+    end
+    return true
+  elseif path == "/elasticat/transport" then
+    if phase_reports_allowed() then
+      set_visual_phase(args[1], 1)
+    end
+    return true
+  elseif path == "/elasticat/reset" then
+    -- The engine echoes every playhead move as /elasticat/reset <phase>.
+    -- Honor the phase: forcing 0 here clobbered the visual playhead after every
+    -- Return/Boomerang release and every preserved-position trig. Playhead
+    -- moves are issued against the facade's engine_track, which select_ui_track
+    -- keeps equal to the selected track, so an un-routed echo re-anchors the
+    -- selected track. A <track> <phase> form is honored too, for when the
+    -- engine starts tagging these.
+    if #args >= 2 then
+      set_visual_phase(args[2], elasticat.osc_track(args[1]))
+    else
+      set_visual_phase(args[1])
+    end
+    return true
+  elseif path == "/elasticat/requestedStatus" then
+    if phase_reports_allowed() then
+      set_visual_phase(args[4], 1)
+    end
+    status.frames = tonumber(args[5]) or status.frames
+    status.derived_bpm[1] = tonumber(args[8]) or status.derived_bpm[1] or 0
+    if status.derived_bpm[1] > 0 then
+      params:set(id("source_bpm"), status.derived_bpm[1], true)
+    end
+    return true
+  elseif path == "/elasticat/load/installed" then
+    status.frames = tonumber(args[3]) or status.frames
+    status.derived_bpm[1] = tonumber(args[5]) or status.derived_bpm[1] or 0
+    if status.derived_bpm[1] > 0 then
+      params:set(id("source_bpm"), status.derived_bpm[1], true)
+    end
+    return true
+  elseif path == "/elasticat/pool/slot/active" then
+    status.frames = tonumber(args[2]) or status.frames
+    return true
+  end
+  return false
 end
 
 local function machine_is_continuous()
@@ -359,6 +603,14 @@ local PATTERN_GLOBAL_SUFFIXES = {
 -- pattern mutes) by NOT being listed here.
 for track = 2, ParamsSpec.TRACK_COUNT_MAX do
   PATTERN_GLOBAL_SUFFIXES["t" .. track .. "_play"] = true
+  -- ...and mirror `amp` above. Phase 2 made amp per-track, so without this
+  -- track 1's volume stays pattern-global and non-morphable while tracks 2-8
+  -- become per-pattern AND (since this table doubles as the morph exclusion
+  -- list) crossfader morph targets -- the fader would ride 7 track volumes and
+  -- pointedly not the first. Track volume is a mixer setting, so all 8 match
+  -- track 1. Note `pan` is deliberately NOT here: it is already per-pattern and
+  -- morphable for track 1, so tracks 2-8 inherit that consistently.
+  PATTERN_GLOBAL_SUFFIXES["t" .. track .. "_amp"] = true
 end
 
 -- Editor preferences (PRD §7): settings that belong to the EDITOR, not to any
@@ -428,9 +680,11 @@ local function apply_pattern_state(snapshot, restart)
     if elasticat.param_exists(full_id) then
       params:set(full_id, value)  -- fire actions so the engine follows the pattern
       -- Scene-locked params' bases follow the pattern's baseline, so the
-      -- crossfader re-apply below morphs against THIS pattern's values.
+      -- crossfader re-apply below morphs against THIS pattern's values. Keyed
+      -- by FULL param id: `suffix` here is the registered suffix (it already
+      -- carries any t<N>_ prefix), so id(suffix) is that param's own id.
       if scene_store ~= nil then
-        scene_store:update_base(suffix, value)
+        scene_store:update_base(full_id, value)
       end
     end
   end
@@ -734,8 +988,34 @@ end
 -- Morphable params = the continuous controls (they have a controlspec) under
 -- our prefix, minus the global-scope params and the structural controls whose
 -- value should step, not glide. Auto-includes future FX/filter controls.
-local MORPH_EXCLUDE = {pattern_steps = true, global_pattern_length = true}
+--
+-- ONLY CONTINUOUS PARAMS MORPH: the `p.controlspec ~= nil` test is what
+-- enforces that (option/binary/number params -- filter type, machine, LFO
+-- wave/mode, mod dest, env mode -- register without one). A half-morphed enum
+-- is nonsense, so those snap on an outright recall and are never faded
+-- (docs/PHASE2_CONTRACT.md, "Send slowly, interpolate in the engine").
+-- `playhead` is a hidden 0..1 control whose action pushes setPlayhead: it is a
+-- transport POSITION, not a sound parameter, so interpolating it would scrub
+-- playback on every fader tick. Structural, exactly like pattern length.
+-- Only CONTINUOUS params may morph. Params with no controlspec (options,
+-- binary, number) are already skipped below; this list catches the ones that
+-- ARE controls but whose values are structural indices, where interpolating is
+-- nonsense rather than merely odd -- morphing sample_slot 3 -> 7 would sweep
+-- through slots 4, 5 and 6, and slice_count would re-cut the grid mid-fade.
+-- default_length/velocity only seed NEWLY created trigs, so morphing them is
+-- inaudible. `playhead` is a hidden 0..1 control whose action scrubs playback.
+local MORPH_EXCLUDE = {pattern_steps = true, global_pattern_length = true,
+  playhead = true,
+  sample_slot = true, slice_count = true, slice_index = true,
+  chop_steps = true, loop_division = true,
+  default_length = true, default_velocity = true}
 local morph_suffix_cache = nil
+-- The BARE morphable suffixes -- ONE track's worth. Per-track ids (t<N>_*) are
+-- deliberately skipped here; elasticat.morph_target_ids() below expands each
+-- per-track suffix across every track instead, which is what keys a scene by
+-- FULL param id rather than by a bare suffix shared by all 8 tracks.
+-- PATTERN_GLOBAL_SUFFIXES doubles as the morph EXCLUSION list -- note
+-- t<N>_amp is in it, so track volumes are deliberately NOT morph targets.
 local function morph_param_suffixes()
   if morph_suffix_cache ~= nil then
     return morph_suffix_cache
@@ -746,14 +1026,54 @@ local function morph_param_suffixes()
     local pid = p ~= nil and p.id
     if type(pid) == "string" and pid:sub(1, plen) == PREFIX then
       local suffix = pid:sub(plen + 1)
-      if p.controlspec ~= nil and not PATTERN_GLOBAL_SUFFIXES[suffix]
-        and not MORPH_EXCLUDE[suffix] then
+      if p.controlspec ~= nil and suffix:match("^t%d+_") == nil
+        and not PATTERN_GLOBAL_SUFFIXES[suffix] and not MORPH_EXCLUDE[suffix] then
         list[#list + 1] = suffix
       end
     end
   end
   morph_suffix_cache = list
   return list
+end
+
+-- The morph TARGET set: (track, suffix) pairs expanded to FULL param ids, so
+-- ONE scene holds values for every track (docs/PHASE2_CONTRACT.md, multi-track
+-- A/B crossfader scenes). A per-track suffix contributes one id per track; a
+-- genuinely global continuous param (the master/send FX busses) contributes a
+-- single id and is always active. Cached once, after every param is registered,
+-- exactly like the suffix scan above.
+-- Module table, not new file-scope locals: the main chunk is AT LuaJIT's
+-- 200-local ceiling (see elasticat.param_exists).
+elasticat.morph_target_cache = nil
+elasticat.morph_target_track = {}
+elasticat.morph_target_ids = function()
+  if elasticat.morph_target_cache ~= nil then
+    return elasticat.morph_target_cache
+  end
+  local list = {}
+  for _, suffix in ipairs(morph_param_suffixes()) do
+    local last = ParamsSpec.PER_TRACK[suffix] and ParamsSpec.TRACK_COUNT_MAX or 1
+    for track = 1, last do
+      local pid = PREFIX .. ParamsSpec.track_suffix(track, suffix)
+      if elasticat.param_exists(pid) then
+        list[#list + 1] = pid
+        elasticat.morph_target_track[pid] = track
+      end
+    end
+  end
+  elasticat.morph_target_cache = list
+  return list
+end
+
+-- Which track a morph target id belongs to (1 for a global param, and for
+-- anything unrecognised -- e.g. an id restored from an older project file --
+-- so an unknown key can never be filtered out as "inactive").
+elasticat.morph_target_of = function(full_id)
+  local track = elasticat.morph_target_track[full_id]
+  if track ~= nil then
+    return track
+  end
+  return ParamsSpec.track_of_suffix(full_id:sub(#PREFIX + 1)) or 1
 end
 
 -- Reverse-lookup set built from morph_param_suffixes(), so scene_edit_item
@@ -787,8 +1107,9 @@ elasticat.undo_record_crossfade = function()
   end
   elasticat.undo:record("crossfade", function()
     local values = {}
-    for _, suffix in ipairs(morph_param_suffixes()) do
-      local full_id = id(suffix)
+    -- Full per-track ids: the fader morphs EVERY track, so undoing it has to
+    -- restore every track (id(suffix) here only ever captured track 1).
+    for _, full_id in ipairs(elasticat.morph_target_ids()) do
       if elasticat.param_exists(full_id) then
         local ok, value = pcall(function() return params:get(full_id) end)
         if ok and type(value) == "number" then
@@ -820,8 +1141,9 @@ elasticat.undo_apply = function()
       -- Follow the scene base too. The low-profile cell's VALUE bar reads the
       -- scene base when one exists (that is what keeps it still under the
       -- crossfader), so without this the value came back but its bar didn't.
-      if scene_store ~= nil and full_id:sub(1, #PREFIX) == PREFIX then
-        scene_store:update_base(full_id:sub(#PREFIX + 1), value)
+      -- Bases are keyed by FULL param id now, so this is the id as recorded.
+      if scene_store ~= nil then
+        scene_store:update_base(full_id, value)
       end
     end
   end
@@ -863,17 +1185,21 @@ local function scene_edit_item(param_item, delta)
     return false
   end
   local suffix = param_item.id
-  if suffix == nil or not is_morph_suffix(suffix) or params:lookup_param(id(suffix)) == nil then
+  -- ui_id, not id: hold-Scene + encoder stays SURGICAL -- it locks this one
+  -- param on the SELECTED track (docs/PHASE2_CONTRACT.md). id() is the track-1
+  -- prefixer, so editing track 5 used to lock track 1's param instead.
+  local full_id = suffix ~= nil and ui_id(suffix) or nil
+  if full_id == nil or not is_morph_suffix(suffix) or not elasticat.param_exists(full_id) then
     -- Anchor held but this param can't morph: swallow the edit rather than
     -- silently changing the live value mid-gesture.
     return true
   end
-  local current = scene_store:scene_value(target, suffix)
+  local current = scene_store:scene_value(target, full_id)
   if current == nil then
-    current = params:get(id(suffix))
+    current = params:get(full_id)
   end
   local next_value = param_values:adjusted_value(param_item, current, delta, fn_active())
-  scene_store:set_scene_value(target, suffix, next_value)
+  scene_store:set_scene_value(target, full_id, next_value)
   param_values:flash_item_value(param_item)
   show_message(param_values:item_long_name(param_item)
     .. (target == 1 and " A " or " B ")
@@ -890,8 +1216,17 @@ local function scene_base_follow(param_item)
     or param_item.pseudo ~= nil or param_item.blank or param_item.file then
     return
   end
-  if params:lookup_param(id(param_item.id)) ~= nil then
-    scene_store:update_base(param_item.id, params:get(id(param_item.id)))
+  -- The full per-track id on BOTH sides. This fires on every encoder edit, and
+  -- the bug it fixes was the two sides disagreeing: the value was read through
+  -- ui_id (the SELECTED track) but stored under the BARE suffix, which is
+  -- track 1's slot in a store keyed by suffix. So editing track 2 wrote track
+  -- 2's value into track 1's base, tracks 2-8 never followed their own edits
+  -- at all, and the low-profile base bar + the next crossfader move both took
+  -- whichever track was touched last (docs/PHASE2_CONTRACT.md, multi-track
+  -- crossfader scenes).
+  local full_id = ui_id(param_item.id)
+  if elasticat.param_exists(full_id) then
+    scene_store:update_base(full_id, params:get(full_id))
   end
 end
 
@@ -1409,11 +1744,16 @@ elasticat.param_display_values = function(item, raw)
   end
   local suffix = item.id
 
-  local bases = scene_store ~= nil and scene_store.bases or nil
-  if bases ~= nil and type(bases[suffix]) == "number" then
-    base = bases[suffix]
-    if math.abs(actual - base) > 0.0001 then
-      modulated = true
+  -- Scene bases are keyed by FULL per-track param id, so the bar reads the
+  -- SELECTED track's base -- a bare suffix here showed track 1's base on every
+  -- track's page.
+  if scene_store ~= nil then
+    local scene_base = scene_store:base_value(ui_id(suffix))
+    if type(scene_base) == "number" then
+      base = scene_base
+      if math.abs(actual - base) > 0.0001 then
+        modulated = true
+      end
     end
   end
 
@@ -1618,11 +1958,13 @@ param_values = ParamValues.new({
   get_scene_edit = function()
     return scene_store ~= nil and scene_store:edit_target_scene() or nil
   end,
+  -- ui_id: scenes are keyed by full per-track id, so a held anchor shows the
+  -- SELECTED track's locked value (not track 1's).
   get_scene_value = function(suffix)
     if scene_store == nil then
       return nil
     end
-    return scene_store:scene_value(scene_store:edit_target_scene(), suffix)
+    return scene_store:scene_value(scene_store:edit_target_scene(), ui_id(suffix))
   end,
   get_select_sample = function() return select_sample end,
   get_default_trig_length = function() return default_trig_length end,
@@ -1630,8 +1972,13 @@ param_values = ParamValues.new({
   get_default_trig_velocity = function() return default_trig_velocity end,
   set_default_trig_velocity = function(v) default_trig_velocity = v end,
   set_last_trim_focus = function(v) last_trim_focus = v end,
+  -- Sizes the trim-scan detent (~1/128 of the file) for trim_start/trim_end.
+  -- Those are FILE-page params editing the file-editor slot, so the duration
+  -- has to come from that slot -- using the playback slot's made the detent
+  -- the wrong size whenever the editor was on a different sample.
   get_sample_duration = function()
-    local slot = elasticat.active_pool_slot ~= nil and elasticat.active_pool_slot() or 1
+    local slot = elasticat.file_edit_slot ~= nil and elasticat.file_edit_slot()
+      or (elasticat.active_pool_slot ~= nil and elasticat.active_pool_slot()) or 1
     local meta = elasticat.pool_meta ~= nil and elasticat.pool_meta(slot) or {}
     return meta.duration or 0
   end,
@@ -1734,21 +2081,32 @@ local function visual_param_value(param_id, fallback)
   return elasticat.param_exists(ui_id(param_id)) and params:get(ui_id(param_id)) or fallback
 end
 
-local function loop_phase_rate(start_point, end_point)
-  start_point = start_point or params:get(ui_id("loop_start")) or 0
-  end_point = end_point or params:get(ui_id("loop_end")) or 128
+-- `track` defaults to the selected one. A background track passes its own
+-- index so its "return" release resolves against ITS region, rate and sample
+-- rather than whatever happens to be on screen.
+local function loop_phase_rate(start_point, end_point, track)
+  track = track or elasticat.selected_track or 1
+  local function tid(suffix) return elasticat.track_pid(track, suffix) end
+  start_point = start_point or params:get(tid("loop_start")) or 0
+  end_point = end_point or params:get(tid("loop_end")) or 128
   -- Rate must reflect the region *as played* -- range + trim mapped -- not the
   -- Track width, or a narrowed range makes the playhead crawl (looks like it
   -- doesn't match the audio).
   local eng_start, eng_end = start_point, end_point
   if elasticat.map_region ~= nil then
-    eng_start, eng_end = elasticat.map_region(start_point, end_point)
+    eng_start, eng_end = elasticat.map_region(start_point, end_point, track)
   end
   local region = math.max(0.01, eng_end - eng_start) / 128
-  -- Use the *active* (playback) slot's steps/bpm from the pool, not the sample_*
-  -- params (which now follow the File-editor slot), so the playhead rate matches
-  -- what's playing even while editing another slot.
-  local active_steps = elasticat.active_steps ~= nil and elasticat.active_steps() or params:get(id("sample_steps"))
+  -- Use the SELECTED TRACK's slot steps/bpm from the pool, not the sample_*
+  -- params (which follow the File-editor slot), so the playhead rate matches
+  -- what that track is playing even while another slot is being edited.
+  -- Phase 2: this is per-track via the `sample_slot` suffix in the id funnel --
+  -- on track 1 it resolves to the same slot elasticat.active_steps() returns,
+  -- so single-track behavior is unchanged.
+  local track_meta = elasticat.ui_sample_meta(track)
+  local active_steps = track_meta.steps
+    or (elasticat.active_steps ~= nil and elasticat.active_steps())
+    or params:get(id("sample_steps"))
   local steps = math.max(1, active_steps or 16)
   local loop_beats = math.max(0.03125, (steps / 4) * region)
 
@@ -1756,48 +2114,78 @@ local function loop_phase_rate(start_point, end_point)
   -- Every other warp mode reads the tempo-locked transport phase, so pitch does
   -- NOT change its playhead rate -- using source_bpm*pitch there made the visual
   -- playhead speed up (e.g. PC mode) while the audio stayed put.
-  local mode = params:lookup_param(ui_id("mode")) ~= nil and params:get(ui_id("mode")) or 1
-  if params:get(ui_id("machine")) == 1 and mode == 1 then
-    local active_bpm = elasticat.active_bpm ~= nil and elasticat.active_bpm() or params:get(id("sample_bpm"))
-    local bpm = status.derived_bpm > 0 and status.derived_bpm or active_bpm
-    local pitch_ratio = math.pow(2, (params:get(ui_id("pitch")) or 0) / 12)
+  local mode = elasticat.param_exists(tid("mode")) and params:get(tid("mode")) or 1
+  if params:get(tid("machine")) == 1 and mode == 1 then
+    local active_bpm = track_meta.bpm
+      or (elasticat.active_bpm ~= nil and elasticat.active_bpm())
+      or params:get(id("sample_bpm"))
+    -- derived_bpm is the engine's own measurement, reported per track.
+    local derived = status.derived_bpm[track] or 0
+    local bpm = derived > 0 and derived or active_bpm
+    local pitch_ratio = math.pow(2, (params:get(tid("pitch")) or 0) / 12)
     return (bpm / 60 / loop_beats) * pitch_ratio
   end
 
   local base_rate = (params:get(id("target_bpm")) or 120) / 60 / loop_beats
-  if params:get(ui_id("machine")) == 1 and mode == 2 then
+  if params:get(tid("machine")) == 1 and mode == 2 then
     -- tempo_varispeed now varispeeds audio-side too (pitch drifts the read
     -- position off the transport, PRD §8): scale the visual playhead the same
     -- way so it tracks what's heard.
-    return base_rate * math.pow(2, (params:get(ui_id("pitch")) or 0) / 12)
+    return base_rate * math.pow(2, (params:get(tid("pitch")) or 0) / 12)
   end
   return base_rate
 end
 
 -- +1 forward, -1 when loop reverse is on, so the visual playhead travels the
 -- same direction as the audio.
-local function playhead_direction()
-  if params:lookup_param(ui_id("loop_reverse")) ~= nil and params:get(ui_id("loop_reverse")) == 1 then
+local function playhead_direction(track)
+  -- track_pid, not ui_id: a background track must read ITS OWN loop_reverse.
+  local rid = elasticat.track_pid(track or elasticat.selected_track or 1, "loop_reverse")
+  if elasticat.param_exists(rid) and params:get(rid) == 1 then
     return -1
   end
   return 1
 end
 
-local function display_phase()
-  local phase = status.phase or 0
+-- The playhead position to DRAW, 0..1: the selected track's anchor dead
+-- reckoned forward at the selected track's own loop rate. On the module table
+-- alongside visual_phase/visual_phase_time (they are one family) -- which also
+-- keeps a file-scope local free, and the main chunk is at LuaJIT's 200 ceiling.
+elasticat.display_phase = function(track)
+  -- No argument = the SELECTED track, which is what the screen draws (one
+  -- playhead, by design). The sequencer passes a track so a BACKGROUND track
+  -- can resolve its own trig_release "return" position.
+  local sel = track == nil
+  track = track or elasticat.selected_track or 1
+  local phase = elasticat.visual_phase(track)
   local previewing = grid_ui ~= nil and grid_ui.preview_active == true
   if not playing and not previewing then
     return phase
   end
 
-  local elapsed = util.time() - (status.phase_time or util.time())
-  local start_point, end_point = active_region()
-  return (phase + (playhead_direction() * elapsed * loop_phase_rate(start_point, end_point))) % 1
+  local elapsed = util.time() - elasticat.visual_phase_time(track)
+  local start_point, end_point
+  if sel then
+    start_point, end_point = active_region()
+  else
+    -- active_region() reads the grid's live loop-key override, which only
+    -- applies to the selected track; a background track uses its own params.
+    start_point = params:get(elasticat.track_pid(track, "loop_start")) or 0
+    end_point = params:get(elasticat.track_pid(track, "loop_end")) or 128
+  end
+  return (phase
+    + (playhead_direction(track) * elapsed
+       * loop_phase_rate(start_point, end_point, track))) % 1
 end
 
-local function position_at_region(start_point, end_point, at_time)
-  local elapsed = (at_time or util.time()) - (status.phase_time or util.time())
-  local unwrapped = (status.phase or 0) + (playhead_direction() * elapsed * loop_phase_rate(start_point, end_point))
+-- `track` defaults to the selected one. This is what trig_release "return"
+-- resolves against, so a background track passing its own index is the whole
+-- difference between "return" working and silently degrading to "reset".
+local function position_at_region(start_point, end_point, at_time, track)
+  track = track or elasticat.selected_track or 1
+  local elapsed = (at_time or util.time()) - elasticat.visual_phase_time(track)
+  local unwrapped = elasticat.visual_phase(track)
+    + (playhead_direction(track) * elapsed * loop_phase_rate(start_point, end_point, track))
   local nearest = math.floor(unwrapped + 0.5)
   local phase
   if nearest == 1 and math.abs(unwrapped - nearest) < 0.01 then
@@ -1820,6 +2208,12 @@ local function draw_page_header(title, page_number)
     end
   end
 
+  -- Per-track meter (Phase 2): the header shows the SELECTED track's level.
+  -- Both values are nil for a track the engine is not currently reporting,
+  -- which Header.draw_meter renders as an empty meter -- never as some other
+  -- track's audio.
+  local level_l, level_r = elasticat.track_level(elasticat.selected_track or 1)
+
   Header.draw({
     track = elasticat.selected_track or 1,
     ghost = ghost,
@@ -1828,8 +2222,8 @@ local function draw_page_header(title, page_number)
       and grid_ui:track_muted(elasticat.selected_track or 1) or false,
     message = visible_message() or grid_status or title or "ELASTICAT",
     tempo = param_value_or("target_bpm", 120),
-    amp_l = status.amp_l,
-    amp_r = status.amp_r,
+    amp_l = level_l,
+    amp_r = level_r,
     page = page_number or 1
   })
 end
@@ -1863,7 +2257,7 @@ local source_page = SourcePage.new({
   active_region = active_region,
   active_range = function() return elasticat.active_range() end,
   get_playing = function() return playing end,
-  display_phase = display_phase,
+  display_phase = elasticat.display_phase,
   visual_param_value = visual_param_value,
   -- Selected-track id funnel (Phase 1): the source page's per-track reads
   -- (slice_count) follow the selection; globals pass through unchanged.
@@ -1872,12 +2266,87 @@ local source_page = SourcePage.new({
   get_last_trim_focus = function() return last_trim_focus end
 })
 
+-- ---- MIX overview page (master category, page 2) ---------------------------
+-- Builds the 8 track descriptors lib/ui/mixer_page.lua renders. Everything is
+-- resolved through ParamsSpec.track_id, so a suffix moving into
+-- ParamsSpec.SPEC turns that column per-track with no change here -- and
+-- param_exists (never a bare lookup_param, which THROWS on norns) means a
+-- suffix that is not per-track yet just reads as the shared value instead of
+-- blanking the page.
+-- Module table, not a local: the main chunk is at LuaJIT's 200-local ceiling.
+-- On the module table rather than a file-scope `local MixerPage = ...`: the
+-- main chunk is AT LuaJIT's 200-local ceiling and one more local fails to
+-- compile the whole script.
+elasticat.MixerPage = include("lib/ui/mixer_page")
+
+elasticat.mixer_track_value = function(track, suffix, fallback)
+  local pid = ParamsSpec.track_id(track, suffix, PREFIX)
+  if not elasticat.param_exists(pid) then
+    return fallback
+  end
+  return params:get(pid) or fallback
+end
+
+-- The MIX page's bottom param strip: label + display value for each of the
+-- page's items, with the active K2/K3 pair flagged. Values resolve through
+-- param_values, which already applies the ui_id funnel -- so the strip shows
+-- the SELECTED track's numbers, and E2/E3 edit exactly what it displays.
+elasticat.mixer_strip = function(items, group)
+  local strip = {}
+  local sel_lo = ((group or 1) - 1) * 2 + 1
+  for i, param_item in ipairs(items or {}) do
+    if not param_item.blank then
+      strip[#strip + 1] = {
+        label = param_item.short or param_item.id,
+        value = param_values:item_display_value(param_item),
+        selected = i == sel_lo or i == sel_lo + 1
+      }
+    end
+  end
+  return strip
+end
+
+elasticat.mixer_tracks = function()
+  local out = {}
+  local count = param_value_or("active_track_count", 1)
+  local selected = elasticat.selected_track or 1
+  for track = 1, ParamsSpec.TRACK_COUNT_MAX do
+    local level_l, level_r = elasticat.track_level(track)
+    local level_frac = nil
+    if level_l ~= nil then
+      -- Peak of the two channels, on the same 0..1 scale the bars want.
+      level_frac = util.clamp(math.max(level_l, level_r or 0), 0, 1)
+    end
+    out[track] = {
+      active = track <= count,
+      selected = track == selected,
+      muted = elasticat.track_muted ~= nil and elasticat.track_muted(track) == true,
+      machine = math.floor((elasticat.mixer_track_value(track, "machine", 1)) + 0.5),
+      slot = math.floor((elasticat.mixer_track_value(track, "sample_slot", 0)) + 0.5),
+      vol_frac = util.clamp(elasticat.mixer_track_value(track, "amp", 0) / 127, 0, 1),
+      level_frac = level_frac,
+      has_content = grid_ui ~= nil and grid_ui.track_has_content ~= nil
+        and grid_ui:track_has_content(track) or false,
+      position_frac = grid_ui ~= nil and grid_ui.track_progress ~= nil
+        and grid_ui:track_progress(track) or nil
+    }
+  end
+  return out
+end
+
 local function draw_root_page()
   local page, page_index, model = nav:current_page()
   local title = page.title or model.title or "ELASTICAT"
 
   if page.animation then
     draw_visualizer_page()  -- full-screen looping sprite, no header/UI
+    return
+  end
+
+  if page.mixer then
+    draw_page_header(title, page_index)
+    elasticat.MixerPage.draw(elasticat.mixer_tracks(),
+      elasticat.mixer_strip(page_items_for("master", page, page_index), nav:clamp_current_group()))
     return
   end
 
@@ -2097,7 +2566,7 @@ set_playing = function(state, reset_transport)
   if state and params:lookup_param(id("sample_preview")) ~= nil and params:get(id("sample_preview")) == 1 then
     params:set(id("sample_preview"), 0, true)
   end
-  local frozen_phase = playing and display_phase() or status.phase
+  local frozen_phase = playing and elasticat.display_phase() or elasticat.visual_phase()
   if not state and loop_trig_gate_clock ~= nil then
     clock.cancel(loop_trig_gate_clock)
     loop_trig_gate_clock = nil
@@ -2109,7 +2578,13 @@ set_playing = function(state, reset_transport)
   elseif not playing then
     set_visual_phase(frozen_phase)
   else
-    status.phase_time = util.time()
+    -- Starting the transport re-anchors EVERY track's dead reckoning to now;
+    -- anchoring only the selected one left the others reckoning from a stale
+    -- timestamp, so switching to them mid-playback showed a playhead that had
+    -- "run ahead" by however long the script had been sitting stopped.
+    for track = 1, ParamsSpec.TRACK_COUNT_MAX do
+      status.phase_time[track] = util.time()
+    end
   end
   params:set(id("play"), playing and 1 or 0, true)
   print("elasticat: K3/play state " .. tostring(playing and 1 or 0))
@@ -2156,6 +2631,173 @@ local function trigger_loop_region(start_point, end_point, options)
       end
     end)
   end
+end
+
+-- ---- Per-track sequencer sinks ---------------------------------------------
+-- Every callback the per-track sequencers write through takes the TRACK as its
+-- first argument. That is the structural half of "a sequencer cannot P-Lock
+-- other tracks' parameters": a step lock's only exit is
+-- elasticat.seq_apply_locks(track, locks), which resolves ids with
+-- elasticat.track_pid(track, suffix) -- the selected-track ui_id funnel is not
+-- reachable from here at all.
+--
+-- Module-table functions, not file-scope locals: this chunk is AT LuaJIT's
+-- 200-local ceiling and init() at its 60-upvalue ceiling.
+
+-- Locks that are consumed by the sequencer or layered by it, never written to
+-- a param (mirrors ParamValues:apply_param_lock_value, which owns the same
+-- list for the selected track's display bookkeeping).
+elasticat.SEQ_UNWRITABLE_LOCKS = {
+  length = true, velocity = true,
+  loop_start = true, loop_end = true, range_start = true, range_end = true,
+  env_reset = true, lfo_reset = true, filter_reset = true,
+  trig_jump = true, trig_release = true
+}
+
+-- Track -> {lock_id -> base value} stashed when a lock first takes hold, so it
+-- can be restored when the lock's window elapses. Per track, so track 3's
+-- bases can never be written back onto track 1.
+elasticat.seq_lock_bases = {}
+
+elasticat.seq_apply_locks = function(track, locks)
+  track = math.floor((tonumber(track) or 1) + 0.5)
+  -- The SELECTED track additionally drives the UI's step-lock display
+  -- bookkeeping (which value a page shows while a lock is active). That is a
+  -- display concern and it resolves the SAME ids, because ui_id(suffix) is by
+  -- definition track_id(selected, suffix).
+  if track == (elasticat.selected_track or 1) and param_values ~= nil then
+    param_values:apply_step_param_locks(locks)
+    return
+  end
+  locks = locks or {}
+  local bases = elasticat.seq_lock_bases[track]
+  if bases == nil then
+    bases = {}
+    elasticat.seq_lock_bases[track] = bases
+  end
+  for lock_id, base in pairs(bases) do
+    if locks[lock_id] == nil then
+      local pid = elasticat.track_pid(track, lock_id)
+      if elasticat.param_exists(pid) then
+        params:set(pid, base)
+      end
+      bases[lock_id] = nil
+    end
+  end
+  for lock_id, value in pairs(locks) do
+    if not elasticat.SEQ_UNWRITABLE_LOCKS[lock_id] then
+      local pid = elasticat.track_pid(track, lock_id)
+      if elasticat.param_exists(pid) then
+        if bases[lock_id] == nil then
+          bases[lock_id] = params:get(pid)
+        end
+        params:set(pid, value)
+      end
+    end
+  end
+end
+
+elasticat.seq_selected = function(track)
+  return math.floor((tonumber(track) or 1) + 0.5) == (elasticat.selected_track or 1)
+end
+
+elasticat.seq_set_pitch = function(track, value)
+  if elasticat.seq_selected(track) then
+    elasticat.set_pitch(value)
+    return
+  end
+  elasticat.tr_now(nil, track, "setPitch", value or 0)
+end
+
+-- ONE path for every track. The selected/background split below sent tracks
+-- 2-8 RAW 0-128 points, because the facade's trim+range mapping was
+-- selected-track-only -- so a region lock on a background track addressed the
+-- wrong part of its sample whenever that track had a non-default trim or a
+-- reduced Range. The facade now takes an explicit `track`, so the branch is
+-- gone. set_visual_phase runs for ALL tracks: a background track otherwise
+-- never gets a phase anchor, which is what trig_release "return" needs.
+elasticat.seq_set_loop_region = function(track, start_point, end_point, reset_playhead)
+  elasticat.set_loop_region(start_point, end_point, reset_playhead, track)
+  if type(reset_playhead) == "number" then
+    set_visual_phase(reset_playhead, track)
+  elseif reset_playhead then
+    set_visual_phase(0, track)
+  end
+end
+
+elasticat.seq_set_active_range = function(track, range_start, range_end)
+  elasticat.set_active_range(range_start, range_end, track)
+end
+
+elasticat.seq_note_on = function(track, seconds)
+  elasticat.tr_now(nil, track, "noteOn", seconds or 0.1)
+end
+
+elasticat.seq_note_off = function(track)
+  elasticat.tr_now(nil, track, "noteOff")
+end
+
+elasticat.seq_retrig_note = function(track, seconds)
+  elasticat.tr_now(nil, track, "retrigNote", seconds or 0)
+end
+
+elasticat.seq_mod_trig = function(track, lfo_on, env_on)
+  elasticat.mod_trig(lfo_on, env_on, track)
+end
+
+elasticat.seq_release_slice = function(track, slice)
+  elasticat.tr_now(nil, track, "releaseSlice", slice)
+end
+
+-- track = nil releases every allocated track (transport stop / cleanup).
+elasticat.seq_release_all_slices = function(track)
+  if track ~= nil then
+    elasticat.tr_now(nil, track, "releaseAllSlices")
+    return
+  end
+  for t = 1, elasticat.active_track_count() do
+    elasticat.tr_now(nil, t, "releaseAllSlices")
+  end
+end
+
+elasticat.seq_trigger_slice = function(track, slice, start_point, end_point, options)
+  local mode = (elasticat.track_param_value(track, "slice_play_mode") or 1) - 1
+  local reverse = elasticat.track_param_value(track, "slice_reverse") == 1
+  -- One path: the facade applies THIS track's file-trim/range mapping. The
+  -- background branch that used to live here sent raw points (see
+  -- seq_set_loop_region above).
+  elasticat.trigger_slice(slice, start_point, end_point, mode, reverse,
+    options.velocity, options.length_seconds, options.pitch, track)
+end
+
+elasticat.seq_trigger_region = function(track, start_point, end_point, options)
+  if elasticat.seq_selected(track) then
+    trigger_loop_region(start_point, end_point, options)
+    return
+  end
+  -- Loop Trig on a background track: jump its region to the start and open its
+  -- amp gate for the note length. (The selected-track path additionally gates
+  -- the GLOBAL transport, which is not a per-track thing to do.)
+  elasticat.seq_set_loop_region(track, start_point, end_point, 0)
+  elasticat.tr_now(nil, track, "noteOn", options.length_seconds or 0.1)
+end
+
+-- Grid Slice divides THIS track's loop region; Razor reads the shared split
+-- table (still global -- 64 params x 8 tracks is deferred, see params_spec).
+elasticat.seq_slice_range = function(track, slice)
+  if (elasticat.track_param_value(track, "machine") or 1) == 4 then
+    local start_point = params:get(id(string.format("razor_%02d_start", slice)))
+    local end_point = params:get(id(string.format("razor_%02d_end", slice)))
+    if end_point <= start_point then
+      end_point = math.min(start_point + 0.01, 128)
+    end
+    return start_point, end_point
+  end
+  local count = math.max(1, elasticat.track_param_value(track, "slice_count") or 16)
+  local loop_start = elasticat.track_param_value(track, "loop_start") or 0
+  local loop_end = elasticat.track_param_value(track, "loop_end") or 128
+  local width = (loop_end - loop_start) / count
+  return loop_start + ((slice - 1) * width), loop_start + (slice * width)
 end
 
 local function load_file(path)
@@ -2396,6 +3038,19 @@ function init()
     -- Phase 1 track scaffolding: active_track_count changed -- snap the grid's
     -- selected track back inside the new count and refresh the row-4 LEDs.
     on_active_track_count = function(_)
+      -- Raising the count allocates engine chains for the newly active tracks,
+      -- but a fresh chain knows nothing -- no sample, amp, region or filter --
+      -- because param actions only fire on EDIT. Push their stored values now,
+      -- or the new track is silent until some unrelated edit happens to reach
+      -- it (which reads as "track 2 randomly started working").
+      elasticat.sync_tracks()
+      -- The scene morph set caches which of its targets are on ACTIVE tracks
+      -- (so a fader tick does no param lookups); the count just moved, so drop
+      -- it. Values stored for a track that just went inactive stay put -- they
+      -- are simply not applied until it comes back.
+      if scene_store ~= nil then
+        scene_store:invalidate()
+      end
       if grid_ui ~= nil and grid_ui.clamp_track_selection ~= nil then
         grid_ui:clamp_track_selection()
       end
@@ -2421,49 +3076,70 @@ function init()
     blank_state = blank_pattern_state
   })
   scene_store = SceneStore.new({
-    morph_ids = morph_param_suffixes,
+    -- FULL per-track param ids, every track at once: one scene is the whole
+    -- instrument, and FN+Scene snapshots all active tracks in one press
+    -- (docs/PHASE2_CONTRACT.md, multi-track A/B crossfader scenes).
+    morph_ids = elasticat.morph_target_ids,
     -- Guarded so a scene that referenced a since-removed param (e.g. the old
     -- macro depth morph targets) is skipped instead of throwing on load.
-    get_value = function(suffix)
-      local fid = id(suffix)
-      return elasticat.param_exists(fid) and params:get(fid) or nil
+    get_value = function(full_id)
+      return elasticat.param_exists(full_id) and params:get(full_id) or nil
     end,
-    set_value = function(suffix, value)
-      local fid = id(suffix)
-      if elasticat.param_exists(fid) then params:set(fid, value) end
-    end
+    -- params:set (not a direct engine push) on purpose: it fires the param's
+    -- own action, which is what puts a morph write on the facade's existing
+    -- 12Hz coalescing send queue (elasticat.tr_queue) instead of inventing a
+    -- second, uncoalesced path -- see docs/PHASE2_CONTRACT.md "Cost control".
+    set_value = function(full_id, value)
+      if elasticat.param_exists(full_id) then params:set(full_id, value) end
+    end,
+    -- Sparse capture: a param at its registered default is stored only when
+    -- the other scene needs a counterpart (see SceneStore:capture). Every
+    -- morph target is a controlspec param, so .controlspec.default exists;
+    -- pcall-guarded lookup via param_exists keeps unknown ids at nil, which
+    -- capture treats as "store unconditionally" -- sparse is an optimisation,
+    -- never a correctness gate.
+    get_default = function(full_id)
+      if not elasticat.param_exists(full_id) then return nil end
+      local p = params:lookup_param(full_id)
+      return p ~= nil and p.controlspec ~= nil and p.controlspec.default or nil
+    end,
+    -- Cost control 3, and "lowering active_track_count must not strand stored
+    -- values": an inactive track's captured values stay in the scene, they are
+    -- simply not applied while that track is off.
+    is_active = function(full_id)
+      return elasticat.morph_target_of(full_id) <= param_value_or("active_track_count", 1)
+    end,
+    -- Pre-multi-track project files keyed scenes by BARE suffix. Load them as
+    -- TRACK 1 values (which is what they were) rather than letting a bare
+    -- suffix land on some other track.
+    legacy_key = function(suffix) return PREFIX .. suffix end
   })
   text_entry = TextEntry.new({})
   grid_ui = GridSequencer.new({
     set_playing = set_playing,
-    set_loop_region = function(start_point, end_point, reset_playhead)
-      elasticat.set_loop_region(start_point, end_point, reset_playhead)
-      if type(reset_playhead) == "number" then
-        set_visual_phase(reset_playhead)
-      elseif reset_playhead then
-        set_visual_phase(0)
-      end
-    end,
-    note_on = function(seconds)
-      elasticat.note_on(seconds)
-    end,
-    note_off = function()
-      elasticat.note_off()
-    end,
+    -- ---- Track-first sequencer sinks ----------------------------------------
+    -- Each of these takes the TRACK as its first argument; the per-track
+    -- sequencers have no track-less variant to call. See the
+    -- elasticat.seq_* block above for why that is the p-lock isolation.
+    set_loop_region = elasticat.seq_set_loop_region,
+    note_on = elasticat.seq_note_on,
+    note_off = elasticat.seq_note_off,
+    retrig_note = elasticat.seq_retrig_note,
     -- Modulation retrigger (2 LFOs + mod env, MOD category): fired per step
-    -- where lfo_reset / env_reset resolve ON (see enter_step). Reaches the
-    -- engine facade through the existing `elasticat` upvalue -- no new init()
-    -- locals (LuaJIT 60-upvalue limit).
-    mod_trig = function(lfo_on, env_on)
-      elasticat.mod_trig(lfo_on, env_on)
-    end,
+    -- where lfo_reset / env_reset resolve ON (see TrackSequencer:enter_step).
+    mod_trig = elasticat.seq_mod_trig,
+    set_active_range = elasticat.seq_set_active_range,
+    set_pitch = elasticat.seq_set_pitch,
+    trigger_region = elasticat.seq_trigger_region,
+    trigger_slice = elasticat.seq_trigger_slice,
+    release_slice = elasticat.seq_release_slice,
+    release_all_slices = elasticat.seq_release_all_slices,
+    apply_step_param_locks = elasticat.seq_apply_locks,
+    get_track_slice_range = elasticat.seq_slice_range,
     -- Macro key LEDs read the live macro value (0-127) for their brightness.
     get_macro_value = function(macro)
       local vid = id("macro" .. macro .. "_value")
       return params:lookup_param(vid) ~= nil and params:get(vid) or 0
-    end,
-    retrig_note = function(seconds)
-      elasticat.retrig_note(seconds)
     end,
     -- Copy/Clear/Paste pattern scope (FN+REC/PLAY/STOP on the grid): buffer =
     -- the same whole-pattern snapshot the pattern slots use; paste re-applies
@@ -2579,11 +3255,14 @@ function init()
     -- PRD §6.6 requirement 1: did the just-released anchor hold actually
     -- capture a param edit? Distinguishes a tap (snap to that scene) from a
     -- hold-to-capture gesture (leave the crossfade position alone).
+    -- ui_id, not id: Phase 2 made these per-track, and the sequencer always
+    -- operates on the SELECTED track. A raw id() here would silently read
+    -- track 1's setting while editing track 5.
     get_loop_division = function()
-      return params:get(id("loop_division"))
+      return params:get(ui_id("loop_division"))
     end,
     get_trig_polyphony = function()
-      return params:get(id("trig_polyphony"))
+      return params:get(ui_id("trig_polyphony"))
     end,
     get_live_performance_mode = function()
       return params:get(id("live_performance_mode")) == 1
@@ -2592,22 +3271,20 @@ function init()
       return params:get(id("step_preview")) == 1
     end,
     get_playhead_return = function()
-      return params:get(id("playhead_return"))
+      -- Per-track since Phase 2; follow the selected track (see above).
+      return params:get(ui_id("playhead_return"))
     end,
-    get_loop_rate = function(start_point, end_point)
-      return loop_phase_rate(start_point, end_point)
+    get_loop_rate = function(start_point, end_point, track)
+      return loop_phase_rate(start_point, end_point, track)
     end,
-    get_playhead_direction = function()
-      return playhead_direction()
+    get_playhead_direction = function(track)
+      return playhead_direction(track)
     end,
     play = function(state)
       elasticat.play(state)
     end,
     set_sample_preview = function(on)
       params:set(id("sample_preview"), on and 1 or 0)
-    end,
-    set_active_range = function(range_start, range_end)
-      elasticat.set_active_range(range_start, range_end)
     end,
     reset_default = function(reset_id)
       return params:lookup_param(elasticat.ui_id(reset_id)) ~= nil and params:get(elasticat.ui_id(reset_id)) == 1
@@ -2651,23 +3328,6 @@ function init()
     get_slice_hold = function()
       return params:get(elasticat.ui_id("slice_hold"))
     end,
-    get_slice_range = function(slice)
-      -- Razor split tables stay shared with track 1 in Phase 1 (see
-      -- lib/tracks/params_spec.lua), so their ids stay plain.
-      if params:get(elasticat.ui_id("machine")) == 4 then
-        local start_point = params:get(id(string.format("razor_%02d_start", slice)))
-        local end_point = params:get(id(string.format("razor_%02d_end", slice)))
-        if end_point <= start_point then
-          end_point = math.min(start_point + 0.01, 128)
-        end
-        return start_point, end_point
-      end
-      local count = math.max(1, params:get(elasticat.ui_id("slice_count")))
-      local loop_start = params:get(elasticat.ui_id("loop_start"))
-      local loop_end = params:get(elasticat.ui_id("loop_end"))
-      local width = (loop_end - loop_start) / count
-      return loop_start + ((slice - 1) * width), loop_start + (slice * width)
-    end,
     get_tempo = function()
       return params:get(id("target_bpm"))
     end,
@@ -2680,35 +3340,8 @@ function init()
     base_pitch = function()
       return params:get(elasticat.ui_id("pitch"))
     end,
-    set_pitch = function(pitch)
-      elasticat.set_pitch(pitch)
-    end,
     set_pitch_param = function(pitch)
       params:set(elasticat.ui_id("pitch"), pitch)
-    end,
-    trigger_region = function(start_point, end_point, options)
-      trigger_loop_region(start_point, end_point, options)
-    end,
-    trigger_slice = function(slice, start_point, end_point, options)
-      elasticat.trigger_slice(
-        slice,
-        start_point,
-        end_point,
-        params:get(elasticat.ui_id("slice_play_mode")) - 1,
-        params:get(elasticat.ui_id("slice_reverse")) == 1,
-        options.velocity,
-        options.length_seconds,
-        options.pitch
-      )
-    end,
-    release_slice = function(slice)
-      elasticat.release_slice(slice)
-    end,
-    release_all_slices = function()
-      elasticat.release_all_slices()
-    end,
-    apply_step_param_locks = function(locks)
-      param_values:apply_step_param_locks(locks)
     end,
     -- Universal input router: grid nav keys (YES/NO/arrows) become semantic
     -- actions for whatever focus layer is open (settings, pop-ups); with none
@@ -2803,10 +3436,7 @@ function init()
     get_track_param = function(track, suffix)
       return elasticat.track_param_value(track, suffix)
     end,
-    track_step = function(track, record)
-      elasticat.track_step(track, record)
-    end,
-    phase = display_phase,
+    phase = elasticat.display_phase,
     position_at_region = position_at_region,
     show_message = show_message,
     request_redraw = request_redraw
@@ -2867,51 +3497,10 @@ function init()
       if not quiet_osc_paths[path] or verbose_osc_logging() then
         print("elasticat: osc " .. path .. " " .. format_args(args))
       end
-      if path == "/elasticat/status" then
-        if phase_reports_allowed() then
-          set_visual_phase(args[5])
-        end
-        status.frames = tonumber(args[6]) or status.frames
-        status.amp_l = tonumber(args[7]) or status.amp_l
-        status.amp_r = tonumber(args[8]) or status.amp_r
-        status.derived_bpm = tonumber(args[10]) or status.derived_bpm
-        if status.derived_bpm > 0 then
-          params:set(id("source_bpm"), status.derived_bpm, true)
-        end
-      elseif path == "/elasticat/mod" then
-        -- Live mod-bus values (pitch/cutoff/res/amp/pan, -1..1) at 15Hz: the
-        -- UI's "actual value" bars and the filter render read these.
-        elasticat.set_mod_values(args[1], args[2], args[3], args[4], args[5])
-      elseif path == "/elasticat/filterEnv" then
-        -- Filter-envelope cutoff contribution (semitones), 15Hz.
-        elasticat.set_filter_env_mod(args[1])
-      elseif path == "/elasticat/transport" then
-        if phase_reports_allowed() then
-          set_visual_phase(args[1])
-        end
-      elseif path == "/elasticat/reset" then
-        -- The engine echoes every playhead move as /elasticat/reset <phase>.
-        -- Honor the phase: forcing 0 here clobbered the visual playhead after
-        -- every Return/Boomerang release and every preserved-position trig.
-        set_visual_phase(args[1])
-      elseif path == "/elasticat/requestedStatus" then
-        if phase_reports_allowed() then
-          set_visual_phase(args[4])
-        end
-        status.frames = tonumber(args[5]) or status.frames
-        status.derived_bpm = tonumber(args[8]) or status.derived_bpm
-        if status.derived_bpm > 0 then
-          params:set(id("source_bpm"), status.derived_bpm, true)
-        end
-      elseif path == "/elasticat/load/installed" then
-        status.frames = tonumber(args[3]) or status.frames
-        status.derived_bpm = tonumber(args[5]) or status.derived_bpm
-        if status.derived_bpm > 0 then
-          params:set(id("source_bpm"), status.derived_bpm, true)
-        end
-      elseif path == "/elasticat/pool/slot/active" then
-        status.frames = tonumber(args[2]) or status.frames
-      end
+      -- Per-track engine reports (playhead / level / modulation) all route
+      -- through elasticat.osc_report above, which owns the "which track does
+      -- this belong to" decision and is unit-testable without init().
+      elasticat.osc_report(path, args)
       if not browsing and not quiet_osc_paths[path] then
         request_redraw()
       end

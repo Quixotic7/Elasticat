@@ -213,10 +213,14 @@ function SourcePage:draw_waveform(opts)
   local height = opts.height or 22
   local center = y0 + math.floor(height / 2)
   -- opts.slot lets the File page render its own (file-edit) slot; otherwise the
-  -- active/playback slot.
-  local slot = opts.slot or (self.elasticat.active_pool_slot ~= nil and self.elasticat.active_pool_slot()) or 1
-  local waveform = self.active_waveform(slot)
-  local meta = self.elasticat.pool_meta ~= nil and self.elasticat.pool_meta(slot) or {}
+  -- SELECTED TRACK's slot (Phase 2 -- `sample_slot` is a per-track suffix, so
+  -- ui_sample_slot is just the id funnel; on track 1 it is the same slot the
+  -- facade's active_pool_slot returns, leaving single-track rendering
+  -- unchanged). Slot 0 means the track has no sample: draw the empty box.
+  local slot = opts.slot or (self.elasticat.ui_sample_slot ~= nil and self.elasticat.ui_sample_slot())
+    or (self.elasticat.active_pool_slot ~= nil and self.elasticat.active_pool_slot()) or 1
+  local waveform = slot >= 1 and self.active_waveform(slot) or nil
+  local meta = (slot >= 1 and self.elasticat.pool_meta ~= nil and self.elasticat.pool_meta(slot)) or {}
   local duration = meta.duration or 0
   local trim_start = meta.trim_start or 0
   local trim_end = meta.trim_end or duration

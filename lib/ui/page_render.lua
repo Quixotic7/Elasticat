@@ -187,6 +187,27 @@ function PageRender:item_value(items, id, default)
   return self.value(id, default)
 end
 
+-- Draw a cell value. Short strings go to screen.text() rather than
+-- screen.text_trim(): on hardware a 1-character value ("1", "2" -- the
+-- non-fractional pattern rates) rendered BLANK through text_trim while longer
+-- ones ("1/2", "11/6", "16") drew fine, so the trim path evidently eats a
+-- string it never needed to shorten. Anything this short cannot exceed BAR_W
+-- at the cell font, so trimming has nothing to do -- skipping it is free and
+-- removes the dependency on that behaviour. Longer values keep the trim.
+local VALUE_NO_TRIM_CHARS = 4
+
+local function draw_cell_value(text, w)
+  local s = tostring(text or "")
+  if s == "" then
+    return
+  end
+  if #s <= VALUE_NO_TRIM_CHARS then
+    screen.text(s)
+  else
+    screen.text_trim(s, w)
+  end
+end
+
 -- Faint Elektron-style cell frame: one horizontal divider between the rows,
 -- vertical dividers between columns. Bottom-row dividers inside the widget
 -- region are skipped so the widget gets an unbroken canvas.
@@ -222,7 +243,7 @@ function PageRender:draw_cells(items, wstart, wend, sel_lo, sel_hi)
     if cell_visible(i, it, wstart, wend) and (i < sel_lo or i > sel_hi) then
       local x, y = cell_pos(i)
       screen.move(x + 2, y + 17)
-      screen.text_trim(tostring(pv:item_display_value(it) or ""), BAR_W)
+      draw_cell_value(pv:item_display_value(it), BAR_W)
     end
   end
 
@@ -233,7 +254,7 @@ function PageRender:draw_cells(items, wstart, wend, sel_lo, sel_hi)
     if cell_visible(i, it, wstart, wend) then
       local x, y = cell_pos(i)
       screen.move(x + 2, y + 17)
-      screen.text_trim(tostring(pv:item_display_value(it) or ""), BAR_W)
+      draw_cell_value(pv:item_display_value(it), BAR_W)
     end
   end
 
@@ -323,7 +344,7 @@ function PageRender:draw_cells(items, wstart, wend, sel_lo, sel_hi)
       if cell_visible(i, it, wstart, wend) and pv:item_value_flashing(it) then
         local x, y = cell_pos(i)
         screen.move(x + 2, y + 17)
-        screen.text_trim(tostring(pv:item_display_value(it) or ""), BAR_W)
+        draw_cell_value(pv:item_display_value(it), BAR_W)
       end
     end
   end

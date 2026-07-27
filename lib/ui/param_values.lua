@@ -1,14 +1,13 @@
 local ParamValues = {}
 ParamValues.__index = ParamValues
 
-local PATTERN_RATES = {0.125, 0.25, 0.5, 1, 2, 4, 8, 16}
+local TrackSequencer = include("lib/sequencer/track_sequencer")
 
-local function rate_label(rate)
-  if rate < 1 then
-    return string.format("%.3gx", rate)
-  end
-  return string.format("%gx", rate)
-end
+-- One source of truth for rates (lib/sequencer/track_sequencer.lua).
+local PATTERN_RATES = TrackSequencer.RATES
+
+-- Rate labels come from TrackSequencer (shown as fractions, one source).
+local rate_label = TrackSequencer.rate_label
 
 local function fmt_round(value)
   return tostring(math.floor((value or 0) + 0.5))
@@ -243,9 +242,9 @@ function ParamValues:pattern_rate_index()
   if grid_ui ~= nil and grid_ui.seq ~= nil then
     -- Per-track sequence state (Phase 1): the rate lives on the selected
     -- track's state table (grid_ui.seq), not on the sequencer object.
-    return grid_ui.seq.rate_index or 4
+    return grid_ui.seq.rate_index or TrackSequencer.RATE_UNITY
   end
-  return 4
+  return TrackSequencer.RATE_UNITY
 end
 
 function ParamValues:item_raw_value(param_item)
@@ -321,7 +320,7 @@ function ParamValues:format_item_value(param_item, value)
     end
     return mode
   elseif param_item.pseudo == "pattern_rate" then
-    return rate_label(PATTERN_RATES[math.floor((value or self:pattern_rate_index()) + 0.5)] or 1)
+    return rate_label(math.floor((value or self:pattern_rate_index()) + 0.5))
   elseif param_item.pseudo == "step_length" then
     return string.format("%.2f", value or self:item_raw_value(param_item))
   elseif param_item.pseudo == "step_velocity" then
@@ -467,7 +466,7 @@ function ParamValues:apply_item_value(param_item, value)
     if grid_ui ~= nil and grid_ui.seq ~= nil then
       -- Per-track sequence state (Phase 1): write the selected track's rate.
       grid_ui.seq.rate_index = util.clamp(math.floor(value + 0.5), 1, #PATTERN_RATES)
-      self.show_message("Pattern Rate " .. rate_label(PATTERN_RATES[grid_ui.seq.rate_index] or 1))
+      self.show_message("Pattern Rate " .. rate_label(grid_ui.seq.rate_index))
     end
   elseif param_item.pseudo == "step_length" then
     local next_length = util.clamp(value, param_item.min or 0.25, param_item.max or 16)

@@ -1,0 +1,402 @@
+<title>elasticat — grid layout</title>
+<style>
+  :root {
+    --ground: #f6f5f2;
+    --ink: #1b1d20;
+    --ink-soft: #5d6268;
+    --ink-faint: #8b9096;
+    --rule: #dedbd4;
+    --panel: #101214;
+    --panel-rule: #262b31;
+    --key: #22262b;
+    --key-edge: #2f353c;
+    --key-ink: #eee8dc;
+    --c-mod: #d2a048;
+    --c-transport: #c96f6f;
+    --c-pages: #8c7bc0;
+    --c-seq: #3f9e96;
+    --c-track: #4e86c7;
+    --c-input: #7e9b5a;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #131416;
+      --ink: #e8e6e1;
+      --ink-soft: #a0a5aa;
+      --ink-faint: #767b81;
+      --rule: #2a2d31;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #131416; --ink: #e8e6e1; --ink-soft: #a0a5aa;
+    --ink-faint: #767b81; --rule: #2a2d31;
+  }
+  :root[data-theme="light"] {
+    --ground: #f6f5f2; --ink: #1b1d20; --ink-soft: #5d6268;
+    --ink-faint: #8b9096; --rule: #dedbd4;
+  }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.6;
+    margin: 0;
+    padding: clamp(1.5rem, 4vw, 3.5rem) clamp(1rem, 4vw, 2rem) 4rem;
+  }
+  .wrap { max-width: 1120px; margin: 0 auto; display: flex; flex-direction: column; gap: 2.5rem; }
+
+  .eyebrow {
+    font-family: var(--mono); font-size: .72rem; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--ink-faint); margin: 0 0 .6rem;
+  }
+  h1 {
+    font-family: var(--mono); font-weight: 500; font-size: clamp(1.6rem, 4vw, 2.3rem);
+    letter-spacing: -.02em; margin: 0 0 .5rem; text-wrap: balance;
+  }
+  .lede { margin: 0; max-width: 62ch; color: var(--ink-soft); }
+  h2 {
+    font-family: var(--mono); font-weight: 500; font-size: 1rem; letter-spacing: .04em;
+    margin: 0 0 1rem; padding-bottom: .5rem; border-bottom: 1px solid var(--rule);
+  }
+
+  /* ---- device panel ---- */
+  .panel {
+    background: var(--panel); border: 1px solid var(--panel-rule);
+    border-radius: 10px; padding: clamp(.9rem, 2.5vw, 1.6rem);
+    overflow-x: auto;
+  }
+  .panel-inner { min-width: 660px; }
+  .ruler-x, .grid-row { display: grid; grid-template-columns: 1.75rem repeat(16, 1fr); gap: 4px; }
+  .ruler-x { margin-bottom: 6px; }
+  .ruler-x span, .rlabel {
+    font-family: var(--mono); font-size: .62rem; color: #59616a;
+    text-align: center; font-variant-numeric: tabular-nums;
+  }
+  .rlabel { display: flex; align-items: center; justify-content: center; }
+  .grid { display: flex; flex-direction: column; gap: 4px; }
+
+  .key {
+    position: relative; aspect-ratio: 1 / 1; border-radius: 4px;
+    background: var(--key); border: 1px solid var(--key-edge);
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--mono); font-size: .55rem; letter-spacing: .01em;
+    color: var(--key-ink); text-align: center; line-height: 1.05;
+    overflow: hidden;
+  }
+  .key.empty { background: #16191d; border-color: #1d2126; }
+  /* Region tint: a wash of the region hue over the key face. */
+  .key[data-c] { background: color-mix(in srgb, var(--rc) 22%, var(--key)); border-color: color-mix(in srgb, var(--rc) 45%, var(--key-edge)); }
+  .key.proposed {
+    border: 1px dashed var(--c-mod); background: color-mix(in srgb, var(--c-mod) 16%, var(--key));
+  }
+  .key.edgecol::after {
+    content: ""; position: absolute; inset: 0; border-radius: 3px;
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--c-mod) 55%, transparent);
+  }
+
+  /* ---- legend ---- */
+  .legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: .1rem 2rem; }
+  .lg { display: grid; grid-template-columns: .8rem 1fr; gap: .7rem; padding: .7rem 0; border-bottom: 1px solid var(--rule); align-items: start; }
+  .sw { width: .8rem; height: .8rem; border-radius: 3px; margin-top: .35rem; background: var(--rc); }
+  .lg-name { font-family: var(--mono); font-size: .82rem; letter-spacing: .02em; }
+  .lg-co { font-family: var(--mono); font-size: .68rem; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+  .lg-desc { font-size: .82rem; color: var(--ink-soft); margin-top: .15rem; }
+
+  /* ---- proposal ---- */
+  .prop {
+    border-left: 2px solid var(--c-mod); padding: .2rem 0 .2rem 1.2rem;
+    display: flex; flex-direction: column; gap: .9rem;
+  }
+  .prop p { margin: 0; max-width: 68ch; }
+  .prop strong { font-family: var(--mono); font-weight: 500; }
+  code {
+    font-family: var(--mono); font-size: .85em;
+    background: color-mix(in srgb, var(--ink) 8%, transparent);
+    padding: .1em .35em; border-radius: 3px;
+  }
+  .colnote { display: flex; flex-wrap: wrap; gap: .5rem 1.4rem; font-family: var(--mono); font-size: .74rem; color: var(--ink-soft); }
+  .colnote b { color: var(--c-mod); font-weight: 500; }
+  footer { font-family: var(--mono); font-size: .7rem; color: var(--ink-faint); border-top: 1px solid var(--rule); padding-top: 1rem; }
+</style>
+
+<div class="wrap">
+  <header>
+    <p class="eyebrow">elasticat / monome grid 128</p>
+    <h1>grid layout — control regions</h1>
+    <p class="lede">The 16&times;8 grid, labelled by functional area rather than individual key. Empty cells are deliberate: spacing is what separates one group from the next, so the layout can be read without memorising positions.</p>
+  </header>
+
+  <section>
+    <div class="panel"><div class="panel-inner">
+      <div class="ruler-x">
+      <span></span>
+      <span>1</span>
+      <span>2</span>
+      <span>3</span>
+      <span>4</span>
+      <span>5</span>
+      <span>6</span>
+      <span>7</span>
+      <span>8</span>
+      <span>9</span>
+      <span>10</span>
+      <span>11</span>
+      <span>12</span>
+      <span>13</span>
+      <span>14</span>
+      <span>15</span>
+      <span>16</span>
+      </div>
+      <div class="grid">
+      <div class="grid-row">
+        <div class="rlabel">y1</div>
+        <div class="key" data-c="mod" style="--rc: var(--c-mod)">FN</div>
+        <div class="key empty"></div>
+        <div class="key" data-c="transport" style="--rc: var(--c-transport)">REC</div>
+        <div class="key" data-c="transport" style="--rc: var(--c-transport)">PLAY</div>
+        <div class="key" data-c="transport" style="--rc: var(--c-transport)">STOP</div>
+        <div class="key empty"></div>
+        <div class="key" data-c="pages" style="--rc: var(--c-pages)">MST</div>
+        <div class="key" data-c="pages" style="--rc: var(--c-pages)">FILE</div>
+        <div class="key" data-c="pages" style="--rc: var(--c-pages)">PAT</div>
+        <div class="key empty"></div>
+        <div class="key" data-c="pages" style="--rc: var(--c-pages)">TRIG</div>
+        <div class="key" data-c="pages" style="--rc: var(--c-pages)">SRC</div>
+        <div class="key" data-c="pages" style="--rc: var(--c-pages)">FILT</div>
+        <div class="key" data-c="pages" style="--rc: var(--c-pages)">AMP</div>
+        <div class="key" data-c="pages" style="--rc: var(--c-pages)">FX</div>
+        <div class="key" data-c="pages" style="--rc: var(--c-pages)">MOD</div>
+      </div>
+      <div class="grid-row">
+        <div class="rlabel">y2</div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+      </div>
+      <div class="grid-row">
+        <div class="rlabel">y3</div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+      </div>
+      <div class="grid-row">
+        <div class="rlabel">y4</div>
+        <div class="key" data-c="track" style="--rc: var(--c-track)">MC1</div>
+        <div class="key" data-c="track" style="--rc: var(--c-track)">MC2</div>
+        <div class="key" data-c="track" style="--rc: var(--c-track)">MC3</div>
+        <div class="key" data-c="track" style="--rc: var(--c-track)">MC4</div>
+        <div class="key empty"></div>
+        <div class="key empty"></div>
+        <div class="key empty"></div>
+        <div class="key" data-c="track" style="--rc: var(--c-track)">T1</div>
+        <div class="key" data-c="track" style="--rc: var(--c-track)">T2</div>
+        <div class="key" data-c="track" style="--rc: var(--c-track)">T3</div>
+        <div class="key" data-c="track" style="--rc: var(--c-track)">T4</div>
+        <div class="key" data-c="track" style="--rc: var(--c-track)">T5</div>
+        <div class="key" data-c="track" style="--rc: var(--c-track)">T6</div>
+        <div class="key" data-c="track" style="--rc: var(--c-track)">T7</div>
+        <div class="key" data-c="track" style="--rc: var(--c-track)">T8</div>
+        <div class="key proposed" style="--rc: var(--c-mod)">MUTE</div>
+      </div>
+      <div class="grid-row">
+        <div class="rlabel">y5</div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)">OCT-</div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)">OCT+</div>
+        <div class="key empty"></div>
+        <div class="key empty"></div>
+        <div class="key empty"></div>
+        <div class="key empty"></div>
+        <div class="key empty"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)">PATN</div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)">SC-A</div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)">xf1</div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)">xf2</div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)">xf3</div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)">xf4</div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)">xf5</div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)">xf6</div>
+        <div class="key edgecol" data-c="seq" style="--rc: var(--c-seq)">SC-B</div>
+      </div>
+      <div class="grid-row">
+        <div class="rlabel">y6</div>
+        <div class="key empty"></div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)"></div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)"></div>
+        <div class="key empty"></div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)"></div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)"></div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)"></div>
+        <div class="key empty"></div>
+        <div class="key empty"></div>
+        <div class="key empty"></div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)">YES</div>
+        <div class="key empty"></div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)">UP</div>
+        <div class="key empty"></div>
+        <div class="key empty"></div>
+        <div class="key edgecol" data-c="mod" style="--rc: var(--c-mod)">FILL</div>
+      </div>
+      <div class="grid-row">
+        <div class="rlabel">y7</div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)"></div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)"></div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)"></div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)"></div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)"></div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)"></div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)"></div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)"></div>
+        <div class="key empty"></div>
+        <div class="key empty"></div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)">NO</div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)">LFT</div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)">DWN</div>
+        <div class="key" data-c="input" style="--rc: var(--c-input)">RGT</div>
+        <div class="key empty"></div>
+        <div class="key edgecol" data-c="mod" style="--rc: var(--c-mod)">PAGE</div>
+      </div>
+      <div class="grid-row">
+        <div class="rlabel">y8</div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+        <div class="key" data-c="seq" style="--rc: var(--c-seq)"></div>
+      </div>
+      </div>
+    </div></div>
+  </section>
+
+  <section>
+    <h2>regions</h2>
+    <div class="legend">
+      <div class="lg">
+        <div class="sw" style="--rc: var(--c-mod)"></div>
+        <div><div class="lg-name">modifier <span class="lg-co">1,1</span></div>
+        <div class="lg-desc">FN. Held with almost anything else; the norns K1 does the same job.</div></div>
+      </div>
+      <div class="lg">
+        <div class="sw" style="--rc: var(--c-transport)"></div>
+        <div><div class="lg-name">transport <span class="lg-co">3-5,1</span></div>
+        <div class="lg-desc">REC, PLAY, STOP. Held as a scope modifier these become copy / clear / paste; held alone, STOP is cut &amp; paste.</div></div>
+      </div>
+      <div class="lg">
+        <div class="sw" style="--rc: var(--c-pages)"></div>
+        <div><div class="lg-name">project pages <span class="lg-co">7-9,1</span></div>
+        <div class="lg-desc">MASTER, FILE, PATTERN &mdash; the pages about the whole instrument.</div></div>
+      </div>
+      <div class="lg">
+        <div class="sw" style="--rc: var(--c-pages)"></div>
+        <div><div class="lg-name">parameter pages <span class="lg-co">11-16,1</span></div>
+        <div class="lg-desc">TRIG, SOURCE, FILTER, AMP, FX, MOD &mdash; the per-track signal chain, in signal order.</div></div>
+      </div>
+      <div class="lg">
+        <div class="sw" style="--rc: var(--c-seq)"></div>
+        <div><div class="lg-name">loop / slice keys <span class="lg-co">1-16, rows 2-3</span></div>
+        <div class="lg-desc">32 positions across the sample. Hold to move the played region live; on slice machines they fire slices. Row 3 is active only above a loop division of 16.</div></div>
+      </div>
+      <div class="lg">
+        <div class="sw" style="--rc: var(--c-track)"></div>
+        <div><div class="lg-name">macros <span class="lg-co">1-4,4</span></div>
+        <div class="lg-desc">MC1-MC4. Hold one and turn a destination to dial that macro&rsquo;s depth to it.</div></div>
+      </div>
+      <div class="lg">
+        <div class="sw" style="--rc: var(--c-track)"></div>
+        <div><div class="lg-name">track select <span class="lg-co">8-15,4</span></div>
+        <div class="lg-desc">T1-T8. Press selects; FN+press mutes. Every page follows the selected track.</div></div>
+      </div>
+      <div class="lg">
+        <div class="sw" style="--rc: var(--c-input)"></div>
+        <div><div class="lg-name">octave / memorize <span class="lg-co">1-2,5</span></div>
+        <div class="lg-desc">Keyboard octave. With FN, memorise and recall the whole project to RAM.</div></div>
+      </div>
+      <div class="lg">
+        <div class="sw" style="--rc: var(--c-seq)"></div>
+        <div><div class="lg-name">pattern <span class="lg-co">8,5</span></div>
+        <div class="lg-desc">Latch or hold the pattern-load overlay; FN opens pattern quantise.</div></div>
+      </div>
+      <div class="lg">
+        <div class="sw" style="--rc: var(--c-seq)"></div>
+        <div><div class="lg-name">scenes &amp; crossfader <span class="lg-co">9-16,5</span></div>
+        <div class="lg-desc">Scene A and B anchors at either end, with six glide keys between them.</div></div>
+      </div>
+      <div class="lg">
+        <div class="sw" style="--rc: var(--c-input)"></div>
+        <div><div class="lg-name">mini keyboard <span class="lg-co">1-8, rows 6-7</span></div>
+        <div class="lg-desc">One octave plus the root above. The gaps at 1,6 and 4,6 are the piano&rsquo;s own missing black keys.</div></div>
+      </div>
+      <div class="lg">
+        <div class="sw" style="--rc: var(--c-input)"></div>
+        <div><div class="lg-name">confirm &amp; navigation <span class="lg-co">11-14, rows 6-7</span></div>
+        <div class="lg-desc">YES / NO and the arrow cluster. Outside menus, NO is quick undo.</div></div>
+      </div>
+      <div class="lg">
+        <div class="sw" style="--rc: var(--c-mod)"></div>
+        <div><div class="lg-name">right-edge modifiers <span class="lg-co">16, rows 5-7</span></div>
+        <div class="lg-desc">FILL and PAGE, held to overlay another mode onto the step row. SC-B anchors the same column.</div></div>
+      </div>
+      <div class="lg">
+        <div class="sw" style="--rc: var(--c-seq)"></div>
+        <div><div class="lg-name">step keys <span class="lg-co">1-16,8</span></div>
+        <div class="lg-desc">The sequencer. Tap toggles a trig; hold and turn to parameter-lock it.</div></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>proposed — dedicated mute key at 16,4</h2>
+    <div class="prop">
+      <p>Column 16 is already the modifier column. It holds <strong>MOD</strong> (16,1), <strong>SC&#8209;B</strong> (16,5), <strong>FILL</strong> (16,6) and <strong>PAGE</strong> (16,7) — every one a held modifier or anchor, and nothing else. A mute key at <strong>16,4</strong> joins that column at the one row it belongs to: row 4 is the track row.</p>
+      <div class="colnote">
+        <span><b>column 16 today</b></span>
+        <span>1 &middot; MOD</span><span>4 &middot; <b>free &rarr; MUTE</b></span><span>5 &middot; SC-B</span><span>6 &middot; FILL</span><span>7 &middot; PAGE</span>
+      </div>
+      <p>This is the only placement that needs no new gap. Putting mute in the 5&#8209;7 gap would either read as a fifth macro or a ninth track depending on which side it sat, and a lone key floating mid&#8209;row reads as unrelated to anything. At 16,4 it is adjacent to T8, but the column convention already tells you the right edge is a modifier, not a track.</p>
+      <p><strong>hold MUTE</strong> &rarr; row 4 becomes eight mute toggles, all states visible at once. <strong>FN&#8239;+&#8239;MUTE</strong> latches the mode, matching how FN latches Fill. <strong>MUTE&#8239;+&#8239;hold a track</strong> solos it — reusing the tap&#8209;versus&#8209;hold distinction the step keys already teach.</p>
+      <p>The cost is honest: it spends the last free cell on the right edge, and mute moves off <code>FN + track</code>, which should keep working so existing muscle memory survives.</p>
+    </div>
+  </section>
+
+  <footer>rows count top to bottom · x,y notation matches docs/CONTROLS.md · dashed cell is proposed, not implemented</footer>
+</div>
+

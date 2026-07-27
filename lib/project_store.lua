@@ -23,8 +23,17 @@
 --     patterns = <PatternStore:serialize() -- {version, current, slots, names}>,
 --     globals = { <param suffix> = <value>, ... },  -- project-level param values
 --     pool = { [slot] = {path, bpm, steps, trim_start, trim_end, gain}, ... },
---     pool_slot = <active pool slot number>
+--     pool_slot = <active pool slot number>,
+--     scenes = <SceneStore:serialize() -- {version, scenes, bases, position}>
 --   }
+--
+-- The `scenes` blob is OPAQUE here: this module only carries it between the
+-- coordinator's capture_scenes/apply_scenes callbacks and the file, and never
+-- reads inside it. Its own shape and version live in lib/scene_store.lua --
+-- version 2 keys every scene value and base by FULL per-track param id (one
+-- scene = every track), where version 1 used bare suffixes and could only ever
+-- describe track 1. SceneStore:deserialize migrates a v1 blob to track 1 ids,
+-- or discards it -- it is never re-interpreted onto some other track.
 local ProjectStore = {}
 ProjectStore.__index = ProjectStore
 

@@ -49,6 +49,11 @@ local pending_engine_order = {}
 local clock_origin = 0
 local clock_sequence = 0
 local ids = {}
+-- Param id prefix (options.prefix in elasticat.params, "elasticat_" in the
+-- shipping script). Declared HERE, above every reader: a local is only in
+-- scope for code that follows it, so declaring it next to the tr_call helpers
+-- would make elasticat.track_pid read a nil global.
+local track_prefix = "elasticat_"
 local sample_pool = {
   paths = {},
   samples = {},
@@ -211,32 +216,34 @@ local engine_track = 1
 -- touched by step locks). Step Range = a triggering step's range lock, pushed
 -- here by GridSequencer. Actual Range (used below) = Step Range when set, else
 -- Track Range. nil per endpoint means "fall through to the Track param".
-local active_range_start = nil
-local active_range_end = nil
+-- Per TRACK, not one shared pair. These were two file-scope locals shared by
+-- every track, so a step range lock on any track overwrote the range the
+-- others were playing -- on the device track 2's range visibly collapsed onto
+-- track 1's the moment playback started.
+local active_range_start = {}
+local active_range_end = {}
 
-function elasticat.set_active_range(range_start, range_end)
-  -- Phase 1: the Active Range override maps track 1's engine points (see
-  -- map_trim_point). With another track selected, a step's range lock must not
-  -- silently re-map TRACK 1's loop points -- tracks 2-8 range support lands
-  -- with their per-track trim mapping.
-  if engine_track > 1 then
-    return
-  end
-  active_range_start = range_start
-  active_range_end = range_end
+function elasticat.set_active_range(range_start, range_end, track)
+  track = track or engine_track
+  active_range_start[track] = range_start
+  active_range_end[track] = range_end
 end
 
 -- The Actual Range (0-128) actually driving playback: Step Range override when
 -- set, else the Track Range params. Used by the waveform view so it can follow
 -- a sequenced range sweep during playback.
-function elasticat.active_range()
-  local rs = active_range_start
-  local re = active_range_end
-  if rs == nil and ids.range_start ~= nil and params:lookup_param(ids.range_start) ~= nil then
-    rs = params:get(ids.range_start)
+function elasticat.active_range(track)
+  track = track or engine_track
+  local rs = active_range_start[track]
+  local re = active_range_end[track]
+  -- Fall through to THIS track's Range params, not track 1's.
+  local sid = elasticat.track_pid(track, "range_start")
+  local eid = elasticat.track_pid(track, "range_end")
+  if rs == nil and elasticat.param_exists(sid) then
+    rs = params:get(sid)
   end
-  if re == nil and ids.range_end ~= nil and params:lookup_param(ids.range_end) ~= nil then
-    re = params:get(ids.range_end)
+  if re == nil and elasticat.param_exists(eid) then
+    re = params:get(eid)
   end
   return rs or 0, re or 128
 end
@@ -244,18 +251,13 @@ end
 -- Range Start/End (0-128) carve a live performance window *inside* the file
 -- trim window: 0 = trim start, 128 = trim end. Unlike file trim (saved per
 -- sample) this is a global, p-lockable layer. Returns the window in seconds.
-local function range_bounds(trim_start, trim_end)
+local function range_bounds(trim_start, trim_end, track)
   local span = trim_end - trim_start
-  local range_start = active_range_start
-  local range_end = active_range_end
-  if range_start == nil and ids.range_start ~= nil and params:lookup_param(ids.range_start) ~= nil then
-    range_start = params:get(ids.range_start)
-  end
-  if range_end == nil and ids.range_end ~= nil and params:lookup_param(ids.range_end) ~= nil then
-    range_end = params:get(ids.range_end)
-  end
-  range_start = range_start or 0
-  range_end = range_end or 128
+  -- elasticat.active_range already resolves the Step Range override, then this
+  -- track's own Range params. Reading the raw tables here (as this did before
+  -- they became per-track) would compare a TABLE against nil and always fall
+  -- through to track 1's params.
+  local range_start, range_end = elasticat.active_range(track)
   local lo = trim_start + (span * (util.clamp(range_start, 0, 128) / 128))
   local hi = trim_start + (span * (util.clamp(range_end, 0, 128) / 128))
   if hi <= lo then
@@ -264,16 +266,38 @@ local function range_bounds(trim_start, trim_end)
   return lo, hi
 end
 
--- Maps a Track point (0-128) through Range, then File Trim, into engine 0-128
--- (of the whole sample). One funnel: every engine region call (loop points,
--- slice ranges, set_loop_region) goes through here, so both the Range and the
--- File Trim layers apply everywhere with no downstream changes.
-local function map_trim_point(point, slot)
-  local trim_start, trim_end, duration = trim_bounds(slot)
+-- The pool slot a given track PLAYS. Track 1 is not special: it reads its own
+-- `sample_slot` param exactly like the rest. active_sample_slot (the slot the
+-- File page focuses) is only the last-resort fallback, for before the params
+-- exist and for the "off" slot 0 -- which trim_bounds clamps exactly as it
+-- always has, so track 1's behaviour is byte-for-byte unchanged.
+elasticat.track_slot = function(track)
+  local v = elasticat.track_param_value(tonumber(track) or 1, "sample_slot")
+  if v ~= nil and v >= 1 then
+    return sample_slot_number(v)
+  end
+  return active_sample_slot
+end
+
+-- Maps a Track point (0-128) through THAT TRACK's Range, then THAT TRACK's
+-- pool-slot File Trim, into engine 0-128 (of the whole sample). One funnel:
+-- every engine region call (loop points, slice ranges, set_loop_region) goes
+-- through here, so both layers apply on every track with no downstream change.
+--
+-- This used to be SELECTED-TRACK-ONLY: it read the globally-active pool slot,
+-- and range_bounds saw no track so it fell through to track 1's Range params.
+-- Tracks 2-8 therefore sent RAW 0-128 points, so a step region lock on a
+-- background track addressed the wrong part of the file whenever that track's
+-- sample had a non-default trim or its Range was narrowed. `track` (not a
+-- slot) is the argument because the slot is derived FROM the track -- passing a
+-- slot could not have carried the Range layer.
+local function map_trim_point(point, track)
+  track = track or engine_track
+  local trim_start, trim_end, duration = trim_bounds(elasticat.track_slot(track))
   if duration <= 0 then
     return util.clamp(point or 0, 0, 128)
   end
-  local range_lo, range_hi = range_bounds(trim_start, trim_end)
+  local range_lo, range_hi = range_bounds(trim_start, trim_end, track)
   local fraction = util.clamp(point or 0, 0, 128) / 128
   return ((range_lo + ((range_hi - range_lo) * fraction)) / duration) * 128
 end
@@ -281,19 +305,10 @@ end
 -- Maps a Track-space region (0-128) to the engine-space region actually played
 -- (range + trim folded in). The visual playhead needs this so its rate matches
 -- the true loop length -- e.g. a narrowed range loops far faster than the Track
--- width alone implies.
-function elasticat.map_region(track_start, track_end)
-  return map_trim_point(track_start), map_trim_point(track_end)
-end
-
-local function update_engine_loop_points()
-  if ids.loop_start == nil or ids.loop_end == nil then
-    return
-  end
-  local start_point = params:lookup_param(ids.loop_start) ~= nil and params:get(ids.loop_start) or 0
-  local end_point = params:lookup_param(ids.loop_end) ~= nil and params:get(ids.loop_end) or 128
-  engine_call("loopStart", map_trim_point(start_point))
-  engine_call("loopEnd", map_trim_point(end_point))
+-- width alone implies. Per track, so a background track's playhead rate can be
+-- derived from ITS region rather than the selected track's.
+function elasticat.map_region(track_start, track_end, track)
+  return map_trim_point(track_start, track), map_trim_point(track_end, track)
 end
 
 local function format_ms(param)
@@ -309,29 +324,51 @@ local ENV_TIME_SHAPE = 6  -- curve steepness; higher = more ms resolution down l
 local ENV_INFINITE_VALUE = 128       -- hold/release value that means "infinite"
 local ENV_INFINITE_SECONDS = 1000000 -- ~11.5 days; effectively infinite to the engine
 
-local function env_range_seconds()
-  if ids.env_range == nil or params:lookup_param(ids.env_range) == nil then
+-- Safe param-existence check. norns' params:lookup_param() ERRORS on an unknown
+-- string id rather than returning nil, so a bare `lookup_param(x) ~= nil` guard
+-- throws the moment it is handed an id that isn't registered. pcall makes the
+-- "does it exist?" question never throw. Hung on the module table (NOT a new
+-- file-scope local): this chunk is at LuaJIT's 200-local ceiling. The
+-- coordinator (elasticat.lua) assigns an identical implementation over the top
+-- when it loads -- same semantics, so either definition order is safe.
+elasticat.param_exists = function(full_id)
+  local ok, p = pcall(params.lookup_param, params, full_id)
+  return ok and p ~= nil
+end
+
+-- A per-track param id from its bare suffix. Track 1 -> the unprefixed id it
+-- has always had; tracks 2-8 -> elasticat_t<N>_<suffix>. Non-per-track
+-- suffixes pass through unchanged, so this is safe to apply uniformly.
+elasticat.track_pid = function(track, suffix)
+  return ParamsSpec.track_id(track, suffix, track_prefix)
+end
+
+-- Envelope seconds mapping is PER TRACK: env_range is a per-track param, so
+-- every conversion needs to know whose envelope it is converting.
+local function env_range_seconds(track)
+  local pid = elasticat.track_pid(track or 1, "env_range")
+  if not elasticat.param_exists(pid) then
     return 8
   end
-  return ENV_RANGE_VALUES[params:get(ids.env_range)] or 8
+  return ENV_RANGE_VALUES[params:get(pid)] or 8
 end
 
 -- 0-127 -> seconds on an exponential curve; 128 is the "infinite" sentinel.
-local function env_value_to_seconds(v)
+local function env_value_to_seconds(v, track)
   v = v or 0
   if v >= ENV_INFINITE_VALUE then
     return ENV_INFINITE_SECONDS
   end
   local n = util.clamp(v / 127, 0, 1)
   local curve = (math.exp(ENV_TIME_SHAPE * n) - 1) / (math.exp(ENV_TIME_SHAPE) - 1)
-  return env_range_seconds() * curve
+  return env_range_seconds(track) * curve
 end
 
-local function format_env_time(param)
+local function format_env_time(param, track)
   if param:get() >= ENV_INFINITE_VALUE then
     return "INF"
   end
-  local secs = env_value_to_seconds(param:get())
+  local secs = env_value_to_seconds(param:get(), track)
   if secs < 1 then
     return string.format("%d ms", math.floor((secs * 1000) + 0.5))
   end
@@ -419,14 +456,9 @@ local MOD_DEST_LABELS = {"OFF", "PITCH", "CUTOFF", "RES", "AMP", "PAN", "MACRO1"
 -- destinations. `key` names the macro's per-dest depth param suffix
 -- (macroN_<key>_depth); `param` is the ACTUAL page param the user turns while
 -- holding a macro key to dial that destination in; `index` is the engine's
--- destination index (1-5, matching the mod buses).
-local MACRO_DESTS = {
-  {key = "pitch", param = "pitch", index = 1},
-  {key = "cutoff", param = "filter_cutoff", index = 2},
-  {key = "res", param = "filter_res", index = 3},
-  {key = "amp", param = "amp", index = 4},
-  {key = "pan", param = "pan", index = 5}
-}
+-- destination index (1-5, matching the mod buses). Defined in params_spec (it
+-- generates the 24 macro params from it) so there is exactly one definition.
+local MACRO_DESTS = ParamsSpec.MACRO_DESTS
 -- Reverse map: turned-param suffix -> its macro-matrix dest entry.
 local MACRO_DEST_BY_PARAM = {}
 for _, dest in ipairs(MACRO_DESTS) do
@@ -445,11 +477,29 @@ local mod_live = {pitch = 0, cutoff = 0, res = 0, amp = 0, pan = 0}
 -- inside the filter synth (not on a mod bus), so it arrives on its own feed.
 local filter_env_semitones = 0
 
-function elasticat.set_filter_env_mod(semitones)
+-- Both feeds now arrive from ALL 8 tracks (one mod synth + one filter each),
+-- tagged with the reporting track's index (SendReply replyID). These are UI
+-- state -- the "actual value" bars and the filter render only ever show the
+-- SELECTED track -- so everything else is discarded here rather than stored
+-- 8-deep. Calls without a track index (an engine/coordinator half that hasn't
+-- landed the replyID yet) are treated as the selected track.
+function elasticat.set_filter_env_mod(track, semitones)
+  if semitones == nil then
+    track, semitones = engine_track, track
+  end
+  if (tonumber(track) or 1) ~= engine_track then
+    return
+  end
   filter_env_semitones = tonumber(semitones) or 0
 end
 
-function elasticat.set_mod_values(pitch, cutoff, res, amp, pan)
+function elasticat.set_mod_values(track, pitch, cutoff, res, amp, pan)
+  if pan == nil then
+    track, pitch, cutoff, res, amp, pan = engine_track, track, pitch, cutoff, res, amp
+  end
+  if (tonumber(track) or 1) ~= engine_track then
+    return
+  end
   mod_live.pitch = tonumber(pitch) or 0
   mod_live.cutoff = tonumber(cutoff) or 0
   mod_live.res = tonumber(res) or 0
@@ -540,8 +590,90 @@ local resend_env_times
 local resend_filter_env_times
 local resend_menv_times
 
+-- The sample-slot gain that multiplies a track's Volume. Sample gain is a
+-- property of the POOL SLOT (saved to the sample's sidecar), so it is read
+-- from whichever slot the track plays -- track 1's playback slot for track 1,
+-- the track's own sample_slot param for the rest.
+-- The gain of the slot THIS track plays. Track 1 is not special here: it used
+-- to fall back to the global `active_sample_slot` (the slot the FILE page is
+-- focused on), so recomputing track 1 amp while another track was selected
+-- multiplied it by the OTHER track slot gain -- turning track 2 volume moves
+-- into track 1 volume moves. elasticat.track_slot owns that resolution now, so
+-- gain and the region mapping can never disagree about which slot a track
+-- plays.
+elasticat.track_gain = function(track)
+  return sample_pool.gains[elasticat.track_slot(track)] or 1
+end
+
+-- ---- SPEC-driven param behaviour (lib/tracks/params_spec.lua) -------------
+-- Every per-track param's DISPLAY, its VALUE TRANSFORM on the way to the
+-- engine, and the two params whose action isn't "push one value" live in these
+-- three tables. params_spec names them; nothing here is per-track-branched, so
+-- all 8 tracks are guaranteed identical by construction.
+--
+-- Hung on the module table, not new file-scope locals: this chunk is at
+-- LuaJIT's 200-local ceiling, and elasticat.params() is near its 60-upvalue
+-- ceiling -- reaching these through the existing `elasticat` upvalue costs
+-- neither.
+elasticat.param_formatters = {
+  env_time = format_env_time,
+  env_level = format_env_level,
+  pan_127 = format_pan_127,
+  filter_cutoff = format_filter_cutoff,
+  filter_morph = format_filter_morph,
+  filter_depth = format_filter_depth,
+  filter_balance = format_filter_balance,
+  lofi_bits = format_lofi_bits,
+  lofi_rate = format_lofi_rate,
+  integer = function(param) return tostring(math.floor(param:get() + 0.5)) end,
+  decimal2 = function(param) return string.format("%.2f", param:get()) end,
+  percent = function(param) return tostring(math.floor((param:get() * 100) + 0.5)) end
+}
+
+-- Value transforms: param units -> engine units. (x, track) so the envelope
+-- times can read the track's own env_range.
+elasticat.param_xforms = {
+  amount = function(x) return util.clamp(x / 127, 0, 1) end,          -- 0-127 -> 0..1
+  bipolar = function(x) return (x - 64) / 64 end,                     -- 0-128 -> -1..1
+  morph = function(x) return util.clamp(x / 128, 0, 1) end,           -- 0-128 -> 0..1
+  macro_base = function(x) return x / 127 end,
+  cutoff_hz = function(x) return filter_cutoff_hz(x) end,
+  lofi_bits = function(x) return lofi_bits_depth(x) end,
+  lofi_rate = function(x) return lofi_rate_hz(x) end,
+  delay_beats = function(x) return DELAY_TIME_BEATS[x] or 1 end,
+  mod_beats = function(x) return MOD_SPEED_BEATS[x] or 4 end,
+  env_seconds = function(x, track) return env_value_to_seconds(x, track) end,
+  -- Track-space 0-128 -> engine-space, folding in THIS track file-trim window
+  -- and Range. Without it a background track Loop-page edit sent the raw value
+  -- while track 1 sent a mapped one -- the same point addressed two different
+  -- places depending on which track was selected.
+  region_point = function(x, track) return map_trim_point(x, track) end,
+  -- The engine has one gain input per track, so the sample slot's gain and the
+  -- track's own Volume combine into it here (see send_effective_amp).
+  amp = function(x, track) return (x / 127) * elasticat.track_gain(track) end
+}
+
+-- The one param whose action isn't a single engine push: env_range only
+-- changes the 0-127 -> seconds MAPPING, so it re-sends this track's three
+-- envelopes at their new seconds values.
+elasticat.param_actions = {
+  -- Range does not push a value of its own: it changes the MAPPING, so it
+  -- re-sends this track loop points at their new engine positions. Without
+  -- this, editing a background track Range did nothing until its next trig.
+  range_remap = function(_, track)
+    elasticat.push_loop_points(track, true)
+  end,
+  env_range = function(_, track)
+    resend_env_times(track)
+    resend_filter_env_times(track)
+    resend_menv_times(track)
+  end
+}
+
 local function clock_param_is_internal()
-  return params:lookup_param("clock_source") ~= nil and params:get("clock_source") == 1
+  -- clock_source/clock_tempo are norns SYSTEM params, not ours: a bare
+  -- lookup_param would throw rather than return nil if they ever went missing.
+  return elasticat.param_exists("clock_source") and params:get("clock_source") == 1
 end
 
 local function set_internal_clock_tempo(bpm)
@@ -552,7 +684,7 @@ local function set_internal_clock_tempo(bpm)
     return
   end
 
-  if params:lookup_param("clock_tempo") ~= nil then
+  if elasticat.param_exists("clock_tempo") then
     params:set("clock_tempo", bpm)
   elseif clock.internal ~= nil and clock.internal.set_tempo ~= nil then
     clock.internal.set_tempo(bpm)
@@ -573,25 +705,27 @@ local function load_sample(path)
   end
 end
 
-engine_call = function(name, ...)
-  if engine[name] ~= nil then
-    engine[name](...)
-  else
-    print("elasticat: engine command missing: " .. name)
-  end
-end
+-- engine_call is assigned further down, AFTER tr_command_name exists (it names
+-- the tr* command in its "you forgot the track" diagnostic), and a Lua local is
+-- only in scope for code that follows its declaration, so a closure built here
+-- could not see it.
 
--- ---- Phase 1 track scaffolding: per-track engine facade --------------------
--- (docs/PHASE1_CONTRACT.md). tr-prefixed commands take a LEADING track index;
--- the existing unprefixed commands stay exactly as-is and act on track 1.
+-- ---- Per-track engine facade ----------------------------------------------
+-- (docs/PHASE1_CONTRACT.md, docs/PHASE2_CONTRACT.md). EVERY per-track command
+-- takes a LEADING track index and is named tr + UpperCamelCase(field):
+-- filter_cutoff -> \trFilterCutoff (track, value). There are no global
+-- aliases: the un-prefixed per-track commands are gone from the engine, so
+-- passing one of those names to the global dispatcher is a bug at the call
+-- site, not a fallback -- see engine_call below.
 -- The engine half is built in parallel, so every tr call no-ops gracefully
 -- (warn once per command) until it lands -- the Lua half stays testable.
 --
--- Name mapping: the contract names a few commands that drop the "set" of
--- their track-1 counterpart (\trPitch for setPitch, \trSampleSlot for
--- setSampleSlot, \trSetMachine for the warp reader select). The alias table
--- tries the contract name first, then the mechanical tr+Capitalized fallback,
--- so either spelling on the engine side just works.
+-- Name mapping: a few commands drop the "set" of their old track-1 counterpart
+-- (\trPitch for setPitch, \trSampleSlot for setSampleSlot, \trSetMachine for
+-- the warp reader select) or rename the unit (\trDelayBeats, \trLfo1Beats --
+-- both take beats, not seconds). The alias table tries the contract name
+-- first, then the mechanical tr+Capitalized fallback, so either spelling on
+-- the engine side just works.
 local TR_COMMAND_ALIASES = {
   setMode = {"trSetMachine", "trSetMode"},
   setSampleSlot = {"trSampleSlot", "trSetSampleSlot"},
@@ -601,10 +735,24 @@ local TR_COMMAND_ALIASES = {
   play = {"trPlay"},
   -- Engine names the per-track reverse command trReverse (not trSetReverse,
   -- which the mechanical fallback would guess from the spec's "setReverse").
-  setReverse = {"trReverse", "trSetReverse"}
+  setReverse = {"trReverse", "trSetReverse"},
+  -- Same shape: the engine has one \trPlayhead, but the facade calls it under
+  -- both "playhead" and "setPlayhead".
+  setPlayhead = {"trPlayhead", "trSetPlayhead"},
+  -- Phase 2 signal chain: contract name first, older/alternate spelling second.
+  filterMachine = {"trFilterMachine", "trSetFilterMachine"},
+  fxInsertMachine = {"trFxInsertMachine", "trSetInsertMachine"},
+  delayBeats = {"trDelayBeats", "trDelayTime"},
+  lfo1Beats = {"trLfo1Beats", "trLfo1Speed"},
+  lfo2Beats = {"trLfo2Beats", "trLfo2Speed"},
+  sendTap = {"trSendTap", "trSetSendTap"},
+  envMode = {"trEnvMode", "trSetEnvMode"},
+  portamento = {"trPortamento", "trSetPortamento"},
+  modeSwitchFade = {"trModeSwitchFade", "trSetModeSwitchFade"},
+  amp = {"trAmp", "trSetAmp"},
+  pan = {"trPan", "trSetPan"}
 }
 local tr_warned = {}
-local track_prefix = "elasticat_"
 
 local function tr_command_name(name)
   local candidates = TR_COMMAND_ALIASES[name]
@@ -636,8 +784,88 @@ local function tr_call(track, name, ...)
 end
 elasticat.tr_call = tr_call
 
+-- GLOBAL engine commands only -- the ~15 that genuinely have no track
+-- (activeTrackCount, the sample pool, master/send-bus FX, stopAndReset,
+-- targetBpm, requestStatus, reset, setDebug, the engine-wide slice settings).
+--
+-- There used to be a per-track FALLBACK here: an un-prefixed name that existed
+-- only as a tr* command was routed to the SELECTED track. It was added to fix a
+-- real no-audio bug (Phase 2 deleted the un-prefixed per-track commands while
+-- ~30 track-1 call sites still used them, including `play` and `loopStart`),
+-- but it made call-site INTENT invisible -- an un-prefixed `play` could not be
+-- read as either "track 1" or "the selection" -- and it caused its own
+-- transport bug: set_engine_play meant "track 1" and was silently retargeted,
+-- so starting playback with track 2 selected never started track 1.
+--
+-- Every per-track call site now names its track (tr_call / tr_queue / the SPEC
+-- actions), so the fallback is gone. A name that reaches here and is not a
+-- global engine command is a BUG at the call site, and now says so.
+engine_call = function(name, ...)
+  if engine[name] ~= nil then
+    engine[name](...)
+    return
+  end
+  if not tr_warned["g:" .. name] then
+    tr_warned["g:" .. name] = true
+    local hint = tr_command_name(name)
+    print("elasticat: engine command missing: " .. name
+      .. (hint ~= nil
+        and (" -- it is PER TRACK (" .. hint .. "); the call site must name a track")
+        or ""))
+  end
+end
+
+-- Track 1's engine loop points, re-mapped through its trim/range layers.
+-- Deliberately BELOW tr_call: a Lua local is only in scope for code that
+-- follows its declaration, and this used to sit ~450 lines higher where a bare
+-- `tr_call` would have silently read a nil GLOBAL. Explicit track 1 (not
+-- engine_track): these are the hand-registered track-1 loop params -- tracks
+-- 2-8 edit their own SPEC-registered ids.
+local function update_engine_loop_points()
+  elasticat.push_loop_points(1)
+end
+
+-- Re-map and push ONE track's loop points. Both endpoints go together because
+-- Range changes the mapping of both, and a start-only push would leave the end
+-- addressing the old window.
+--
+-- `queued` routes through the 12Hz coalescing queue -- used when the re-map is
+-- driven by a rapidly-scrubbed control (Range), so per-detent edits do not
+-- flood the engine.
+elasticat.push_loop_points = function(track, queued)
+  track = track or engine_track
+  local sid = elasticat.track_pid(track, "loop_start")
+  local eid = elasticat.track_pid(track, "loop_end")
+  if not elasticat.param_exists(sid) or not elasticat.param_exists(eid) then
+    return
+  end
+  local lo = map_trim_point(params:get(sid), track)
+  local hi = map_trim_point(params:get(eid), track)
+  if queued then
+    elasticat.tr_queue(sid, track, "loopStart", lo)
+    elasticat.tr_queue(eid, track, "loopEnd", hi)
+  else
+    tr_call(track, "loopStart", lo)
+    tr_call(track, "loopEnd", hi)
+  end
+end
+
+-- The immediate dispatcher params_spec hands every non-queued param action.
+-- (key, track, cmd, ...) mirrors tr_queue below so the two are interchangeable.
+elasticat.tr_now = function(_, track, cmd, ...)
+  tr_call(track, cmd, ...)
+end
+
 function elasticat.set_engine_track(track)
-  engine_track = util.clamp(math.floor((tonumber(track) or 1) + 0.5), 1, ParamsSpec.TRACK_COUNT_MAX)
+  local next_track = util.clamp(math.floor((tonumber(track) or 1) + 0.5), 1, ParamsSpec.TRACK_COUNT_MAX)
+  if next_track ~= engine_track then
+    -- The live mod/filter-env feeds are the SELECTED track's only; drop the
+    -- old track's last frame so the UI can't paint it onto the new one during
+    -- the ~15Hz gap before the new track reports.
+    mod_live.pitch, mod_live.cutoff, mod_live.res, mod_live.amp, mod_live.pan = 0, 0, 0, 0, 0
+    filter_env_semitones = 0
+  end
+  engine_track = next_track
 end
 
 function elasticat.engine_track()
@@ -656,8 +884,8 @@ end
 -- Read a per-track param by bare suffix (track 1 = the unprefixed id). nil if
 -- the param does not exist (e.g. a suffix outside the Phase 1 per-track set).
 function elasticat.track_param_value(track, suffix)
-  local pid = ParamsSpec.track_id(track, suffix, track_prefix)
-  if params:lookup_param(pid) == nil then
+  local pid = elasticat.track_pid(track, suffix)
+  if not elasticat.param_exists(pid) then
     return nil
   end
   return params:get(pid)
@@ -680,38 +908,10 @@ function elasticat.track_muted(track)
   return params:lookup_param(pid) ~= nil and params:get(pid) == 1
 end
 
--- A background (non-selected) track's step fired: push its p-locked pitch and
--- region to that track's chain. Phase 1 scope -- the per-track chain has no
--- amp envelope yet, so sequencing a background track means region/pitch moves
--- on its continuously-running reader (trNoteOn is sent guarded for when the
--- engine grows per-track envelopes).
-function elasticat.track_step(track, record)
-  if record == nil then
-    return
-  end
-  local locks = record.param_locks or {}
-  local pitch = record.pitch or locks.pitch
-  if pitch ~= nil then
-    tr_call(track, "setPitch", pitch)
-  end
-  if locks.loop_start ~= nil or locks.loop_end ~= nil then
-    local start_point = locks.loop_start or elasticat.track_param_value(track, "loop_start") or 0
-    local end_point = locks.loop_end or elasticat.track_param_value(track, "loop_end") or 128
-    if end_point <= start_point then
-      end_point = math.min(start_point + 0.01, 128)
-    end
-    tr_call(track, "loopStart", start_point)
-    tr_call(track, "loopEnd", end_point)
-    local jump = locks.trig_jump
-    if jump == nil then
-      jump = elasticat.track_param_value(track, "trig_jump")
-    end
-    if jump == nil or jump == 1 then
-      tr_call(track, "playhead", 0)
-    end
-  end
-  tr_call(track, "noteOn", 0.1)
-end
+-- elasticat.track_step DELETED (Phase 2 per-track sequencers). It was the
+-- background-track step stub -- pitch, loop locks, a bare noteOn -- and the
+-- reason a deselected track went quiet. Every track now runs the SAME
+-- enter_position routine on its own TrackSequencer instance.
 
 -- Push every per-track param (tracks 2-8) + the active count + mutes to the
 -- engine on init -- same reasoning as sync_amp_env: actions are set after
@@ -723,16 +923,36 @@ function elasticat.sync_tracks()
   end
   engine_call("activeTrackCount", elasticat.active_track_count())
   tr_call(1, "mute", elasticat.track_muted(1) and 1 or 0)
-  for track = 2, ParamsSpec.TRACK_COUNT_MAX do
+  -- Push through sync_entry -> ParamsSpec.entry_action: the EXACT transform and
+  -- argument shape the param's own action uses.
+  --
+  -- This used to call tr_call(track, entry.cmd, raw_value) directly, which
+  -- silently dropped two things entry_action does:
+  --   * `xform` -- so `amp` sent its raw 0-127 param value where the engine
+  --     wants 0-1. A track synced at amp 100 came up ~127x too loud.
+  --   * `args`  -- so an INDEXED command lost its indices: macro depth sent
+  --     trMacroDepth(track, 64) instead of (track, macro, dest, value). The
+  --     engine read 64 as the macro index and got nil for the rest, which is
+  --     the DoesNotUnderstand storm seen on the device.
+  -- A bulk sync must never re-implement a param action; it must reuse it.
+  -- Only the tracks that actually have an engine chain: an inactive track owns
+  -- no synths, so pushing to it is pure waste (7/8 of ~1000 sends at the
+  -- default count of 1). Raising the count re-runs this, which is what gives a
+  -- newly activated track its parameters -- without that, activating track 2
+  -- allocated a chain that had never been told its sample, amp, or region, and
+  -- it stayed silent until some unrelated edit happened to push one.
+  for track = 1, elasticat.active_track_count() do
     for _, entry in ipairs(ParamsSpec.SPEC) do
       if entry.cmd ~= nil then
-        local value = elasticat.track_param_value(track, entry.suffix)
-        if value ~= nil then
-          tr_call(track, entry.cmd, entry.offset ~= nil and (value + entry.offset) or value)
-        end
+        elasticat.sync_entry(track, entry)
       end
     end
   end
+  -- ...and the pool metadata of the slot each track binds. That is NOT in the
+  -- SPEC (it belongs to the sample, not the track), so without this a newly
+  -- activated track kept the engine's default 16 sampleSteps and free-ran at
+  -- the wrong rate for its own sample.
+  elasticat.sync_track_slot_metadata()
 end
 
 local function notify_pool_change(kind, slot, path)
@@ -778,17 +998,34 @@ local function load_sample_slot(slot, path)
   end
 end
 
--- Push the *active* slot's pool metadata (bpm/steps/trim/gain) to the engine.
--- Called when the active/playback slot changes, or when its own metadata is
--- edited. Does not touch the display params -- those follow the file-edit slot.
-local function push_engine_slot_metadata(slot)
-  slot = sample_slot_number(slot)
+-- Push the pool metadata of the slot a track PLAYS (source BPM + steps) to that
+-- track's chain. The engine derives each track's loopBeats from its own
+-- sampleSteps, so a track never told its slot's step count free-runs at the
+-- default 16 -- i.e. at the wrong rate for its sample. track = nil means every
+-- active track, each from its own slot.
+elasticat.sync_track_slot_metadata = function(track)
+  if track == nil then
+    for t = 1, elasticat.active_track_count() do
+      elasticat.sync_track_slot_metadata(t)
+    end
+    return
+  end
+  local slot = elasticat.track_slot(track)
   if sample_pool.bpms[slot] ~= nil then
-    engine_call("sourceBpm", sample_pool.bpms[slot])
+    tr_call(track, "sourceBpm", sample_pool.bpms[slot])
   end
   if sample_pool.steps[slot] ~= nil then
-    engine_call("setSampleSteps", sample_pool.steps[slot])
+    tr_call(track, "setSampleSteps", sample_pool.steps[slot])
   end
+end
+
+-- Push pool metadata (bpm/steps/gain) + the mapped loop points to the engine.
+-- Called when the active/playback slot changes, or when its own metadata is
+-- edited. Does not touch the display params -- those follow the file-edit slot.
+-- `slot` is retained for call-site readability; each track resolves its OWN
+-- slot, so a pool edit reaches whichever tracks are actually playing it.
+local function push_engine_slot_metadata(_slot)
+  elasticat.sync_track_slot_metadata()
   send_effective_amp()
   update_engine_loop_points()
 end
@@ -844,8 +1081,11 @@ local function set_active_pool_slot(slot)
     end
   end
 
+  -- Track 1's playback slot, named explicitly: this is the hand-registered
+  -- track-1 `sample_slot` param: tracks 2-8 bind their slot through their own
+  -- SPEC-registered id.
   if slot == 0 then
-    engine_call("setSampleSlot", 0)
+    tr_call(1, "setSampleSlot", 0)
     if not suppress_pool_callback and pool_options.on_sample_slot ~= nil then
       pool_options.on_sample_slot(0, nil)
     end
@@ -855,7 +1095,7 @@ local function set_active_pool_slot(slot)
   -- Push the active slot's metadata to the engine (not the display params, which
   -- follow the file-edit slot).
   push_engine_slot_metadata(slot)
-  engine_call("setSampleSlot", slot)
+  tr_call(1, "setSampleSlot", slot)
 
   if not suppress_pool_callback and pool_options.on_sample_slot ~= nil then
     pool_options.on_sample_slot(slot, sample_pool.paths[slot])
@@ -909,65 +1149,89 @@ local function queue_engine_call(key, name, ...)
   end)
 end
 
--- Re-send the envelope times to the engine (used when env_range changes the
+-- The coalescing (12Hz) dispatcher params_spec hands every `queue = true` param
+-- action -- the per-track twin of queue_engine_call, keyed on the param id so a
+-- fast encoder sweep collapses to one send per param per tick.
+elasticat.tr_queue = function(key, track, cmd, ...)
+  local args = {...}
+  local argc = select("#", ...)
+  queue_engine_send(key, function()
+    tr_call(track, cmd, unpack(args, 1, argc))
+  end)
+end
+
+-- Re-send ONE track's envelope times (used when its env_range changes the
 -- seconds mapping); guarded so it is a no-op before the params exist.
-resend_env_times = function()
-  if ids.env_attack == nil or params:lookup_param(ids.env_attack) == nil then
-    return
+resend_env_times = function(track)
+  track = track or 1
+  local function resend(suffix, cmd)
+    local pid = elasticat.track_pid(track, suffix)
+    if elasticat.param_exists(pid) then
+      elasticat.tr_queue(pid, track, cmd, env_value_to_seconds(params:get(pid), track))
+    end
   end
-  queue_engine_call(ids.env_attack, "envAttack", env_value_to_seconds(params:get(ids.env_attack)))
-  queue_engine_call(ids.env_decay, "envDecay", env_value_to_seconds(params:get(ids.env_decay)))
-  queue_engine_call(ids.env_release, "envRelease", env_value_to_seconds(params:get(ids.env_release)))
-  queue_engine_call(ids.env_hold, "envHold", env_value_to_seconds(params:get(ids.env_hold)))
+  resend("env_attack", "envAttack")
+  resend("env_decay", "envDecay")
+  resend("env_release", "envRelease")
+  resend("env_hold", "envHold")
 end
 
 -- The filter envelope shares the amp's seconds mapping (env_range), so a range
 -- change must re-send the filter env times too.
-resend_filter_env_times = function()
-  if ids.filter_env_attack == nil or params:lookup_param(ids.filter_env_attack) == nil then
-    return
+resend_filter_env_times = function(track)
+  track = track or 1
+  local function resend(suffix, cmd)
+    local pid = elasticat.track_pid(track, suffix)
+    if elasticat.param_exists(pid) then
+      elasticat.tr_queue(pid, track, cmd, env_value_to_seconds(params:get(pid), track))
+    end
   end
-  queue_engine_call(ids.filter_env_attack, "filterEnvAttack", env_value_to_seconds(params:get(ids.filter_env_attack)))
-  queue_engine_call(ids.filter_env_decay, "filterEnvDecay", env_value_to_seconds(params:get(ids.filter_env_decay)))
-  queue_engine_call(ids.filter_env_release, "filterEnvRelease", env_value_to_seconds(params:get(ids.filter_env_release)))
-  queue_engine_call(ids.filter_env_hold, "filterEnvHold", env_value_to_seconds(params:get(ids.filter_env_hold)))
+  resend("filter_env_attack", "filterEnvAttack")
+  resend("filter_env_decay", "filterEnvDecay")
+  resend("filter_env_release", "filterEnvRelease")
+  resend("filter_env_hold", "filterEnvHold")
 end
 
 -- The mod envelope's ATK/DEC also share the amp env's seconds mapping.
-resend_menv_times = function()
-  if ids.menv_attack == nil or params:lookup_param(ids.menv_attack) == nil then
-    return
+resend_menv_times = function(track)
+  track = track or 1
+  local function resend(suffix, cmd)
+    local pid = elasticat.track_pid(track, suffix)
+    if elasticat.param_exists(pid) then
+      elasticat.tr_queue(pid, track, cmd, env_value_to_seconds(params:get(pid), track))
+    end
   end
-  queue_engine_call(ids.menv_attack, "menvAttack", env_value_to_seconds(params:get(ids.menv_attack)))
-  queue_engine_call(ids.menv_decay, "menvDecay", env_value_to_seconds(params:get(ids.menv_decay)))
-  queue_engine_call(ids.menv_release, "menvRelease", env_value_to_seconds(params:get(ids.menv_release)))
+  resend("menv_attack", "menvAttack")
+  resend("menv_decay", "menvDecay")
+  resend("menv_release", "menvRelease")
 end
 
 -- Coalesced (12Hz) version of update_engine_loop_points -- used when re-mapping
 -- the loop points from a rapidly-scrubbed control (Range) during playback, so
 -- per-detent edits don't flood the engine with immediate sends and feel laggy.
 local function queue_engine_loop_points()
-  if ids.loop_start == nil or ids.loop_end == nil then
-    return
-  end
-  local start_point = params:lookup_param(ids.loop_start) ~= nil and params:get(ids.loop_start) or 0
-  local end_point = params:lookup_param(ids.loop_end) ~= nil and params:get(ids.loop_end) or 128
-  queue_engine_call(ids.loop_start, "loopStart", map_trim_point(start_point))
-  queue_engine_call(ids.loop_end, "loopEnd", map_trim_point(end_point))
+  elasticat.push_loop_points(1, true)
 end
 
--- The engine only has one gain input (setAmp); the per-sample "gain" param
--- is a script-side multiplier on top of the track/master amp param, so both
--- combine into that single engine send instead of needing a second engine
--- parameter.
-send_effective_amp = function()
-  if ids.amp == nil or params:lookup_param(ids.amp) == nil then
+-- Each track has one gain input (\trAmp); the per-sample "gain" param is a
+-- script-side multiplier on top of the track's Volume, so both combine into
+-- that single engine send instead of needing a second engine parameter. Same
+-- arithmetic as the "amp" xform -- this is the path taken when the SAMPLE gain
+-- moved rather than the Volume param. track = nil means every active track
+-- (a pool gain edit can affect any track playing that slot).
+send_effective_amp = function(track)
+  if track == nil then
+    for t = 1, elasticat.active_track_count() do
+      send_effective_amp(t)
+    end
+    return
+  end
+  local pid = elasticat.track_pid(track, "amp")
+  if not elasticat.param_exists(pid) then
     return
   end
   -- Track Volume is an Elektron-style 0-127 param; map to a 0..1 amplitude.
-  local base = params:get(ids.amp) / 127
-  local gain = sample_pool.gains[active_sample_slot] or 1
-  queue_engine_call(ids.amp, "setAmp", base * gain)
+  elasticat.tr_queue(pid, track, "amp", (params:get(pid) / 127) * elasticat.track_gain(track))
 end
 
 flush_engine_sends = function()
@@ -992,13 +1256,18 @@ local function reset_clock_origin()
   clock_sequence = 0
 end
 
+-- Track 1 transport. EXPLICITLY tr_call(1, ...) rather than engine_call: the
+-- engine_call fallback routes an orphaned per-track command to the SELECTED
+-- track, so with track 2 selected this started track 2 (twice, via
+-- elasticat.play below) and never started track 1 at all. That is a transport
+-- decision leaking out of an id-resolution helper.
 local function set_engine_play(x)
   print("elasticat: params/play action " .. tostring(x))
   if x == 1 and ids.clock_sync ~= nil and params:get(ids.clock_sync) == 1 then
-    reset_clock_origin()
-    engine_call("setPlayhead", 0)
+    reset_clock_origin()   -- global beat origin: once, not per track
+    tr_call(1, "setPlayhead", 0)
   end
-  engine_call("play", x)
+  tr_call(1, "play", x)
 end
 
 local function send_clock_observation()
@@ -1072,29 +1341,35 @@ end
 -- machine_is_continuous() gating in the coordinator. Without all_tracks this is
 -- a single-track gesture (previews, grid holds) addressed to the selected
 -- engine track: track 1 keeps the exact existing path.
+-- Transport is GLOBAL. Play starts every active track, whichever one happens
+-- to be selected: selection is an EDITING focus, not a transport scope.
+--
+-- This used to return early when a track above 1 was selected, playing ONLY
+-- that track -- so selecting track 2 and pressing play silenced track 1, while
+-- selecting track 1 played both. `all_tracks` is kept for the callers that
+-- pass it, but it no longer changes what happens.
 function elasticat.play(state, all_tracks)
-  if engine_track > 1 and not all_tracks then
-    tr_call(engine_track, "play", state and 1 or 0)
-    return
-  end
   set_engine_play(state and 1 or 0)
-  if all_tracks then
-    for track = 2, elasticat.active_track_count() do
-      local machine = elasticat.track_param_value(track, "machine") or 1
-      tr_call(track, "play", (state and machine == 1) and 1 or 0)
-    end
+  for track = 2, elasticat.active_track_count() do
+    -- Only continuous (loop) machines run a free-running reader; slice
+    -- machines sound from their own triggers, so play must not force them on.
+    local machine = elasticat.track_param_value(track, "machine") or 1
+    tr_call(track, "play", (state and machine == 1) and 1 or 0)
   end
 end
 
 function elasticat.stop_reset()
   flush_engine_sends()
+  -- stopAndReset/stop are genuinely global engine commands; play/playhead are
+  -- per track and must name track 1 explicitly (see set_engine_play) or they
+  -- stop whichever track happens to be selected.
   if engine.stopAndReset ~= nil then
     engine_call("stopAndReset")
   elseif engine.stop ~= nil then
     engine_call("stop")
   else
-    engine_call("play", 0)
-    engine_call("playhead", 0)
+    tr_call(1, "play", 0)
+    tr_call(1, "playhead", 0)
   end
   for track = 2, elasticat.active_track_count() do
     tr_call(track, "play", 0)
@@ -1106,45 +1381,34 @@ function elasticat.request_status()
   engine_call("requestStatus")
 end
 
-function elasticat.set_pitch(value)
-  if engine_track > 1 then
-    tr_call(engine_track, "setPitch", value)
-    return
-  end
-  engine_call("setPitch", value)
+-- ---- Live voice/region gestures, per track ---------------------------------
+-- Every one of these takes an explicit `track`, defaulting to engine_track (the
+-- selected track) so existing callers are unchanged. There is ONE path: the
+-- track index is an argument, never a branch. They all used to be
+-- `if engine_track > 1 then tr_call(...) else engine_call(...) end`, and the
+-- tracks-2-8 half skipped map_trim_point entirely -- which is exactly why a
+-- background track's region locks addressed raw file positions.
+
+function elasticat.set_pitch(value, track)
+  tr_call(track or engine_track, "setPitch", value)
 end
 
-function elasticat.set_reverse(reverse)
-  local flag = (reverse == true or reverse == 1) and 1 or 0
-  if engine_track > 1 then
-    tr_call(engine_track, "setReverse", flag)
-    return
-  end
-  engine_call("setReverse", flag)
+function elasticat.set_reverse(reverse, track)
+  tr_call(track or engine_track, "setReverse",
+    (reverse == true or reverse == 1) and 1 or 0)
 end
 
-function elasticat.trigger_slice(slice_index, start_point, end_point, play_mode, reverse, velocity, length_seconds, pitch_value)
-  local reverse_flag = (reverse == true or reverse == 1) and 1 or 0
-  if engine_track > 1 then
-    -- Phase 1: tracks 2-8 send raw 0-128 points (their file-trim/range mapping
-    -- lands with the per-track chain work; the pool metadata funnel below is
-    -- track 1's).
-    tr_call(engine_track, "triggerSlice", slice_index,
-      util.clamp(start_point or 0, 0, 128), util.clamp(end_point or 128, 0, 128),
-      play_mode, reverse_flag, velocity or 1, length_seconds or 0, pitch_value or 0)
-    return
-  end
-  engine_call(
-    "triggerSlice",
+function elasticat.trigger_slice(slice_index, start_point, end_point, play_mode, reverse, velocity, length_seconds, pitch_value, track)
+  track = track or engine_track
+  tr_call(track, "triggerSlice",
     slice_index,
-    map_trim_point(start_point),
-    map_trim_point(end_point),
+    map_trim_point(start_point, track),
+    map_trim_point(end_point, track),
     play_mode,
-    reverse_flag,
+    (reverse == true or reverse == 1) and 1 or 0,
     velocity or 1,
     length_seconds or 0,
-    pitch_value or 0
-  )
+    pitch_value or 0)
 end
 
 -- Retrigger the amp envelope on the active reader with the given note length
@@ -1154,250 +1418,254 @@ end
 -- it, instead of auto-releasing after a timer -- for a live-held note (e.g. a
 -- grid key held down) whose duration isn't known up front. Omitting `seconds`
 -- keeps today's default one-shot length (0.1s), unchanged.
-function elasticat.note_on(seconds)
-  if engine_track > 1 then
-    tr_call(engine_track, "noteOn", seconds or 0.1)
-    return
-  end
-  engine_call("noteOn", seconds or 0.1)
+function elasticat.note_on(seconds, track)
+  tr_call(track or engine_track, "noteOn", seconds or 0.1)
 end
 
 -- Close the currently-sounding note's ADSR gate now (release stage), for a
 -- live-held note started via elasticat.note_on(0) (or any seconds <= 0).
 -- Sent immediately, same as note_on -- envelope timing is tight. No-op (just
 -- a redundant reset edge) if nothing is currently held open.
-function elasticat.note_off()
-  if engine_track > 1 then
-    tr_call(engine_track, "noteOff")
-    return
-  end
-  engine_call("noteOff")
+function elasticat.note_off(track)
+  tr_call(track or engine_track, "noteOff")
 end
 
 -- Force a fresh amp/filter re-attack for auditioning a stopped step preview.
 -- Unlike note_on, this re-attacks even under portamento (whose legato hold
 -- otherwise swallows a note-on on a still-sounding preview note). seconds <= 0
 -- keeps the indefinite hold used by the sustained preview.
-function elasticat.retrig_note(seconds)
-  if engine_track > 1 then
-    tr_call(engine_track, "retrigNote", seconds or 0)
-    return
-  end
-  engine_call("retrigNote", seconds or 0)
+function elasticat.retrig_note(seconds, track)
+  tr_call(track or engine_track, "retrigNote", seconds or 0)
 end
 
--- Push the amp-envelope + pan/vol params to the engine. Needed on init because
--- these params are added with their action set afterwards (so their defaults
--- never fire) and aren't in older psets, leaving the engine on stale defaults.
-function elasticat.sync_amp_env()
-  if ids.env_mode == nil or params:lookup_param(ids.env_mode) == nil then
+-- ---- Per-track engine sync -------------------------------------------------
+-- Params are added with their action set afterwards (so their defaults never
+-- fire) and older psets lack the newer ids entirely, which leaves the engine
+-- on stale defaults until something pushes the current values. These sync
+-- helpers do that -- and they drive the params through params_spec.entry_action,
+-- i.e. the EXACT transform + engine command the param action itself uses, so a
+-- sync can never drift from an edit.
+--
+-- track = nil means "every allocated track" (what init wants); an explicit
+-- track syncs just that one.
+
+-- Immediate variant of the SPEC dispatch: init ordering matters (machines are
+-- re-selected last so their respawn seeds from the values just sent), so sync
+-- bypasses the 12Hz coalescing queue that live edits use.
+elasticat.sync_deps = {
+  xforms = elasticat.param_xforms,
+  tr_now = elasticat.tr_now,
+  tr_queue = elasticat.tr_now
+}
+
+elasticat.sync_entry = function(track, entry)
+  if entry == nil then
     return
   end
-  engine_call("setEnvMode", (params:get(ids.env_mode) or 2) - 1)
-  engine_call("envAttack", env_value_to_seconds(params:get(ids.env_attack)))
-  engine_call("envDecay", env_value_to_seconds(params:get(ids.env_decay)))
-  engine_call("envSustain", util.clamp((params:get(ids.env_sustain) or 100) / 127, 0, 1))
-  engine_call("envRelease", env_value_to_seconds(params:get(ids.env_release)))
-  engine_call("envHold", env_value_to_seconds(params:get(ids.env_hold)))
-  engine_call("setPortamento", params:get(ids.portamento) or 0)
-  send_effective_amp()
-  if ids.pan ~= nil then
-    engine_call("setPan", ((params:get(ids.pan) or 64) - 64) / 64)
+  local pid = elasticat.track_pid(track, entry.suffix)
+  if not elasticat.param_exists(pid) then
+    return
+  end
+  ParamsSpec.entry_action(elasticat.sync_deps, track, entry, pid)(params:get(pid))
+end
+
+elasticat.sync_entries = function(track, suffixes)
+  for _, suffix in ipairs(suffixes) do
+    elasticat.sync_entry(track, ParamsSpec.BY_SUFFIX[suffix])
   end
 end
 
--- Push the filter params to the engine on init (same reasoning as sync_amp_env:
--- actions are set after add, so defaults never fire, and old psets lack them).
--- Params are sent first, then the machine is (re)selected last so its respawn
--- seeds from the now-current engine-side values.
-function elasticat.sync_filter()
-  if ids.filter_machine == nil or params:lookup_param(ids.filter_machine) == nil then
-    return
-  end
-  engine_call("filterType", (params:get(ids.filter_type) or 1) - 1)
-  engine_call("filterCutoff", filter_cutoff_hz(params:get(ids.filter_cutoff)))
-  engine_call("filterRes", util.clamp((params:get(ids.filter_res) or 0) / 127, 0, 1))
-  engine_call("filterDrive", util.clamp((params:get(ids.filter_drive) or 0) / 127, 0, 1))
-  engine_call("filterMorph", util.clamp((params:get(ids.filter_morph) or 64) / 128, 0, 1))
-  engine_call("filterBalance", ((params:get(ids.filter_balance) or 64) - 64) / 64)
-  engine_call("filterEnvMode", (params:get(ids.filter_env_mode) or 2) - 1)
-  engine_call("filterEnvAttack", env_value_to_seconds(params:get(ids.filter_env_attack)))
-  engine_call("filterEnvDecay", env_value_to_seconds(params:get(ids.filter_env_decay)))
-  engine_call("filterEnvSustain", util.clamp((params:get(ids.filter_env_sustain) or 100) / 127, 0, 1))
-  engine_call("filterEnvRelease", env_value_to_seconds(params:get(ids.filter_env_release)))
-  engine_call("filterEnvHold", env_value_to_seconds(params:get(ids.filter_env_hold)))
-  engine_call("filterEnvDepth", ((params:get(ids.filter_env_depth) or 64) - 64) / 64)
-  engine_call("setFilterMachine", (params:get(ids.filter_machine) or 1) - 1)
-end
-
--- Push the Insert 1 FX params to the engine on init (same reasoning as
--- sync_filter). Params are sent first, then the machine is (re)selected last so
--- its respawn seeds from the now-current engine-side values.
-function elasticat.sync_fx()
-  if ids.fx_insert1_machine == nil or params:lookup_param(ids.fx_insert1_machine) == nil then
-    return
-  end
-  engine_call("fxDrive", util.clamp((params:get(ids.fx_drive) or 0) / 127, 0, 1))
-  engine_call("fxMix", util.clamp((params:get(ids.fx_mix) or 64) / 127, 0, 1))
-  engine_call("delayTime", DELAY_TIME_BEATS[params:get(ids.delay_time) or 4] or 1)
-  engine_call("delayFeedback", util.clamp((params:get(ids.delay_feedback) or 38) / 127, 0, 1))
-  engine_call("delayTone", util.clamp((params:get(ids.delay_tone) or 127) / 127, 0, 1))
-  engine_call("reverbSize", util.clamp((params:get(ids.reverb_size) or 64) / 127, 0, 1))
-  engine_call("reverbDamp", util.clamp((params:get(ids.reverb_damp) or 64) / 127, 0, 1))
-  engine_call("lofiBits", lofi_bits_depth(params:get(ids.lofi_bits) or 127))
-  engine_call("lofiRate", lofi_rate_hz(params:get(ids.lofi_rate) or 127))
-  engine_call("setInsertMachine", (params:get(ids.fx_insert1_machine) or 1) - 1)
-
-  -- Send 1/2 + Master insert (PRD §3/§8): same reasoning, seeded after Insert 1
-  -- above. Guarded independently since a psets saved before this landed won't
-  -- have these ids yet.
-  if ids.send1_machine == nil or params:lookup_param(ids.send1_machine) == nil then
-    return
-  end
-  engine_call("setSendTap", (params:get(ids.send_tap) or 1) - 1)
-  engine_call("sendLevel1", util.clamp((params:get(ids.send1_level) or 0) / 127, 0, 1))
-  engine_call("sendLevel2", util.clamp((params:get(ids.send2_level) or 0) / 127, 0, 1))
-
-  engine_call("send1FxDrive", util.clamp((params:get(ids.send1_fx_drive) or 0) / 127, 0, 1))
-  engine_call("send1FxMix", util.clamp((params:get(ids.send1_fx_mix) or 64) / 127, 0, 1))
-  engine_call("send1DelayTime", DELAY_TIME_BEATS[params:get(ids.send1_delay_time) or 4] or 1)
-  engine_call("send1DelayFeedback", util.clamp((params:get(ids.send1_delay_feedback) or 38) / 127, 0, 1))
-  engine_call("send1DelayTone", util.clamp((params:get(ids.send1_delay_tone) or 127) / 127, 0, 1))
-  engine_call("send1ReverbSize", util.clamp((params:get(ids.send1_reverb_size) or 64) / 127, 0, 1))
-  engine_call("send1ReverbDamp", util.clamp((params:get(ids.send1_reverb_damp) or 64) / 127, 0, 1))
-  engine_call("send1LofiBits", lofi_bits_depth(params:get(ids.send1_lofi_bits) or 127))
-  engine_call("send1LofiRate", lofi_rate_hz(params:get(ids.send1_lofi_rate) or 127))
-  engine_call("setSend1Machine", (params:get(ids.send1_machine) or 1) - 1)
-
-  engine_call("send2FxDrive", util.clamp((params:get(ids.send2_fx_drive) or 0) / 127, 0, 1))
-  engine_call("send2FxMix", util.clamp((params:get(ids.send2_fx_mix) or 64) / 127, 0, 1))
-  engine_call("send2DelayTime", DELAY_TIME_BEATS[params:get(ids.send2_delay_time) or 4] or 1)
-  engine_call("send2DelayFeedback", util.clamp((params:get(ids.send2_delay_feedback) or 38) / 127, 0, 1))
-  engine_call("send2DelayTone", util.clamp((params:get(ids.send2_delay_tone) or 127) / 127, 0, 1))
-  engine_call("send2ReverbSize", util.clamp((params:get(ids.send2_reverb_size) or 64) / 127, 0, 1))
-  engine_call("send2ReverbDamp", util.clamp((params:get(ids.send2_reverb_damp) or 64) / 127, 0, 1))
-  engine_call("send2LofiBits", lofi_bits_depth(params:get(ids.send2_lofi_bits) or 127))
-  engine_call("send2LofiRate", lofi_rate_hz(params:get(ids.send2_lofi_rate) or 127))
-  engine_call("setSend2Machine", (params:get(ids.send2_machine) or 1) - 1)
-
-  engine_call("masterFxDrive", util.clamp((params:get(ids.master_fx_drive) or 0) / 127, 0, 1))
-  engine_call("masterFxMix", util.clamp((params:get(ids.master_fx_mix) or 64) / 127, 0, 1))
-  engine_call("masterDelayTime", DELAY_TIME_BEATS[params:get(ids.master_delay_time) or 4] or 1)
-  engine_call("masterDelayFeedback", util.clamp((params:get(ids.master_delay_feedback) or 38) / 127, 0, 1))
-  engine_call("masterDelayTone", util.clamp((params:get(ids.master_delay_tone) or 127) / 127, 0, 1))
-  engine_call("masterReverbSize", util.clamp((params:get(ids.master_reverb_size) or 64) / 127, 0, 1))
-  engine_call("masterReverbDamp", util.clamp((params:get(ids.master_reverb_damp) or 64) / 127, 0, 1))
-  engine_call("masterLofiBits", lofi_bits_depth(params:get(ids.master_lofi_bits) or 127))
-  engine_call("masterLofiRate", lofi_rate_hz(params:get(ids.master_lofi_rate) or 127))
-  engine_call("setMasterMachine", (params:get(ids.master_fx_machine) or 1) - 1)
-end
-
--- Push the modulation params (2 LFOs + mod env) to the engine on init (same
--- reasoning as sync_filter: actions are set after add, so defaults never fire,
--- and older psets lack these ids entirely).
-function elasticat.sync_mod()
-  if ids.lfo1_dest == nil or params:lookup_param(ids.lfo1_dest) == nil then
-    return
-  end
-  engine_call("lfo1Dest", (params:get(ids.lfo1_dest) or 1) - 1)
-  engine_call("lfo1Wave", (params:get(ids.lfo1_wave) or 1) - 1)
-  engine_call("lfo1Speed", MOD_SPEED_BEATS[params:get(ids.lfo1_speed) or 4] or 4)
-  engine_call("lfo1Depth", ((params:get(ids.lfo1_depth) or 64) - 64) / 64)
-  engine_call("lfo1Mode", (params:get(ids.lfo1_mode) or 1) - 1)
-  engine_call("lfo2Dest", (params:get(ids.lfo2_dest) or 1) - 1)
-  engine_call("lfo2Wave", (params:get(ids.lfo2_wave) or 1) - 1)
-  engine_call("lfo2Speed", MOD_SPEED_BEATS[params:get(ids.lfo2_speed) or 4] or 4)
-  engine_call("lfo2Depth", ((params:get(ids.lfo2_depth) or 64) - 64) / 64)
-  engine_call("lfo2Mode", (params:get(ids.lfo2_mode) or 1) - 1)
-  engine_call("menvDest", (params:get(ids.menv_dest) or 1) - 1)
-  engine_call("menvAttack", env_value_to_seconds(params:get(ids.menv_attack)))
-  engine_call("menvDecay", env_value_to_seconds(params:get(ids.menv_decay)))
-  engine_call("menvSustain", util.clamp((params:get(ids.menv_sustain) or 100) / 127, 0, 1))
-  engine_call("menvRelease", env_value_to_seconds(params:get(ids.menv_release)))
-  engine_call("menvDepth", ((params:get(ids.menv_depth) or 64) - 64) / 64)
-  for m = 1, 4 do
-    engine_call("macroBase", m, (params:get(ids["macro" .. m .. "_value"]) or 0) / 127)
-    for _, dest in ipairs(MACRO_DESTS) do
-      local raw = params:get(ids["macro" .. m .. "_" .. dest.key .. "_depth"]) or 64
-      engine_call("macroDepth", m, dest.index, (raw - 64) / 64)
+-- Amp envelope + portamento + the output stage (vol/pan, which live on the
+-- track FILTER synth engine-side -- that is where the mod matrix applies the
+-- AMP/PAN destinations).
+function elasticat.sync_amp_env(track)
+  if track == nil then
+    for t = 1, elasticat.active_track_count() do
+      elasticat.sync_amp_env(t)
     end
+    return
   end
+  elasticat.sync_entries(track, {
+    "env_mode", "env_attack", "env_decay", "env_sustain", "env_release",
+    "env_hold", "portamento", "amp", "pan"
+  })
+end
+
+-- Filter + filter envelope. The machine is (re)selected LAST so its respawn
+-- seeds from the now-current engine-side values.
+function elasticat.sync_filter(track)
+  if track == nil then
+    for t = 1, elasticat.active_track_count() do
+      elasticat.sync_filter(t)
+    end
+    return
+  end
+  elasticat.sync_entries(track, {
+    "filter_type", "filter_cutoff", "filter_res", "filter_drive",
+    "filter_morph", "filter_balance",
+    "filter_env_mode", "filter_env_attack", "filter_env_decay",
+    "filter_env_sustain", "filter_env_release", "filter_env_hold",
+    "filter_env_depth",
+    "filter_machine"
+  })
+end
+
+-- Insert 1 FX + this track\x27s send levels/tap. Machine last, same reasoning as
+-- sync_filter. The send BUS effects and the master insert are shared by every
+-- track, so they are pushed once by sync_bus_fx below.
+function elasticat.sync_fx(track)
+  if track == nil then
+    for t = 1, elasticat.active_track_count() do
+      elasticat.sync_fx(t)
+    end
+    elasticat.sync_bus_fx()
+    return
+  end
+  elasticat.sync_entries(track, {
+    "fx_drive", "fx_mix", "delay_time", "delay_feedback", "delay_tone",
+    "reverb_size", "reverb_damp", "lofi_bits", "lofi_rate",
+    "fx_insert1_machine",
+    "send_tap", "send1_level", "send2_level"
+  })
+end
+
+-- Send 1/2 bus FX + the master insert (PRD SS3/SS8): GLOBAL, one instance each,
+-- so these keep the un-prefixed engine commands. Guarded independently since a
+-- pset saved before they landed will not have these ids.
+elasticat.sync_bus_fx = function()
+  if ids.send1_machine == nil or not elasticat.param_exists(ids.send1_machine) then
+    return
+  end
+  local function slot(cmd_prefix, slot_ids, machine_id, machine_cmd)
+    engine_call(cmd_prefix .. "FxDrive", util.clamp((params:get(slot_ids.fx_drive) or 0) / 127, 0, 1))
+    engine_call(cmd_prefix .. "FxMix", util.clamp((params:get(slot_ids.fx_mix) or 64) / 127, 0, 1))
+    engine_call(cmd_prefix .. "DelayTime", DELAY_TIME_BEATS[params:get(slot_ids.delay_time) or 4] or 1)
+    engine_call(cmd_prefix .. "DelayFeedback", util.clamp((params:get(slot_ids.delay_feedback) or 38) / 127, 0, 1))
+    engine_call(cmd_prefix .. "DelayTone", util.clamp((params:get(slot_ids.delay_tone) or 127) / 127, 0, 1))
+    engine_call(cmd_prefix .. "ReverbSize", util.clamp((params:get(slot_ids.reverb_size) or 64) / 127, 0, 1))
+    engine_call(cmd_prefix .. "ReverbDamp", util.clamp((params:get(slot_ids.reverb_damp) or 64) / 127, 0, 1))
+    engine_call(cmd_prefix .. "LofiBits", lofi_bits_depth(params:get(slot_ids.lofi_bits) or 127))
+    engine_call(cmd_prefix .. "LofiRate", lofi_rate_hz(params:get(slot_ids.lofi_rate) or 127))
+    engine_call(machine_cmd, (params:get(machine_id) or 1) - 1)
+  end
+
+  slot("send1", {
+    fx_drive = ids.send1_fx_drive, fx_mix = ids.send1_fx_mix,
+    delay_time = ids.send1_delay_time, delay_feedback = ids.send1_delay_feedback,
+    delay_tone = ids.send1_delay_tone, reverb_size = ids.send1_reverb_size,
+    reverb_damp = ids.send1_reverb_damp, lofi_bits = ids.send1_lofi_bits,
+    lofi_rate = ids.send1_lofi_rate
+  }, ids.send1_machine, "setSend1Machine")
+
+  slot("send2", {
+    fx_drive = ids.send2_fx_drive, fx_mix = ids.send2_fx_mix,
+    delay_time = ids.send2_delay_time, delay_feedback = ids.send2_delay_feedback,
+    delay_tone = ids.send2_delay_tone, reverb_size = ids.send2_reverb_size,
+    reverb_damp = ids.send2_reverb_damp, lofi_bits = ids.send2_lofi_bits,
+    lofi_rate = ids.send2_lofi_rate
+  }, ids.send2_machine, "setSend2Machine")
+
+  slot("master", {
+    fx_drive = ids.master_fx_drive, fx_mix = ids.master_fx_mix,
+    delay_time = ids.master_delay_time, delay_feedback = ids.master_delay_feedback,
+    delay_tone = ids.master_delay_tone, reverb_size = ids.master_reverb_size,
+    reverb_damp = ids.master_reverb_damp, lofi_bits = ids.master_lofi_bits,
+    lofi_rate = ids.master_lofi_rate
+  }, ids.master_fx_machine, "setMasterMachine")
+end
+
+-- Modulation: 2 LFOs + mod envelope + the 4 macros (value + 5 matrix depths
+-- each), all on this track\x27s own control-rate mod synth.
+function elasticat.sync_mod(track)
+  if track == nil then
+    for t = 1, elasticat.active_track_count() do
+      elasticat.sync_mod(t)
+    end
+    return
+  end
+  elasticat.sync_entries(track, {
+    "lfo1_dest", "lfo1_wave", "lfo1_speed", "lfo1_depth", "lfo1_mode",
+    "lfo2_dest", "lfo2_wave", "lfo2_speed", "lfo2_depth", "lfo2_mode",
+    "menv_dest", "menv_attack", "menv_decay", "menv_sustain", "menv_release",
+    "menv_depth"
+  })
+  elasticat.sync_entries(track, ParamsSpec.MACRO_SUFFIXES)
 end
 
 -- Set a macro's live value (0-127) -- used by the grid macro keys. Routes
 -- through the param so the value is displayed, saved, and (when a step is
 -- held) p-locked by the normal step-lock path; the param action pushes it to
 -- the engine.
-function elasticat.set_macro_value(index, value)
-  local vid = ids["macro" .. index .. "_value"]
-  if vid ~= nil and params:lookup_param(vid) ~= nil then
+function elasticat.set_macro_value(index, value, track)
+  local vid = elasticat.track_pid(track or engine_track, "macro" .. index .. "_value")
+  if elasticat.param_exists(vid) then
     params:set(vid, util.clamp(value, 0, 127))
   end
 end
 
 -- The macro-matrix depth param id for a macro (1-4) targeting a destination
 -- (a MACRO_DESTS entry), or nil. The coordinator adjusts this param when you
--- hold a macro key and turn the destination's param.
-function elasticat.macro_depth_id(index, dest)
-  return dest ~= nil and ids["macro" .. index .. "_" .. dest.key .. "_depth"] or nil
+-- hold a macro key and turn the destination's param -- on the SELECTED track,
+-- like every other editing gesture.
+function elasticat.macro_depth_id(index, dest, track)
+  if dest == nil then
+    return nil
+  end
+  return elasticat.track_pid(track or engine_track, "macro" .. index .. "_" .. dest.key .. "_depth")
 end
 
 -- Retrigger the modulation sources for a firing step. lfo_on retrigs both
 -- LFOs (only their non-FREE modes react -- the synth gates the trigger by
 -- mode); env_on retrigs the mod envelope. Fired by the sequencer where the
 -- step's lfo_reset / env_reset resolve ON (ghosts resolve both off). Sent
--- immediately, same as note_on -- trigger timing is tight.
-function elasticat.mod_trig(lfo_on, env_on)
+-- immediately, same as note_on -- trigger timing is tight. Every track runs
+-- its own mod synth, so this is a per-track command like the rest of them.
+function elasticat.mod_trig(lfo_on, env_on, track)
   if not lfo_on and not env_on then
     return
   end
-  engine_call("modTrig", lfo_on and 1 or 0, env_on and 1 or 0)
+  tr_call(track or engine_track, "modTrig", lfo_on and 1 or 0, env_on and 1 or 0)
 end
 
-function elasticat.release_slice(slice_index)
-  if engine_track > 1 then
-    tr_call(engine_track, "releaseSlice", slice_index)
-    return
-  end
-  engine_call("releaseSlice", slice_index)
+function elasticat.release_slice(slice_index, track)
+  tr_call(track or engine_track, "releaseSlice", slice_index)
 end
 
-function elasticat.release_all_slices()
-  if engine_track > 1 then
-    tr_call(engine_track, "releaseAllSlices")
-    return
-  end
-  engine_call("releaseAllSlices")
+function elasticat.release_all_slices(track)
+  tr_call(track or engine_track, "releaseAllSlices")
 end
 
-function elasticat.set_loop_region(start_point, end_point, reset_playhead)
-  if engine_track > 1 then
-    -- Phase 1: raw 0-128 points for tracks 2-8 (no per-track trim/range map yet).
-    tr_call(engine_track, "loopStart", util.clamp(start_point or 0, 0, 128))
-    tr_call(engine_track, "loopEnd", util.clamp(end_point or 128, 0, 128))
-    if type(reset_playhead) == "number" then
-      tr_call(engine_track, "playhead", reset_playhead)
-    elseif reset_playhead then
-      tr_call(engine_track, "playhead", 0)
-    end
-    return
-  end
+-- The region a track plays, in TRACK space (0-128), mapped through that track's
+-- Range + File Trim on the way out. `reset_playhead`: nil = leave the playhead
+-- alone, a number = warp to that phase, truthy = warp to 0.
+--
+-- flush_engine_sends() first, for EVERY track, not just the selected one: a
+-- coalesced loopStart/loopEnd still sitting in the 12Hz queue from an encoder
+-- edit would otherwise land AFTER this immediate send and overwrite the step's
+-- region with a stale value.
+function elasticat.set_loop_region(start_point, end_point, reset_playhead, track)
+  track = track or engine_track
   flush_engine_sends()
-  local engine_start = map_trim_point(start_point)
-  local engine_end = map_trim_point(end_point)
-  if reset_playhead ~= nil and engine.loopRegionPlayhead ~= nil then
-    local phase = type(reset_playhead) == "number" and reset_playhead or 0
-    engine_call("loopRegionPlayhead", engine_start, engine_end, phase)
+  local engine_start = map_trim_point(start_point, track)
+  local engine_end = map_trim_point(end_point, track)
+  -- nil = leave the playhead; a number = that phase; any other truthy = 0.
+  -- `false` must mean "leave it" -- `reset_playhead ~= nil` would have warped
+  -- to 0 on an explicit false.
+  local phase = nil
+  if type(reset_playhead) == "number" then
+    phase = reset_playhead
+  elseif reset_playhead then
+    phase = 0
+  end
+  -- One atomic command when the playhead moves too: region and phase land in
+  -- the same message, so the playhead is never reset against the OLD region
+  -- (and it is one OSC message per trig instead of three).
+  if phase ~= nil then
+    tr_call(track, "loopRegionPlayhead", engine_start, engine_end, phase)
     return
   end
-
-  engine_call("loopStart", engine_start)
-  engine_call("loopEnd", engine_end)
-  if type(reset_playhead) == "number" then
-    engine_call("playhead", reset_playhead)
-  elseif reset_playhead then
-    engine_call("playhead", 0)
-  end
+  tr_call(track, "loopStart", engine_start)
+  tr_call(track, "loopEnd", engine_end)
 end
 
 -- Auditions the File-edit slot as a raw looped sample -- native rate, no
@@ -1690,16 +1958,10 @@ function elasticat.params(options)
   ids.trim_start = param_id(prefix, "trim_start")
   ids.trim_end = param_id(prefix, "trim_end")
   ids.gain = param_id(prefix, "gain")
-  ids.amp = param_id(prefix, "amp")
-  ids.loop_division = param_id(prefix, "loop_division")
-  ids.trig_polyphony = param_id(prefix, "trig_polyphony")
-  ids.playhead_return = param_id(prefix, "playhead_return")
   ids.pattern_steps = param_id(prefix, "pattern_steps")
   ids.pattern_quantize = param_id(prefix, "pattern_quantize")
   ids.global_pattern_length = param_id(prefix, "global_pattern_length")
   ids.global_bpm = param_id(prefix, "global_bpm")
-  ids.default_length = param_id(prefix, "default_length")
-  ids.default_velocity = param_id(prefix, "default_velocity")
   ids.trig_jump = param_id(prefix, "trig_jump")
   ids.trig_release = param_id(prefix, "trig_release")
   ids.live_step_trig = param_id(prefix, "live_step_trig")
@@ -1717,53 +1979,16 @@ function elasticat.params(options)
   ids.range_end_sync = param_id(prefix, "range_end_sync")
   ids.sample_preview = param_id(prefix, "sample_preview")
   ids.mode_macro = param_id(prefix, "mode_macro")
-  ids.mode_switch_fade = param_id(prefix, "mode_switch_fade")
   ids.debug = param_id(prefix, "debug")
   ids.live_performance_mode = param_id(prefix, "live_performance_mode")
   ids.step_preview = param_id(prefix, "step_preview")
-  ids.pan = param_id(prefix, "pan")
   ids.crossfade = param_id(prefix, "crossfade")
-  ids.env_attack = param_id(prefix, "env_attack")
-  ids.env_decay = param_id(prefix, "env_decay")
-  ids.env_sustain = param_id(prefix, "env_sustain")
-  ids.env_release = param_id(prefix, "env_release")
-  ids.env_hold = param_id(prefix, "env_hold")
-  ids.env_mode = param_id(prefix, "env_mode")
-  ids.env_range = param_id(prefix, "env_range")
-  ids.portamento = param_id(prefix, "portamento")
-  ids.filter_machine = param_id(prefix, "filter_machine")
-  ids.filter_type = param_id(prefix, "filter_type")
-  ids.filter_cutoff = param_id(prefix, "filter_cutoff")
-  ids.filter_res = param_id(prefix, "filter_res")
-  ids.filter_drive = param_id(prefix, "filter_drive")
-  ids.filter_morph = param_id(prefix, "filter_morph")
-  ids.filter_balance = param_id(prefix, "filter_balance")
-  ids.filter_env_mode = param_id(prefix, "filter_env_mode")
-  ids.filter_env_attack = param_id(prefix, "filter_env_attack")
-  ids.filter_env_decay = param_id(prefix, "filter_env_decay")
-  ids.filter_env_sustain = param_id(prefix, "filter_env_sustain")
-  ids.filter_env_release = param_id(prefix, "filter_env_release")
-  ids.filter_env_hold = param_id(prefix, "filter_env_hold")
-  ids.filter_env_depth = param_id(prefix, "filter_env_depth")
-  ids.fx_insert1_machine = param_id(prefix, "fx_insert1_machine")
-  ids.fx_drive = param_id(prefix, "fx_drive")
-  ids.fx_mix = param_id(prefix, "fx_mix")
-  ids.delay_time = param_id(prefix, "delay_time")
-  ids.delay_feedback = param_id(prefix, "delay_feedback")
-  ids.delay_tone = param_id(prefix, "delay_tone")
-  ids.reverb_size = param_id(prefix, "reverb_size")
-  ids.reverb_damp = param_id(prefix, "reverb_damp")
-  ids.lofi_bits = param_id(prefix, "lofi_bits")
-  ids.lofi_rate = param_id(prefix, "lofi_rate")
 
   -- Send 1/2 + Master insert FX (PRD §3/§8): send tap point, per-send level,
   -- and the three machine selects. Each slot's Drive/Mix/Delay*/Reverb*/Lofi*
   -- ids are namespaced per slot (send1_/send2_/master_) via FxRegistry's
   -- `prefix` argument -- see fx_send1_items/fx_send2_items/fx_master_items
   -- below and lib/fx_modes/*.lua.
-  ids.send_tap = param_id(prefix, "send_tap")
-  ids.send1_level = param_id(prefix, "send1_level")
-  ids.send2_level = param_id(prefix, "send2_level")
   ids.send1_machine = param_id(prefix, "send1_machine")
   ids.send2_machine = param_id(prefix, "send2_machine")
   ids.master_fx_machine = param_id(prefix, "master_fx_machine")
@@ -1795,37 +2020,14 @@ function elasticat.params(options)
   ids.master_lofi_bits = param_id(prefix, "master_lofi_bits")
   ids.master_lofi_rate = param_id(prefix, "master_lofi_rate")
 
-  -- Modulation: 2 LFOs + mod envelope (MOD category). Per-pattern sound
-  -- params, registered like their siblings above (NOT pattern-global, NOT
-  -- editor prefs, so pattern snapshots auto-include them).
-  ids.lfo1_dest = param_id(prefix, "lfo1_dest")
-  ids.lfo1_wave = param_id(prefix, "lfo1_wave")
-  ids.lfo1_speed = param_id(prefix, "lfo1_speed")
-  ids.lfo1_depth = param_id(prefix, "lfo1_depth")
-  ids.lfo1_mode = param_id(prefix, "lfo1_mode")
-  ids.lfo2_dest = param_id(prefix, "lfo2_dest")
-  ids.lfo2_wave = param_id(prefix, "lfo2_wave")
-  ids.lfo2_speed = param_id(prefix, "lfo2_speed")
-  ids.lfo2_depth = param_id(prefix, "lfo2_depth")
-  ids.lfo2_mode = param_id(prefix, "lfo2_mode")
-  ids.menv_dest = param_id(prefix, "menv_dest")
-  ids.menv_attack = param_id(prefix, "menv_attack")
-  ids.menv_decay = param_id(prefix, "menv_decay")
-  ids.menv_sustain = param_id(prefix, "menv_sustain")
-  ids.menv_release = param_id(prefix, "menv_release")
-  ids.menv_depth = param_id(prefix, "menv_depth")
+  -- The whole signal chain (filter, both envelopes, insert FX, send levels,
+  -- output, modulation + macros, and the per-track behaviour settings) is
+  -- registered from ParamsSpec.SPEC at the END of this function -- for all 8
+  -- tracks, track 1 included. Nothing signal-chain-shaped is registered by
+  -- hand here any more, and no `ids.*` entry exists for those suffixes: their
+  -- per-track ids come from elasticat.track_pid(track, suffix).
 
-  -- 4 macros: each a value knob (p-lockable) + a signed matrix depth to each of
-  -- the 5 destinations (macroN_<dest>_depth).
-  for m = 1, 4 do
-    ids["macro" .. m .. "_value"] = param_id(prefix, "macro" .. m .. "_value")
-    for _, dest in ipairs(MACRO_DESTS) do
-      local suffix = "macro" .. m .. "_" .. dest.key .. "_depth"
-      ids[suffix] = param_id(prefix, suffix)
-    end
-  end
-
-  -- Phase 1 track scaffolding (docs/PHASE1_CONTRACT.md).
+  -- Per-track param model (docs/PHASE1_CONTRACT.md, docs/PHASE2_CONTRACT.md).
   track_prefix = prefix
   ids.active_track_count = param_id(prefix, "active_track_count")
 
@@ -1836,27 +2038,35 @@ function elasticat.params(options)
   ids.project_save_as = param_id(prefix, "project_save_as")
   ids.project_new = param_id(prefix, "project_new")
 
+  -- Re-push track 1's warp-mode params after a mode/machine switch (the new
+  -- reader synth starts on its SynthDef defaults). Every command here is per
+  -- track and names track 1 explicitly: these are the hand-registered,
+  -- un-prefixed ids, which ARE track 1's -- tracks 2-8 own the t<N>_ copies and
+  -- push them through their own SPEC actions.
   local function apply_current_mode_params()
     local mode = params:get(ids.mode)
+    local function push(suffix, cmd, offset)
+      tr_call(1, cmd, params:get(param_id(prefix, suffix)) + (offset or 0))
+    end
     if mode == 1 or mode == 2 then
-      engine_call("loopStart", map_trim_point(params:get(ids.loop_start)))
-      engine_call("loopEnd", map_trim_point(params:get(ids.loop_end)))
+      tr_call(1, "loopStart", map_trim_point(params:get(ids.loop_start), 1))
+      tr_call(1, "loopEnd", map_trim_point(params:get(ids.loop_end), 1))
     elseif mode == 3 then
-      engine_call("chopSteps", params:get(param_id(prefix, "chop_steps")))
-      engine_call("chopLoopMode", params:get(param_id(prefix, "chop_loop_mode")) - 1)
-      engine_call("chopAttack", params:get(param_id(prefix, "chop_attack")))
-      engine_call("chopHold", params:get(param_id(prefix, "chop_hold")))
-      engine_call("chopRelease", params:get(param_id(prefix, "chop_release")))
+      push("chop_steps", "chopSteps")
+      push("chop_loop_mode", "chopLoopMode", -1)
+      push("chop_attack", "chopAttack")
+      push("chop_hold", "chopHold")
+      push("chop_release", "chopRelease")
     elseif mode == 4 then
-      engine_call("grainSize", params:get(param_id(prefix, "grain_size")))
-      engine_call("grainDensity", params:get(param_id(prefix, "grain_density")))
-      engine_call("grainJitter", params:get(param_id(prefix, "grain_jitter")))
+      push("grain_size", "grainSize")
+      push("grain_density", "grainDensity")
+      push("grain_jitter", "grainJitter")
     elseif mode == 5 then
-      engine_call("wsolaWindow", params:get(param_id(prefix, "wsola_window")))
-      engine_call("wsolaSearch", params:get(param_id(prefix, "wsola_search")))
+      push("wsola_window", "wsolaWindow")
+      push("wsola_search", "wsolaSearch")
     elseif mode == 6 then
-      engine_call("pvWindow", params:get(param_id(prefix, "pv_window")))
-      engine_call("pvDispersion", params:get(param_id(prefix, "pv_dispersion")))
+      push("pv_window", "pvWindow")
+      push("pv_dispersion", "pvDispersion")
     end
   end
 
@@ -1935,41 +2145,26 @@ function elasticat.params(options)
   params:add_option(ids.machine, "machine", elasticat.machines, 1)
   params:set_action(ids.machine, function(x)
     flush_engine_sends()
-    engine_call("setMode", params:get(ids.mode) - 1)
+    tr_call(1, "setMode", params:get(ids.mode) - 1)
     apply_current_mode_params()
-    if x == 1 then
-      engine_call("play", params:get(ids.play))
-    else
-      engine_call("play", 0)
-    end
+    -- Only a continuous (loop) machine free-runs its reader; slice machines
+    -- sound from their own triggers. Track 1's transport, named explicitly.
+    tr_call(1, "play", x == 1 and params:get(ids.play) or 0)
   end)
 
   params:add_option(ids.mode, "engine mode", elasticat.modes, 1)
   params:set_action(ids.mode, function(x)
     flush_engine_sends()
-    engine_call("setMode", x - 1)
+    tr_call(1, "setMode", x - 1)
     apply_current_mode_params()
   end)
 
-  -- Lua-side grid-interaction settings only; never sent to the engine.
-  add_control(ids.loop_division, "loop key division",
-    cs.new(2, 32, "lin", 2, 16, "", 2 / 30),
-    function(_) end,
-    function(param) return tostring(math.floor(param:get() + 0.5)) end)
-
-  params:add_option(ids.trig_polyphony, "trig polyphony", {"mono", "poly"}, 1)
-
-  -- Where the playhead lands when the last live loop key is released during
-  -- playback: return (rejoin the sequence), boomerang (keep going from the
-  -- current position), reset (jump to the region start). grid_sequencer reads
-  -- this live; no engine action.
-  -- Default Return: a tempo-warped loop stays perfectly synced through live
-  -- loop-key performances, same reasoning as the step-level trig_release.
-  params:add_option(ids.playhead_return, "playhead return", {"return", "boomerang", "reset"}, 1)
-
+  -- The engine names this \trModeMacro (spec field `macro`). It was being sent
+  -- as "setModeMacro", which resolves to NOTHING on either side -- the mode
+  -- macro was silently dropped on every track.
   add_control(ids.mode_macro, "mode macro",
     cs.new(0, 1, "lin", 0.001, 0, "", 0.001),
-    function(x) queue_engine_call(ids.mode_macro, "setModeMacro", x) end)
+    function(x) elasticat.tr_queue(ids.mode_macro, 1, "modeMacro", x) end)
 
   params:add_binary(ids.play, "play", "toggle", 0)
   params:set_action(ids.play, set_engine_play)
@@ -1995,20 +2190,6 @@ function elasticat.params(options)
   params:add_binary(ids.global_bpm, "global bpm", "toggle", 0)
   params:set_action(ids.global_bpm, function(_) end)
 
-  -- Track Volume + Pan are Elektron-style 0-127 (Pan centered at 64). The engine
-  -- still receives a 0..1 amplitude / -1..1 pan; the mapping happens here.
-  add_control(ids.amp, "amp",
-    cs.new(0, 127, "lin", 1, 100, "", 1 / 127),
-    function(_) send_effective_amp() end,
-    format_env_level)
-
-  -- Pan is bipolar, so it uses 0-128 (129 values) for a true center at 64:
-  -- 0 = hard left, 64 = center, 128 = hard right, symmetric 64 steps each side.
-  add_control(ids.pan, "pan",
-    cs.new(0, 128, "lin", 1, 64, "", 1 / 128),
-    function(x) queue_engine_call(ids.pan, "setPan", (x - 64) / 64) end,
-    format_pan_127)
-
   -- A/B scene crossfader position (PRD §6.6 requirement 2), MASTER page,
   -- encoder-adjustable. Straight 0-128 (not centered like pan/filter_balance):
   -- 0 = fully Scene A, 128 = fully Scene B. No engine call here -- this is a
@@ -2018,58 +2199,6 @@ function elasticat.params(options)
   add_control(ids.crossfade, "crossfade",
     cs.new(0, 128, "lin", 1, 0, "", 1 / 128),
     function(x) if pool_options.on_crossfade ~= nil then pool_options.on_crossfade(x) end end)
-
-  -- Amp envelope (0-127 Elektron style; times mapped exponentially to seconds via
-  -- env_range). ADSR uses attack/decay/sustain/release, AHR uses attack/hold/release.
-  add_control(ids.env_attack, "env attack",
-    cs.new(0, 127, "lin", 1, 0, "", 1 / 127),
-    function(x) queue_engine_call(ids.env_attack, "envAttack", env_value_to_seconds(x)) end,
-    format_env_time)
-
-  add_control(ids.env_decay, "env decay",
-    cs.new(0, 127, "lin", 1, 64, "", 1 / 127),
-    function(x) queue_engine_call(ids.env_decay, "envDecay", env_value_to_seconds(x)) end,
-    format_env_time)
-
-  add_control(ids.env_sustain, "env sustain",
-    cs.new(0, 127, "lin", 1, 100, "", 1 / 127),
-    function(x) queue_engine_call(ids.env_sustain, "envSustain", util.clamp(x / 127, 0, 1)) end,
-    format_env_level)
-
-  -- Release and Hold reach 128 = INF: the envelope holds (AHR) / stays at sustain
-  -- (ADSR) forever until the next trigger. Default AHR is 0 / INF / 0 -- an
-  -- instant attack that holds full, i.e. a continuous drone.
-  add_control(ids.env_release, "env release",
-    -- Default 128 = INF: a new project should sustain until note-off rather
-    -- than cutting the tail immediately.
-    cs.new(0, 128, "lin", 1, 128, "", 1 / 128),
-    function(x) queue_engine_call(ids.env_release, "envRelease", env_value_to_seconds(x)) end,
-    format_env_time)
-
-  add_control(ids.env_hold, "env hold",
-    cs.new(0, 128, "lin", 1, 128, "", 1 / 128),
-    function(x) queue_engine_call(ids.env_hold, "envHold", env_value_to_seconds(x)) end,
-    format_env_time)
-
-  params:add_option(ids.env_mode, "envelope mode", {"ADSR", "AHR"}, 2)
-  params:set_action(ids.env_mode, function(x)
-    queue_engine_call(ids.env_mode, "setEnvMode", x - 1)  -- 0 = ADSR, 1 = AHR
-  end)
-
-  params:add_option(ids.env_range, "envelope range",
-    {"1s", "4s", "8s", "16s", "32s", "64s", "128s", "256s", "512s", "1024s"}, 3)
-  params:set_action(ids.env_range, function(_)
-    resend_env_times()
-    resend_filter_env_times()
-    resend_menv_times()
-  end)
-
-  -- Portamento (mono overlap): off = a new trigger re-attacks; on = an
-  -- overlapping trigger glides without re-attacking the amp envelope.
-  params:add_binary(ids.portamento, "portamento", "toggle", 0)
-  params:set_action(ids.portamento, function(x)
-    queue_engine_call(ids.portamento, "setPortamento", x)
-  end)
 
   add_control(param_id(prefix, "source_bpm"), "derived source bpm",
     cs.new(20, 300, "lin", 0.1, 120, "bpm", 1 / 280),
@@ -2089,12 +2218,13 @@ function elasticat.params(options)
     function(x)
       sample_pool.bpms[file_edit_slot] = x
       mark_pool_dirty(file_edit_slot)
-      if file_edits_active() then
-        if params:lookup_param(param_id(prefix, "source_bpm")) ~= nil then
-          params:set(param_id(prefix, "source_bpm"), x, true)
-        end
-        queue_engine_call(ids.sample_bpm, "sourceBpm", x)
+      if file_edits_active() and params:lookup_param(param_id(prefix, "source_bpm")) ~= nil then
+        params:set(param_id(prefix, "source_bpm"), x, true)
       end
+      -- Coalesced (12Hz) re-push to EVERY active track from its own slot: this
+      -- is pool metadata, and any track may be playing the edited slot -- not
+      -- only whichever one the File page happens to be aligned with.
+      queue_engine_send(ids.sample_bpm, elasticat.sync_track_slot_metadata)
     end)
 
   add_control(ids.sample_steps, "sample steps",
@@ -2102,9 +2232,7 @@ function elasticat.params(options)
     function(x)
       sample_pool.steps[file_edit_slot] = x
       mark_pool_dirty(file_edit_slot)
-      if file_edits_active() then
-        queue_engine_call(ids.sample_steps, "setSampleSteps", x)
-      end
+      queue_engine_send(ids.sample_steps, elasticat.sync_track_slot_metadata)
     end,
     function(param) return tostring(math.floor(param:get() + 0.5)) end)
 
@@ -2198,16 +2326,6 @@ function elasticat.params(options)
     function(_) end,
     function(param) return tostring(math.floor(param:get() + 0.5)) end)
 
-  add_control(ids.default_length, "default trig length",
-    cs.new(0.25, 16, "lin", 0.25, 1, "", 0.25 / 15.75),
-    function(_) end,
-    function(param) return string.format("%.2f", param:get()) end)
-
-  add_control(ids.default_velocity, "default velocity",
-    cs.new(0, 1, "lin", 0.01, 1, "", 0.01),
-    function(_) end,
-    function(param) return tostring(math.floor((param:get() * 100) + 0.5)) end)
-
   -- Ghost-trigger reset flags (default on). A normal trigger resets envelope /
   -- LFO / filter; a ghost trigger has these off. No engine action yet -- env /
   -- LFO / filter don't exist until Phase 2/3, so these are forward-compatible
@@ -2262,7 +2380,7 @@ function elasticat.params(options)
 
   add_control(param_id(prefix, "playhead"), "playhead",
     cs.new(0, 1, "lin", 0.001, 0, "", 0.001),
-    function(x) queue_engine_call(param_id(prefix, "playhead"), "setPlayhead", x) end)
+    function(x) elasticat.tr_queue(param_id(prefix, "playhead"), 1, "setPlayhead", x) end)
   if params.hide ~= nil then
     params:hide(param_id(prefix, "playhead"))
   end
@@ -2280,7 +2398,7 @@ function elasticat.params(options)
     cs.new(0, 128, "lin", 0.01, 0, "", 1 / 128),
     function(x)
       if not region_edit_handled() then
-        queue_engine_call(ids.loop_start, "loopStart", map_trim_point(x))
+        elasticat.tr_queue(ids.loop_start, 1, "loopStart", map_trim_point(x, 1))
       end
     end)
 
@@ -2288,7 +2406,7 @@ function elasticat.params(options)
     cs.new(0, 128, "lin", 0.01, 128, "", 1 / 128),
     function(x)
       if not region_edit_handled() then
-        queue_engine_call(ids.loop_end, "loopEnd", map_trim_point(x))
+        elasticat.tr_queue(ids.loop_end, 1, "loopEnd", map_trim_point(x, 1))
       end
     end)
 
@@ -2346,12 +2464,6 @@ function elasticat.params(options)
       end
     end)
 
-  -- E-SNC: when on, range end tracks range start (see range_start action and the
-  -- grid p-lock auto-lock in param_values). Default off -- a new user could be
-  -- confused that start won't move independently until end is adjusted. Pure UI
-  -- behavior, no engine action.
-  params:add_binary(ids.range_end_sync, "range end sync", "toggle", 0)
-
   -- Sample preview: momentary audition of the current sample's trim window,
   -- only while master playback is stopped (see elasticat.preview_trim). Driven
   -- by encoder on the File page and/or a grid hold.
@@ -2367,164 +2479,12 @@ function elasticat.params(options)
 
   add_control(param_id(prefix, "pitch"), "pitch",
     cs.new(-24, 24, "lin", 0.1, 0, "st", 0.1 / 48),
-    function(x) queue_engine_call(param_id(prefix, "pitch"), "setPitch", x) end)
+    function(x) elasticat.tr_queue(param_id(prefix, "pitch"), 1, "setPitch", x) end)
 
   params:add_binary(param_id(prefix, "loop_reverse"), "loop reverse", "toggle", 0)
   params:set_action(param_id(prefix, "loop_reverse"), function(x)
-    queue_engine_call(param_id(prefix, "loop_reverse"), "setReverse", x)
+    elasticat.tr_queue(param_id(prefix, "loop_reverse"), 1, "setReverse", x)
   end)
-
-  params:add_group(param_id(prefix, "group_filter"), "filter", 14)
-
-  -- Filter machine is a setting (respawns the engine's filter synth), not
-  -- p-lockable. Machine index -> engine 0-based.
-  params:add_option(ids.filter_machine, "filter machine", FilterRegistry.names(), 1)
-  params:set_action(ids.filter_machine, function(x)
-    queue_engine_call(ids.filter_machine, "setFilterMachine", x - 1)
-  end)
-
-  -- Type: 4-way multimode (Classic machines). Option 1-4 -> engine 0-3.
-  params:add_option(ids.filter_type, "filter type", FILTER_TYPE_LABELS, 1)
-  params:set_action(ids.filter_type, function(x)
-    queue_engine_call(ids.filter_type, "filterType", x - 1)
-  end)
-
-  -- Cutoff / Res / Drive are 0-127 amounts. Cutoff maps exponentially to Hz;
-  -- Res and Drive map linearly to 0..1 in the engine.
-  add_control(ids.filter_cutoff, "filter cutoff",
-    cs.new(0, 127, "lin", 1, 127, "", 1 / 127),
-    function(x) queue_engine_call(ids.filter_cutoff, "filterCutoff", filter_cutoff_hz(x)) end,
-    format_filter_cutoff)
-
-  add_control(ids.filter_res, "filter resonance",
-    cs.new(0, 127, "lin", 1, 0, "", 1 / 127),
-    function(x) queue_engine_call(ids.filter_res, "filterRes", util.clamp(x / 127, 0, 1)) end,
-    format_env_level)
-
-  add_control(ids.filter_drive, "filter drive",
-    cs.new(0, 127, "lin", 1, 0, "", 1 / 127),
-    function(x) queue_engine_call(ids.filter_drive, "filterDrive", util.clamp(x / 127, 0, 1)) end,
-    format_env_level)
-
-  -- Morph: centered 0-128 (Morphing machines). 0 LP -> 64 notch -> 128 HP,
-  -- sent to the engine as 0..1.
-  add_control(ids.filter_morph, "filter morph",
-    cs.new(0, 128, "lin", 1, 64, "", 1 / 128),
-    function(x) queue_engine_call(ids.filter_morph, "filterMorph", util.clamp(x / 128, 0, 1)) end,
-    format_filter_morph)
-
-  -- Balance: centered 0-128 (stereo/mid-side machines only; #3-6). Shared id
-  -- across both interpretations (L/R spread on stereo, Mid/Side spread on
-  -- M/S) -- same idiom as pan's (x-64)/64 mapping to the engine's -1..1
-  -- filterBalance.
-  add_control(ids.filter_balance, "filter balance",
-    cs.new(0, 128, "lin", 1, 64, "", 1 / 128),
-    function(x) queue_engine_call(ids.filter_balance, "filterBalance", (x - 64) / 64) end,
-    format_filter_balance)
-
-  -- Filter envelope: independent mode from the amp env, but reuses the amp's
-  -- seconds mapping (env_range) for its times. Whole envelope is p-lockable.
-  add_control(ids.filter_env_attack, "filter env attack",
-    cs.new(0, 127, "lin", 1, 0, "", 1 / 127),
-    function(x) queue_engine_call(ids.filter_env_attack, "filterEnvAttack", env_value_to_seconds(x)) end,
-    format_env_time)
-
-  add_control(ids.filter_env_decay, "filter env decay",
-    cs.new(0, 127, "lin", 1, 64, "", 1 / 127),
-    function(x) queue_engine_call(ids.filter_env_decay, "filterEnvDecay", env_value_to_seconds(x)) end,
-    format_env_time)
-
-  add_control(ids.filter_env_sustain, "filter env sustain",
-    cs.new(0, 127, "lin", 1, 100, "", 1 / 127),
-    function(x) queue_engine_call(ids.filter_env_sustain, "filterEnvSustain", util.clamp(x / 127, 0, 1)) end,
-    format_env_level)
-
-  add_control(ids.filter_env_release, "filter env release",
-    cs.new(0, 128, "lin", 1, 0, "", 1 / 128),
-    function(x) queue_engine_call(ids.filter_env_release, "filterEnvRelease", env_value_to_seconds(x)) end,
-    format_env_time)
-
-  add_control(ids.filter_env_hold, "filter env hold",
-    cs.new(0, 128, "lin", 1, 128, "", 1 / 128),
-    function(x) queue_engine_call(ids.filter_env_hold, "filterEnvHold", env_value_to_seconds(x)) end,
-    format_env_time)
-
-  -- Depth: bipolar 0-128 (64 = no modulation) -> engine -1..1 (+/-6 octaves).
-  add_control(ids.filter_env_depth, "filter env depth",
-    cs.new(0, 128, "lin", 1, 64, "", 1 / 128),
-    function(x) queue_engine_call(ids.filter_env_depth, "filterEnvDepth", (x - 64) / 64) end,
-    format_filter_depth)
-
-  params:add_option(ids.filter_env_mode, "filter envelope mode", {"ADSR", "AHR"}, 2)
-  params:set_action(ids.filter_env_mode, function(x)
-    queue_engine_call(ids.filter_env_mode, "filterEnvMode", x - 1)  -- 0 = ADSR, 1 = AHR
-  end)
-
-  params:add_group(param_id(prefix, "group_fx"), "fx", 10)
-
-  -- FX Insert 1 machine is a setting (respawns the engine's insert synth), not
-  -- p-lockable -- same idiom as filter_machine. Machine index -> engine 0-based;
-  -- index 0/option 1 (NONE) is the always-present dry passthrough.
-  params:add_option(ids.fx_insert1_machine, "fx insert 1 machine", FxRegistry.names(), 1)
-  params:set_action(ids.fx_insert1_machine, function(x)
-    queue_engine_call(ids.fx_insert1_machine, "setInsertMachine", x - 1)
-  end)
-
-  -- Drive / Mix are 0-127 amounts shared by every wet FX machine (DRIVE uses
-  -- fx_drive+fx_mix; DELAY/REVERB/LOFI reuse fx_mix alongside their own knobs) --
-  -- same "shared id across machines" idiom as the filter's cutoff/res/drive.
-  add_control(ids.fx_drive, "fx drive",
-    cs.new(0, 127, "lin", 1, 0, "", 1 / 127),
-    function(x) queue_engine_call(ids.fx_drive, "fxDrive", util.clamp(x / 127, 0, 1)) end,
-    format_env_level)
-
-  add_control(ids.fx_mix, "fx mix",
-    cs.new(0, 127, "lin", 1, 64, "", 1 / 127),
-    function(x) queue_engine_call(ids.fx_mix, "fxMix", util.clamp(x / 127, 0, 1)) end,
-    format_env_level)
-
-  -- Delay time: beat-division options param (PRD SS5), not raw seconds -- stays
-  -- in sync across tempo changes since the engine recomputes seconds from
-  -- targetBpm every block.
-  params:add_option(ids.delay_time, "delay time", DELAY_TIME_LABELS, 4)
-  params:set_action(ids.delay_time, function(x)
-    queue_engine_call(ids.delay_time, "delayTime", DELAY_TIME_BEATS[x] or 1)
-  end)
-
-  add_control(ids.delay_feedback, "delay feedback",
-    cs.new(0, 127, "lin", 1, 38, "", 1 / 127),
-    function(x) queue_engine_call(ids.delay_feedback, "delayFeedback", util.clamp(x / 127, 0, 1)) end,
-    format_env_level)
-
-  -- Tone: the feedback-loop filter amount. 0-127, matching the other FX
-  -- amounts, mapped in the engine to a lowpass cutoff (higher = brighter/more
-  -- open); see the elasticatFxDelay SynthDef.
-  add_control(ids.delay_tone, "delay tone",
-    cs.new(0, 127, "lin", 1, 127, "", 1 / 127),
-    function(x) queue_engine_call(ids.delay_tone, "delayTone", util.clamp(x / 127, 0, 1)) end,
-    format_env_level)
-
-  add_control(ids.reverb_size, "reverb size",
-    cs.new(0, 127, "lin", 1, 64, "", 1 / 127),
-    function(x) queue_engine_call(ids.reverb_size, "reverbSize", util.clamp(x / 127, 0, 1)) end,
-    format_env_level)
-
-  add_control(ids.reverb_damp, "reverb damp",
-    cs.new(0, 127, "lin", 1, 64, "", 1 / 127),
-    function(x) queue_engine_call(ids.reverb_damp, "reverbDamp", util.clamp(x / 127, 0, 1)) end,
-    format_env_level)
-
-  -- Lofi bits/rate map to real units (bit depth / Hz), like filter cutoff, so
-  -- they get dedicated formatters instead of format_env_level.
-  add_control(ids.lofi_bits, "lofi bits",
-    cs.new(0, 127, "lin", 1, 127, "", 1 / 127),
-    function(x) queue_engine_call(ids.lofi_bits, "lofiBits", lofi_bits_depth(x)) end,
-    format_lofi_bits)
-
-  add_control(ids.lofi_rate, "lofi rate",
-    cs.new(0, 127, "lin", 1, 127, "", 1 / 127),
-    function(x) queue_engine_call(ids.lofi_rate, "lofiRate", lofi_rate_hz(x)) end,
-    format_lofi_rate)
 
   -- Send 1/2 + Master insert FX (PRD §3/§8): each slot reuses the exact same
   -- Drive/Mix/Delay*/Reverb*/Lofi* shape as Insert 1 above -- this local
@@ -2578,26 +2538,15 @@ function elasticat.params(options)
       format_lofi_rate)
   end
 
-  -- Send tap: which point in the chain Send 1/2 pull from -- pre-insert (i.e.
-  -- post-filter) or post-insert-1 (PRD §3). A setting, not p-lockable (it's a
-  -- bus-select argument on the tap synth, not a per-note articulation).
-  params:add_group(param_id(prefix, "group_fx_routing"), "fx routing", 1)
-  params:add_option(ids.send_tap, "send tap", {"pre insert", "post insert"}, 1)
-  params:set_action(ids.send_tap, function(x)
-    queue_engine_call(ids.send_tap, "setSendTap", x - 1)
-  end)
-
-  -- Send 1: machine is a setting (respawns the engine's send1 synth); level is
-  -- the continuous, p-lockable send amount pushed live to the tap synth.
-  params:add_group(param_id(prefix, "group_send1"), "send 1", 11)
+  -- Send 1: machine is a setting (respawns the engine's send1 synth). The send
+  -- LEVEL and the tap point are per-track (lib/tracks/params_spec.lua); the
+  -- send BUS and its FX are shared by every track, so only the machine + its
+  -- 9 knobs live here.
+  params:add_group(param_id(prefix, "group_send1"), "send 1", 10)
   params:add_option(ids.send1_machine, "send 1 machine", FxRegistry.names(), 1)
   params:set_action(ids.send1_machine, function(x)
     queue_engine_call(ids.send1_machine, "setSend1Machine", x - 1)
   end)
-  add_control(ids.send1_level, "send 1 level",
-    cs.new(0, 127, "lin", 1, 0, "", 1 / 127),
-    function(x) queue_engine_call(ids.send1_level, "sendLevel1", util.clamp(x / 127, 0, 1)) end,
-    format_env_level)
   register_send_fx_params({
     fx_drive = ids.send1_fx_drive,
     fx_mix = ids.send1_fx_mix,
@@ -2611,15 +2560,11 @@ function elasticat.params(options)
   }, "send1", "send 1")
 
   -- Send 2: mirrors Send 1.
-  params:add_group(param_id(prefix, "group_send2"), "send 2", 11)
+  params:add_group(param_id(prefix, "group_send2"), "send 2", 10)
   params:add_option(ids.send2_machine, "send 2 machine", FxRegistry.names(), 1)
   params:set_action(ids.send2_machine, function(x)
     queue_engine_call(ids.send2_machine, "setSend2Machine", x - 1)
   end)
-  add_control(ids.send2_level, "send 2 level",
-    cs.new(0, 127, "lin", 1, 0, "", 1 / 127),
-    function(x) queue_engine_call(ids.send2_level, "sendLevel2", util.clamp(x / 127, 0, 1)) end,
-    format_env_level)
   register_send_fx_params({
     fx_drive = ids.send2_fx_drive,
     fx_mix = ids.send2_fx_mix,
@@ -2652,176 +2597,62 @@ function elasticat.params(options)
     lofi_rate = ids.master_lofi_rate
   }, "master", "master fx")
 
-  -- Modulation (MOD category): 2 LFOs + 1 mod envelope, all engine-side (one
-  -- control-rate \elasticatMod synth; see Engine_Elasticat.sc). Each LFO slot
-  -- shares the exact same 5-knob shape, so one local helper registers both
-  -- against namespaced ids/commands -- the register_send_fx_params idiom.
-  -- DEP is the project-standard bipolar 0-128 (64 = off/center); SPD is a
-  -- tempo-synced musical division sent as beats-per-cycle; DEST/WAVE/MODE are
-  -- settings-style selectors (not p-lockable in this first stab).
-  local function register_lfo_params(slot_ids, cmd_prefix, display_prefix)
-    params:add_option(slot_ids.dest, display_prefix .. " dest", MOD_DEST_LABELS, 1)
-    params:set_action(slot_ids.dest, function(x)
-      queue_engine_call(slot_ids.dest, cmd_prefix .. "Dest", x - 1)
-    end)
-
-    params:add_option(slot_ids.wave, display_prefix .. " wave", MOD_WAVE_LABELS, 1)
-    params:set_action(slot_ids.wave, function(x)
-      queue_engine_call(slot_ids.wave, cmd_prefix .. "Wave", x - 1)
-    end)
-
-    params:add_option(slot_ids.speed, display_prefix .. " speed", MOD_SPEED_LABELS, 4)
-    params:set_action(slot_ids.speed, function(x)
-      queue_engine_call(slot_ids.speed, cmd_prefix .. "Speed", MOD_SPEED_BEATS[x] or 4)
-    end)
-
-    add_control(slot_ids.depth, display_prefix .. " depth",
-      cs.new(0, 128, "lin", 1, 64, "", 1 / 128),
-      function(x) queue_engine_call(slot_ids.depth, cmd_prefix .. "Depth", (x - 64) / 64) end,
-      format_filter_depth)
-
-    params:add_option(slot_ids.mode, display_prefix .. " mode", MOD_LFO_MODE_LABELS, 1)
-    params:set_action(slot_ids.mode, function(x)
-      queue_engine_call(slot_ids.mode, cmd_prefix .. "Mode", x - 1)
-    end)
-  end
-
-  -- 14 LFO/mod-env params + 24 macro params (4 x [value + 5 matrix depths]) = 38.
-  params:add_group(param_id(prefix, "group_mod"), "modulation", 40)
-
-  register_lfo_params({
-    dest = ids.lfo1_dest,
-    wave = ids.lfo1_wave,
-    speed = ids.lfo1_speed,
-    depth = ids.lfo1_depth,
-    mode = ids.lfo1_mode
-  }, "lfo1", "lfo 1")
-
-  register_lfo_params({
-    dest = ids.lfo2_dest,
-    wave = ids.lfo2_wave,
-    speed = ids.lfo2_speed,
-    depth = ids.lfo2_depth,
-    mode = ids.lfo2_mode
-  }, "lfo2", "lfo 2")
-
-  -- Mod envelope: an AD burst per note (env_reset semantics -- retriggered
-  -- wherever the amp env retrigs and the step's ERST resolves ON). ATK/DEC
-  -- reuse the amp env's exponential seconds mapping (env_range).
-  params:add_option(ids.menv_dest, "mod env dest", MOD_DEST_LABELS, 1)
-  params:set_action(ids.menv_dest, function(x)
-    queue_engine_call(ids.menv_dest, "menvDest", x - 1)
-  end)
-
-  add_control(ids.menv_attack, "mod env attack",
-    cs.new(0, 127, "lin", 1, 0, "", 1 / 127),
-    function(x) queue_engine_call(ids.menv_attack, "menvAttack", env_value_to_seconds(x)) end,
-    format_env_time)
-
-  add_control(ids.menv_decay, "mod env decay",
-    cs.new(0, 127, "lin", 1, 64, "", 1 / 127),
-    function(x) queue_engine_call(ids.menv_decay, "menvDecay", env_value_to_seconds(x)) end,
-    format_env_time)
-
-  add_control(ids.menv_sustain, "mod env sustain",
-    cs.new(0, 127, "lin", 1, 100, "", 1 / 127),
-    function(x) queue_engine_call(ids.menv_sustain, "menvSustain", util.clamp(x / 127, 0, 1)) end)
-
-  add_control(ids.menv_release, "mod env release",
-    cs.new(0, 127, "lin", 1, 48, "", 1 / 127),
-    function(x) queue_engine_call(ids.menv_release, "menvRelease", env_value_to_seconds(x)) end,
-    format_env_time)
-
-  add_control(ids.menv_depth, "mod env depth",
-    cs.new(0, 128, "lin", 1, 64, "", 1 / 128),
-    function(x) queue_engine_call(ids.menv_depth, "menvDepth", (x - 64) / 64) end,
-    format_filter_depth)
-
-  -- 4 macros. VALUE (0-127 -> 0..1) is the knob the grid macro keys / MACRO
-  -- page drive, p-lockable per step. Each macro is a MOD MATRIX: a signed depth
-  -- (bipolar 0-128, 64 = off) to each of the 5 destinations, dialed by holding
-  -- the macro key and turning that destination's param. The macro contributes
-  -- VALUE * depth[d] to destination d, summing with the LFOs/mod-env -- and an
-  -- LFO/env can target the macro (DEST = MACRO1..4) to modulate VALUE. The
-  -- 20 matrix-depth params are hidden from the PARAMS menu (the grid gesture is
-  -- their interface) but still serialize with patterns/projects.
-  for m = 1, 4 do
-    local mi = m
-    local vid = ids["macro" .. m .. "_value"]
-    add_control(vid, "macro " .. m .. " value",
-      cs.new(0, 127, "lin", 1, 0, "", 1 / 127),
-      function(x) queue_engine_call(vid, "macroBase", mi, x / 127) end)
-    for _, dest in ipairs(MACRO_DESTS) do
-      local di = dest.index
-      local pid = ids["macro" .. m .. "_" .. dest.key .. "_depth"]
-      add_control(pid, "macro " .. m .. " " .. dest.key .. " depth",
-        cs.new(0, 128, "lin", 1, 64, "", 1 / 128),
-        function(x) queue_engine_call(pid, "macroDepth", mi, di, (x - 64) / 64) end,
-        format_filter_depth)
-      params:hide(pid)
-    end
-  end
-
-  params:add_group(param_id(prefix, "group_engine_modes"), "engine algorithms", 13)
-
-  add_control(ids.mode_switch_fade, "mode switch fade",
-    cs.new(0.001, 0.25, "lin", 0.001, 0.05, "", 0.001 / 0.249),
-    function(x) queue_engine_call(ids.mode_switch_fade, "setModeSwitchFade", x) end)
+  params:add_group(param_id(prefix, "group_engine_modes"), "engine algorithms", 12)
 
   add_control(param_id(prefix, "chop_steps"), "chop steps",
     cs.new(0.05, 16, "lin", 0.05, 1, "steps", 0.05 / 15.95),
-    function(x) queue_engine_call(param_id(prefix, "chop_steps"), "chopSteps", x) end)
+    function(x) elasticat.tr_queue(param_id(prefix, "chop_steps"), 1, "chopSteps", x) end)
 
   params:add_option(param_id(prefix, "chop_loop_mode"), "chop loop mode", {"forward stop", "loop forward", "ping pong"}, 1)
-  params:set_action(param_id(prefix, "chop_loop_mode"), function(x) engine_call("chopLoopMode", x - 1) end)
+  params:set_action(param_id(prefix, "chop_loop_mode"), function(x) tr_call(1, "chopLoopMode", x - 1) end)
 
   add_control(param_id(prefix, "chop_attack"), "chop attack",
     cs.new(0.0001, 0.2, "lin", 0.0001, 0.002, "s", 0.0005 / 0.1999),
-    function(x) queue_engine_call(param_id(prefix, "chop_attack"), "chopAttack", x) end,
+    function(x) elasticat.tr_queue(param_id(prefix, "chop_attack"), 1, "chopAttack", x) end,
     format_ms)
 
   add_control(param_id(prefix, "chop_hold"), "chop hold",
     cs.new(0, 0.5, "lin", 0.001, 0.04, "s", 0.001 / 0.5),
-    function(x) queue_engine_call(param_id(prefix, "chop_hold"), "chopHold", x) end,
+    function(x) elasticat.tr_queue(param_id(prefix, "chop_hold"), 1, "chopHold", x) end,
     format_ms)
 
   add_control(param_id(prefix, "chop_release"), "chop release",
     cs.new(0.0001, 0.2, "lin", 0.0001, 0.01, "s", 0.0005 / 0.1999),
-    function(x) queue_engine_call(param_id(prefix, "chop_release"), "chopRelease", x) end,
+    function(x) elasticat.tr_queue(param_id(prefix, "chop_release"), 1, "chopRelease", x) end,
     format_ms)
 
   add_control(param_id(prefix, "grain_size"), "grain size",
     cs.new(0.002, 0.5, "lin", 0.001, 0.08, "s", 0.001 / 0.498),
-    function(x) queue_engine_call(param_id(prefix, "grain_size"), "grainSize", x) end,
+    function(x) elasticat.tr_queue(param_id(prefix, "grain_size"), 1, "grainSize", x) end,
     format_ms)
 
   add_control(param_id(prefix, "grain_density"), "grain density",
     cs.new(1, 64, "lin", 1, 8, "gr/step", 1 / 63),
-    function(x) queue_engine_call(param_id(prefix, "grain_density"), "grainDensity", x) end)
+    function(x) elasticat.tr_queue(param_id(prefix, "grain_density"), 1, "grainDensity", x) end)
 
   add_control(param_id(prefix, "grain_jitter"), "grain jitter",
     cs.new(0, 0.25, "lin", 0.001, 0.01, "s", 0.001 / 0.25),
-    function(x) queue_engine_call(param_id(prefix, "grain_jitter"), "grainJitter", x) end,
+    function(x) elasticat.tr_queue(param_id(prefix, "grain_jitter"), 1, "grainJitter", x) end,
     format_ms)
 
   add_control(param_id(prefix, "wsola_window"), "OLA window",
     cs.new(0.005, 0.5, "lin", 0.001, 0.08, "s", 0.001 / 0.495),
-    function(x) queue_engine_call(param_id(prefix, "wsola_window"), "wsolaWindow", x) end,
+    function(x) elasticat.tr_queue(param_id(prefix, "wsola_window"), 1, "wsolaWindow", x) end,
     format_ms)
 
   add_control(param_id(prefix, "wsola_search"), "OLA wander",
     cs.new(0, 0.1, "lin", 0.001, 0.015, "s", 0.001 / 0.1),
-    function(x) queue_engine_call(param_id(prefix, "wsola_search"), "wsolaSearch", x) end,
+    function(x) elasticat.tr_queue(param_id(prefix, "wsola_search"), 1, "wsolaSearch", x) end,
     format_ms)
 
   add_control(param_id(prefix, "pv_window"), "PC window",
     cs.new(0.005, 2, "lin", 0.001, 0.2, "", 0.001 / 1.995),
-    function(x) queue_engine_call(param_id(prefix, "pv_window"), "pvWindow", x) end,
+    function(x) elasticat.tr_queue(param_id(prefix, "pv_window"), 1, "pvWindow", x) end,
     format_ms)
 
   add_control(param_id(prefix, "pv_dispersion"), "PC dispersion",
     cs.new(0, 1, "lin", 0.001, 0, "", 0.001),
-    function(x) queue_engine_call(param_id(prefix, "pv_dispersion"), "pvDispersion", x) end)
+    function(x) elasticat.tr_queue(param_id(prefix, "pv_dispersion"), 1, "pvDispersion", x) end)
 
   params:add_group(param_id(prefix, "group_slices"), "slice machines", 11)
 
@@ -2941,19 +2772,33 @@ function elasticat.params(options)
   params:add_option(ids.debug, "debug", {"errors", "lifecycle", "clock", "verbose"}, 2)
   params:set_action(ids.debug, function(x) engine_call("setDebug", x - 1) end)
 
-  -- Phase 1 track scaffolding: active_track_count + track 1's mute + the full
-  -- programmatic per-track param set for tracks 2-8 (lib/tracks/params_spec.lua).
-  -- Registered LAST so it never disturbs the existing param/pset ordering, and
-  -- before any partition scanner runs (they're built lazily after init).
+  -- The per-track param set: active_track_count + every SPEC entry for all 8
+  -- tracks (lib/tracks/params_spec.lua). Track 1 keeps the unprefixed ids it
+  -- has always had, so psets and projects load unchanged. Registered LAST so
+  -- it never disturbs the existing param/pset ordering, and before any
+  -- partition scanner runs (they're built lazily after init).
   ParamsSpec.register({
     params = params,
     cs = cs,
     prefix = prefix,
     tr_call = tr_call,
+    tr_now = elasticat.tr_now,
+    tr_queue = elasticat.tr_queue,
     engine_call = engine_call,
+    xforms = elasticat.param_xforms,
+    formatters = elasticat.param_formatters,
+    actions = elasticat.param_actions,
     machines = elasticat.machines,
     modes = elasticat.modes,
     trig_conditions = TRIG_CONDITIONS,
+    filter_machines = FilterRegistry.names(),
+    filter_types = FILTER_TYPE_LABELS,
+    fx_machines = FxRegistry.names(),
+    delay_times = DELAY_TIME_LABELS,
+    mod_dests = MOD_DEST_LABELS,
+    mod_waves = MOD_WAVE_LABELS,
+    mod_lfo_modes = MOD_LFO_MODE_LABELS,
+    mod_speeds = MOD_SPEED_LABELS,
     on_active_track_count = function(n)
       if pool_options.on_active_track_count ~= nil then
         pool_options.on_active_track_count(n)
