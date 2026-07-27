@@ -78,6 +78,11 @@ function PageRender.new(opts)
   return setmetatable({
     param_values = opts.param_values,
     value = opts.value, -- param_value_or(id, default)
+    -- resolved_value(id) -> the base-value switch output (a firing step p-lock /
+    -- crossfader morph overriding the track value), so the filter curve follows
+    -- what's actually sounding, not the stored track value. Optional -- self:resolved
+    -- falls back to self.value when it is absent (docs/BASE_VALUE_RESOLVER.md).
+    resolved_value = opts.resolved_value,
     -- display_values(item, raw) -> base_raw, actual_raw, modulated. Splits the
     -- low-profile cell's two bars (track value vs post-crossfade/macro/mod
     -- value); defaults to "actual == base" when not injected.
@@ -182,6 +187,19 @@ function PageRender:item_value(items, id, default)
         return raw
       end
       return default
+    end
+  end
+  return self.value(id, default)
+end
+
+-- The RESOLVED base of a selected-track param (docs/BASE_VALUE_RESOLVER.md): what
+-- a firing step p-lock / morph is actually sending. Falls back to the plain param
+-- value when the resolver is not wired (older callers, tests).
+function PageRender:resolved(id, default)
+  if self.resolved_value ~= nil then
+    local v = self.resolved_value(id)
+    if type(v) == "number" then
+      return v
     end
   end
   return self.value(id, default)
@@ -711,32 +729,32 @@ end
 function PageRender:draw_filter_bars(items, playing)
   local machine = floor(self.value("filter_machine", 1) + 0.5)
   local morphing = machine % 2 == 0
-  local cut, res_raw
-  if playing then
-    -- Follow the value actually SOUNDING. self.value is the live param, which is
-    -- what a firing step p-lock set -- item_value returns the pre-lock BASE
-    -- (active_step_lock_bases masks it so an encoder edit adjusts the base), so
-    -- it would freeze the bars at the base while a cutoff/res lock sweeps the
-    -- real filter. The mod feed (LFOs / filter env / macros, injected by the
-    -- coordinator from the engine's 15Hz report) then adds on top.
-    cut = self.value("filter_cutoff", 64)
-    res_raw = self.value("filter_res", 0)
-    if self.mod_offsets ~= nil then
-      local d_cut, d_res = self.mod_offsets()
-      cut = cut + (d_cut or 0)
-      res_raw = res_raw + (d_res or 0)
+  -- Base the curve follows (docs/BASE_VALUE_RESOLVER.md): the RESOLVED switch
+  -- output -- a firing step p-lock OR a crossfader morph overriding the track
+  -- value. NOT gated on `playing`: a morph is live regardless of transport. A
+  -- held-step / scene-anchor PREVIEW wins while you edit one -- item_value then
+  -- differs from the plain track value (self.value), so prefer it. The mod feed
+  -- (LFOs / filter env / macros) is playback-only and adds on top below.
+  local function base_of(suffix, default)
+    local track = self.value(suffix, default)
+    local item = self:item_value(items, suffix, default)
+    if item ~= track then
+      return item              -- a held-step / scene preview is showing
     end
-  else
-    -- STOPPED: item_value, so holding a step with a filter_cutoff/res lock
-    -- previews that step's locked filter (the same value the cell shows).
-    cut = self:item_value(items, "filter_cutoff", 64)
-    res_raw = self:item_value(items, "filter_res", 0)
+    return self:resolved(suffix, default)
+  end
+  local cut = base_of("filter_cutoff", 64)
+  local res_raw = base_of("filter_res", 0)
+  if playing and self.mod_offsets ~= nil then
+    local d_cut, d_res = self.mod_offsets()
+    cut = cut + (d_cut or 0)
+    res_raw = res_raw + (d_res or 0)
   end
   local res = min(max(res_raw / 127, 0), 1)
   local fc = 0.06 + min(max(cut / 127, 0), 1) * 0.88
   local arg
   if morphing then
-    arg = min(max(self:item_value(items, "filter_morph", 64) / 128, 0), 1)
+    arg = min(max(base_of("filter_morph", 64) / 128, 0), 1)
   else
     arg = floor(min(max(self:item_value(items, "filter_type", 1), 1), 4) + 0.5)
   end

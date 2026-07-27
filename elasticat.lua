@@ -692,6 +692,7 @@ local function apply_pattern_state(snapshot, restart)
   -- the pattern's unblended values.
   if scene_store ~= nil then
     scene_store:apply(scene_store:position_value())
+    elasticat.reconcile_crossfader(scene_store:morph_target_keys())
   end
 end
 
@@ -1117,6 +1118,7 @@ elasticat.undo_apply = function()
   -- base changed in between.
   if entry.kind == "crossfade" and entry.position ~= nil and scene_store ~= nil then
     scene_store:apply(entry.position)
+    elasticat.reconcile_crossfader(scene_store:morph_target_keys())
   end
   for full_id, value in pairs(entry.values or {}) do
     if elasticat.param_exists(full_id) then
@@ -1211,6 +1213,9 @@ local function scene_base_follow(param_item)
   if elasticat.param_exists(full_id) then
     scene_store:update_base(full_id, params:get(full_id))
   end
+  -- A hand edit takes the param back from the crossfader: drop its morph override
+  -- so the track value plays until the fader is next moved (BASE_VALUE_RESOLVER).
+  elasticat.knob_takes_over(param_item.id)
 end
 
 -- =============================================================================
@@ -1627,6 +1632,7 @@ local function ram_recall()
       params:set(id("crossfade"), math.floor(scene_store:position_value() * 128 + 0.5), true)
     end
     scene_store:apply(scene_store:position_value())
+    elasticat.reconcile_crossfader(scene_store:morph_target_keys())
   end
   show_message("Recalled")
   request_redraw()
@@ -1730,6 +1736,20 @@ elasticat.param_display_values = function(item, raw)
     return base, actual, false
   end
   local suffix = item.id
+
+  -- Base-value resolver (docs/BASE_VALUE_RESOLVER.md): the ACTUAL bar follows the
+  -- value actually SENT -- a firing step p-lock (or a morph) overriding the track
+  -- value -- while the STORED bar (base) stays the track value the knob edits.
+  -- Guarded so the common case (nothing p-locked/morphing) pays nothing.
+  if elasticat.has_base_override ~= nil and elasticat.has_base_override() then
+    local resolved = elasticat.resolved_value(suffix)
+    if type(resolved) == "number" then
+      actual = resolved
+      if math.abs(actual - base) > 0.0001 then
+        modulated = true
+      end
+    end
+  end
 
   -- Scene bases are keyed by FULL per-track param id, so the bar reads the
   -- SELECTED track's base -- a bare suffix here showed track 1's base on every
@@ -1971,6 +1991,11 @@ param_values = ParamValues.new({
   end,
   active_step_lock_bases = active_step_lock_bases,
   active_step_lock_ids = active_step_lock_ids,
+  -- Base-value resolver (docs/BASE_VALUE_RESOLVER.md): a firing continuous
+  -- p-lock publishes a non-destructive override on the selected track instead of
+  -- mutating the track param; returns false for params that keep the destructive
+  -- path, so apply_step_param_locks falls back for those.
+  set_base_override = elasticat.set_step_override,
   value_flash_until = value_flash_until,
   value_flash_seconds = VALUE_FLASH_SECONDS
 })
@@ -2013,6 +2038,9 @@ local function clear_scene_lock_for_slot(slot)
   local cleared = scene_store:clear_key(key)
   if cleared then
     show_message(param_values:item_long_name(param_item) .. " scene lock clear")
+    -- The param just left the morph set: drop its crossfader override so the knob
+    -- (source 1) takes back control even with the fader idle (BASE_VALUE_RESOLVER).
+    elasticat.reconcile_crossfader(scene_store:morph_target_keys())
   end
   request_redraw()
   return cleared
@@ -2246,6 +2274,10 @@ end
 local page_render = include("lib/ui/page_render").new({
   param_values = param_values,
   value = param_value_or,
+  -- The RESOLVED base (a firing step p-lock / morph overriding the track value)
+  -- for the filter curve to follow during playback, matching the low-profile
+  -- actual bar. nil-safe: returns the track value when nothing overrides.
+  resolved_value = function(suffix) return elasticat.resolved_value(suffix) end,
   display_values = function(item, raw) return elasticat.param_display_values(item, raw) end,
   mod_offsets = function()
     return elasticat.mod_offset_for("filter_cutoff"), elasticat.mod_offset_for("filter_res")
@@ -3047,6 +3079,7 @@ function init()
         -- flood the engine with per-tick sends (see elasticat.tr_now).
         elasticat.morph_active = true
         scene_store:apply(x / 128)
+        elasticat.reconcile_crossfader(scene_store:morph_target_keys())
         elasticat.morph_active = false
       end
     end,
@@ -3100,12 +3133,22 @@ function init()
     get_value = function(full_id)
       return elasticat.param_exists(full_id) and params:get(full_id) or nil
     end,
-    -- params:set (not a direct engine push) on purpose: it fires the param's
-    -- own action, which is what puts a morph write on the facade's existing
-    -- 12Hz coalescing send queue (elasticat.tr_queue) instead of inventing a
-    -- second, uncoalesced path -- see docs/PHASE2_CONTRACT.md "Cost control".
+    -- Base-value model (docs/BASE_VALUE_RESOLVER.md): the morph is SOURCE 2. It
+    -- publishes a non-destructive crossfader override (which re-sends the
+    -- resolved base through the same 12Hz coalescing queue a params:set action
+    -- would) instead of mutating the track param, so the stored bar keeps the
+    -- track value the knob owns. Region/range + track-1 hand-registered params
+    -- are not resolvable, so those fall back to the old direct params:set.
     set_value = function(full_id, value)
-      if elasticat.param_exists(full_id) then params:set(full_id, value) end
+      if not elasticat.param_exists(full_id) then
+        return
+      end
+      local body = full_id:sub(#PREFIX + 1)
+      local track = ParamsSpec.track_of_suffix(body) or 1
+      local suffix = body:gsub("^t%d+_", "")
+      if not elasticat.set_crossfader_override(track, suffix, value) then
+        params:set(full_id, value)
+      end
     end,
     -- Sparse capture: a param at its registered default is stored only when
     -- the other scene needs a counterpart (see SceneStore:capture). Every
@@ -3232,6 +3275,9 @@ function init()
     capture_scene = function(scene)
       if scene_store ~= nil then
         scene_store:capture(scene)
+        -- Sparse capture can drop a param from the morph set (re-captured at its
+        -- default); clear any now-stale crossfader override so it isn't stuck.
+        elasticat.reconcile_crossfader(scene_store:morph_target_keys())
       end
     end,
     -- PRD §6.6 requirement 2: route grid fader/anchor-tap position jumps through
@@ -3246,6 +3292,7 @@ function init()
       if scene_store ~= nil then
         elasticat.undo_record_crossfade()
         scene_store:apply(t)
+        elasticat.reconcile_crossfader(scene_store:morph_target_keys())
       end
       -- Sync the MASTER-page display param SILENTLY (3rd arg true = no action):
       -- firing on_crossfade here would apply the morph a second time.
@@ -3481,6 +3528,7 @@ function init()
         -- Re-apply the restored crossfade position so the loaded project SOUNDS
         -- like it did when saved, not like its unblended pattern values.
         scene_store:apply(scene_store:position_value())
+        elasticat.reconcile_crossfader(scene_store:morph_target_keys())
       else
         scene_store:reset()  -- pre-scenes project: start clean, don't inherit
       end

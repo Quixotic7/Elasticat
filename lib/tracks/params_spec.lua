@@ -389,13 +389,26 @@ function ParamsSpec.entry_action(deps, track, entry, pid)
   local xform = entry.xform ~= nil and (deps.xforms or {})[entry.xform] or nil
   local offset = entry.offset
   local args = entry.args
+  -- The base-value switch (docs/BASE_VALUE_RESOLVER.md): what actually goes to
+  -- the engine is the RESOLVED base (a firing step p-lock or crossfader morph
+  -- overriding the track param), not the raw param value. Consulting it here --
+  -- the single send point every knob edit AND every re-send funnels through --
+  -- is what makes the override non-destructive: the param keeps the user's own
+  -- value; only the sent value is switched. Absent (tests that don't wire it, or
+  -- a param with no override live) it is a pass-through, so behaviour is
+  -- unchanged. A region point's (loop_start/end) STEP resolution happens in its
+  -- region_point xform + active_range, so step_override never holds one; it
+  -- passes through here untouched unless a crossfader morph targets it.
+  local resolve = deps.resolve_base
+  local suffix = entry.suffix
 
   return function(x)
-    local value = x
+    local base = resolve ~= nil and resolve(track, suffix, x) or x
+    local value = base
     if xform ~= nil then
-      value = xform(x, track)
+      value = xform(base, track)
     elseif offset ~= nil then
-      value = x + offset
+      value = base + offset
     end
     if args == nil then
       send(pid, track, cmd, value)

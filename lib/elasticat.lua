@@ -248,6 +248,41 @@ function elasticat.active_range(track)
   return rs or 0, re or 128
 end
 
+-- ---- Base-value resolver (docs/BASE_VALUE_RESOLVER.md) ---------------------
+-- The non-destructive switch that decides what a continuous p-lockable param
+-- actually SENDS to the engine: a firing step p-lock wins, then a crossfader
+-- morph, then the track's own stored param. Steps and the crossfader publish
+-- into these override layers instead of mutating the track param, so the knob
+-- always owns the track value (its stored bar) and a live edit is never stomped
+-- by a per-tick restore. step_override is a SINGLE selected-track layer (keyed
+-- by bare suffix) -- it mirrors the one active_step_lock set the UI keeps and
+-- the ui_id funnel step locks already route through. crossfader_override is
+-- per-track because a scene is the whole instrument. active_range (above) is the
+-- region/range twin of this, resolved separately for the trim-mapped points.
+local step_override = {}         -- suffix -> raw value (selected track only)
+local crossfader_override = {}   -- [track] -> {suffix -> raw value}
+
+-- The switch. track_value is the param's own stored value, passed in by the
+-- caller (the param action already holds it) to save a params:get; xform/offset
+-- still apply downstream exactly as for a live edit. Absent overrides fall
+-- straight through, so a param that is never p-locked or morphed is unchanged.
+function elasticat.resolve_base(track, suffix, track_value)
+  if track == engine_track then
+    local v = step_override[suffix]
+    if v ~= nil then
+      return v
+    end
+  end
+  local layer = crossfader_override[track]
+  if layer ~= nil then
+    local v = layer[suffix]
+    if v ~= nil then
+      return v
+    end
+  end
+  return track_value
+end
+
 -- Range Start/End (0-128) carve a live performance window *inside* the file
 -- trim window: 0 = trim start, 128 = trim end. Unlike file trim (saved per
 -- sample) this is a global, p-lockable layer. Returns the window in seconds.
@@ -995,6 +1030,13 @@ function elasticat.set_engine_track(track)
     -- the ~15Hz gap before the new track reports.
     mod_live.pitch, mod_live.cutoff, mod_live.res, mod_live.amp, mod_live.pan = 0, 0, 0, 0, 0
     filter_env_semitones = 0
+    -- step_override is a SINGLE selected-track layer (resolve_base applies it only
+    -- when track == engine_track). Drop it on a switch so a lock still firing on
+    -- the old track can't leak onto the new one; the sequencer re-establishes it
+    -- on the next step. (crossfader_override is per-track, so it is untouched.)
+    for suffix in pairs(step_override) do
+      step_override[suffix] = nil
+    end
   end
   engine_track = next_track
 end
@@ -1318,6 +1360,149 @@ elasticat.tr_queue = function(key, track, cmd, ...)
   end)
 end
 
+-- ---- Base-value resolver: publishing overrides + re-sending ---------------
+-- A continuous base param is a control (not option/binary) that pushes ONE
+-- value to the engine (has a cmd, no custom action) and is not a region point
+-- (loop_start/end resolve through region_point + active_range instead). Only
+-- these participate in the step/crossfader switch; everything else sends its own
+-- value unchanged.
+local function is_base_suffix(suffix)
+  local entry = ParamsSpec.BY_SUFFIX[suffix]
+  return entry ~= nil and entry.kind == nil and entry.cmd ~= nil
+    and entry.action == nil and entry.xform ~= "region_point"
+end
+elasticat.is_base_suffix = is_base_suffix
+
+-- Re-send ONE track's param through its EXACT transform + engine command, at the
+-- currently-resolved base (entry_action consults resolve_base). Same 12Hz
+-- coalescing queue a live edit uses, so a step firing/clearing at sequencer rate
+-- collapses to one send per param per flush -- the morph flood cannot return.
+local resend_deps = {
+  xforms = elasticat.param_xforms,
+  tr_now = elasticat.tr_now,
+  tr_queue = elasticat.tr_queue,
+  resolve_base = elasticat.resolve_base
+}
+local function resend_base(track, entry)
+  if entry == nil then
+    return
+  end
+  local pid = elasticat.track_pid(track, entry.suffix)
+  if not elasticat.param_exists(pid) then
+    return
+  end
+  ParamsSpec.entry_action(resend_deps, track, entry, pid)(params:get(pid))
+end
+
+-- Publish (value) or clear (nil) a firing step p-lock's value for a continuous
+-- base param on the SELECTED track, then re-send the resolved base. Returns
+-- false for params that are NOT continuous base values (discrete/option/binary
+-- p-locks, region/range) so the caller falls back to the destructive params:set
+-- path those still use.
+-- A param is resolvable on a track when its KNOB edit also flows through
+-- entry_action -- so an edit made while an override is live is itself resolved
+-- and the override wins. That is every base param on tracks 2-8, and the `t1`
+-- base params on track 1. Track 1's remaining hand-registered params (pitch,
+-- xfade, chop/grain, slice times) bypass entry_action, so on track 1 they keep
+-- the destructive path (fixed once track 1 is fully SPEC-registered --
+-- docs/BASE_VALUE_RESOLVER.md follow-up).
+function elasticat.is_resolvable(track, suffix)
+  local entry = ParamsSpec.BY_SUFFIX[suffix]
+  return entry ~= nil and is_base_suffix(suffix) and (track > 1 or entry.t1 == true)
+end
+
+function elasticat.set_step_override(suffix, value)
+  if not elasticat.is_resolvable(engine_track, suffix) then
+    return false
+  end
+  if step_override[suffix] == value then
+    return true
+  end
+  step_override[suffix] = value
+  resend_base(engine_track, ParamsSpec.BY_SUFFIX[suffix])
+  return true
+end
+
+-- Crossfader morph = source 2 (docs/BASE_VALUE_RESOLVER.md). SceneStore:apply
+-- publishes each morph target's interpolated value here -- per-track, since a
+-- scene is the whole instrument -- instead of mutating the track param, so the
+-- stored bar keeps the track value and the knob keeps source 1. Self-skips an
+-- unchanged value, so a fader tick re-sends only what moved (the morph-flood fix
+-- stays intact). Returns false for a non-resolvable param so the caller can fall
+-- back to a direct params:set (region/range, track-1 hand-registered).
+function elasticat.set_crossfader_override(track, suffix, value)
+  if not elasticat.is_resolvable(track, suffix) then
+    return false
+  end
+  local layer = crossfader_override[track]
+  if layer == nil then
+    layer = {}
+    crossfader_override[track] = layer
+  end
+  if layer[suffix] ~= value then
+    layer[suffix] = value
+    resend_base(track, ParamsSpec.BY_SUFFIX[suffix])
+  end
+  return true
+end
+
+-- A normal knob edit on a morph target takes that param back from the crossfader:
+-- drop its crossfader override so the track value (source 1) is what plays, until
+-- the fader is next moved and re-applies the morph. Owner: "if I am not moving the
+-- crossfader, adjusting the track cutoff should make it the base value." No-op
+-- when the param is not currently morphing. Called from the SELECTED track's
+-- normal-edit hook (scene_base_follow), so it uses engine_track.
+function elasticat.knob_takes_over(suffix)
+  local layer = crossfader_override[engine_track]
+  if layer ~= nil and layer[suffix] ~= nil then
+    layer[suffix] = nil
+    resend_base(engine_track, ParamsSpec.BY_SUFFIX[suffix])
+  end
+end
+
+-- Drop crossfader overrides whose param left the morph set (unlocked from both
+-- scenes, or its endpoints became equal) so the knob (source 1) regains control,
+-- re-sending each dropped param at its now-resolved base. active_set is
+-- {full_id -> true} of the CURRENT morph targets. O(live overrides), and only
+-- re-sends the few that actually dropped. Setting an existing field to nil mid
+-- pairs() is defined behaviour in Lua.
+function elasticat.reconcile_crossfader(active_set)
+  active_set = active_set or {}
+  for track, layer in pairs(crossfader_override) do
+    for suffix in pairs(layer) do
+      if active_set[elasticat.track_pid(track, suffix)] == nil then
+        layer[suffix] = nil
+        resend_base(track, ParamsSpec.BY_SUFFIX[suffix])
+      end
+    end
+  end
+end
+
+-- True while any override layer holds a value, so the render can skip the
+-- per-cell resolve entirely in the common case (nothing p-locked or morphing).
+function elasticat.has_base_override()
+  if next(step_override) ~= nil then
+    return true
+  end
+  for _, layer in pairs(crossfader_override) do
+    if next(layer) ~= nil then
+      return true
+    end
+  end
+  return false
+end
+
+-- The RESOLVED base of a selected-track param -- what a firing step lock (or a
+-- morph) is actually sending, for the actual bar / filter curve to draw during
+-- playback. Raw units, like params:get; nil if the param does not exist.
+function elasticat.resolved_value(suffix)
+  local pid = elasticat.track_pid(engine_track, suffix)
+  if not elasticat.param_exists(pid) then
+    return nil
+  end
+  return elasticat.resolve_base(engine_track, suffix, params:get(pid))
+end
+
 -- Re-send ONE track's envelope times (used when its env_range changes the
 -- seconds mapping); guarded so it is a no-op before the params exist.
 resend_env_times = function(track)
@@ -1606,7 +1791,8 @@ end
 elasticat.sync_deps = {
   xforms = elasticat.param_xforms,
   tr_now = elasticat.tr_now,
-  tr_queue = elasticat.tr_now
+  tr_queue = elasticat.tr_now,
+  resolve_base = elasticat.resolve_base
 }
 
 elasticat.sync_entry = function(track, entry)
@@ -2897,6 +3083,7 @@ function elasticat.params(options)
     tr_call = tr_call,
     tr_now = elasticat.tr_now,
     tr_queue = elasticat.tr_queue,
+    resolve_base = elasticat.resolve_base,
     engine_call = engine_call,
     xforms = elasticat.param_xforms,
     formatters = elasticat.param_formatters,

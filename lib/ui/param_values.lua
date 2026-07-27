@@ -152,6 +152,12 @@ function ParamValues.new(opts)
     get_sample_duration = opts.get_sample_duration,
     active_step_lock_bases = opts.active_step_lock_bases or {},
     active_step_lock_ids = opts.active_step_lock_ids or {},
+    -- Base-value resolver (docs/BASE_VALUE_RESOLVER.md): for a CONTINUOUS base
+    -- param, publish/clear a non-destructive step override instead of mutating
+    -- the track param. Returns true when it took the param; false (or absent)
+    -- means fall back to the destructive params:set path (discrete/option/binary
+    -- p-locks, region/range, and track-1 hand-registered params keep it).
+    set_base_override = opts.set_base_override,
     value_flash_until = opts.value_flash_until or {},
     value_flash_seconds = opts.value_flash_seconds or 0.85,
     applying_step_locks = false
@@ -508,11 +514,19 @@ function ParamValues:apply_step_param_locks(locks)
   locks = locks or {}
   self.applying_step_locks = true
 
+  local override = self.set_base_override
+
   for lock_id, _ in pairs(self.active_step_lock_ids) do
     if locks[lock_id] == nil then
-      local base = self.active_step_lock_bases[lock_id]
-      if base ~= nil then
-        self:apply_param_lock_value(lock_id, base)
+      -- Continuous base param: clear its non-destructive override. Only if the
+      -- resolver did NOT own it do we restore a snapshotted base (the
+      -- destructive path discrete/region p-locks still use). A base is never
+      -- snapshotted for an override param, so this branch never runs for one.
+      if not (override ~= nil and override(lock_id, nil)) then
+        local base = self.active_step_lock_bases[lock_id]
+        if base ~= nil then
+          self:apply_param_lock_value(lock_id, base)
+        end
       end
       self.active_step_lock_ids[lock_id] = nil
       self.active_step_lock_bases[lock_id] = nil
@@ -520,11 +534,15 @@ function ParamValues:apply_step_param_locks(locks)
   end
 
   for lock_id, value in pairs(locks) do
-    if self.active_step_lock_bases[lock_id] == nil and params:lookup_param(self.id(lock_id)) ~= nil then
-      self.active_step_lock_bases[lock_id] = params:get(self.id(lock_id))
+    -- Publish the override first; only fall back to the destructive snapshot +
+    -- params:set when the resolver declines (returns false / not wired).
+    if override == nil or not override(lock_id, value) then
+      if self.active_step_lock_bases[lock_id] == nil and params:lookup_param(self.id(lock_id)) ~= nil then
+        self.active_step_lock_bases[lock_id] = params:get(self.id(lock_id))
+      end
+      self:apply_param_lock_value(lock_id, value)
     end
     self.active_step_lock_ids[lock_id] = true
-    self:apply_param_lock_value(lock_id, value)
   end
   self.applying_step_locks = false
 end

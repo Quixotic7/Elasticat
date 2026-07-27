@@ -364,8 +364,17 @@ function SourcePage:draw_waveform(opts)
     self:draw_marker_pair(marker_range_lo, marker_range_hi, view_lo, view_hi, x0, y0, width, height)
   else
     screen.level(9)
-    self:draw_waveform_marker(visual_start, x0, y0, width, height, "start")
-    self:draw_waveform_marker(visual_end, x0, y0, width, height, "end")
+    -- Base-value model (docs/BASE_VALUE_RESOLVER.md): during playback the start/
+    -- end markers follow the RESOLVED active region (a firing step region p-lock,
+    -- or the live scrub) -- start_point/end_point are already what the playhead
+    -- rides -- so you see where the loop ACTUALLY is. Stopped (incl. a held-step
+    -- preview), visual_param_value shows the stored / held-lock points.
+    local mark_start, mark_end = visual_start, visual_end
+    if self.get_playing ~= nil and self.get_playing() then
+      mark_start, mark_end = start_point, end_point
+    end
+    self:draw_waveform_marker(mark_start, x0, y0, width, height, "start")
+    self:draw_waveform_marker(mark_end, x0, y0, width, height, "end")
 
     -- Only show the playhead while the transport is actually playing. While
     -- stopped (incl. a held-step preview) it would sit static and misleading.

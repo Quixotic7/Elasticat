@@ -262,6 +262,17 @@ function SceneStore:morph_target_count()
   return #self:morph_targets()
 end
 
+-- The morph-target keys as a set {key -> true}, so the coordinator can tell the
+-- base-value resolver which crossfader overrides are still live and drop the
+-- rest (a param unlocked from both scenes must hand control back to the knob).
+function SceneStore:morph_target_keys()
+  local set = {}
+  for _, entry in ipairs(self:morph_targets()) do
+    set[entry.key] = true
+  end
+  return set
+end
+
 -- Morph to crossfade position t (0..1): every param in the precomputed morph
 -- set interpolates between its two ends and is pushed live. Params locked in
 -- neither scene -- and params whose ends are identical, which cannot move --
