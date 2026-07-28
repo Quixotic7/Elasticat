@@ -1687,10 +1687,15 @@ end
 -- selecting track 1 played both. `all_tracks` is kept for the callers that
 -- pass it, but it no longer changes what happens.
 function elasticat.play(state, all_tracks)
-  set_engine_play(state and 1 or 0)
+  -- `state` is the raw transport state. EVERY track (including track 1) runs its
+  -- free-running reader only on a CONTINUOUS (loop) machine; a slice machine
+  -- sounds from its own triggers, so its reader stays muted. Gating track 1 by
+  -- its OWN machine here is what lets a slice on track 1 coexist with a loop on
+  -- track 2 -- the caller must NOT pre-gate `state` by the SELECTED track's
+  -- machine (that silenced every loop track whenever a slice track was selected).
+  local machine1 = elasticat.track_param_value(1, "machine") or 1
+  set_engine_play((state and machine1 == 1) and 1 or 0)
   for track = 2, elasticat.active_track_count() do
-    -- Only continuous (loop) machines run a free-running reader; slice
-    -- machines sound from their own triggers, so play must not force them on.
     local machine = elasticat.track_param_value(track, "machine") or 1
     tr_call(track, "play", (state and machine == 1) and 1 or 0)
   end

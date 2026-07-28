@@ -209,8 +209,12 @@ local page_model = {
       {
         title = "SAMPLE",
         items = {
-          item("sample_bpm", "BPM", {lockable = false, always_value = true, min = 20, max = 300, step = 1, snaps = {60, 80, 90, 100, 110, 120, 128, 136, 140, 160, 180}}),
-          item("sample_steps", "STEP", {lockable = false, always_value = true, min = 1, max = 512, step = 1, snaps = {4, 8, 16, 32, 48, 64, 96, 128, 256, 512}}),
+          -- fn_to_edit: the sample's detected BPM / step count only change with FN
+          -- held, so a stray knob turn can't silently rewrite the warp reference
+          -- and force a recalculation (owner). FN also does the trim-zoom here,
+          -- but that only triggers on the trim items, so there is no conflict.
+          item("sample_bpm", "BPM", {lockable = false, fn_to_edit = true, always_value = true, min = 20, max = 300, step = 1, snaps = {60, 80, 90, 100, 110, 120, 128, 136, 140, 160, 180}}),
+          item("sample_steps", "STEP", {lockable = false, fn_to_edit = true, always_value = true, min = 1, max = 512, step = 1, snaps = {4, 8, 16, 32, 48, 64, 96, 128, 256, 512}}),
           item("sample", "FILE", {file = true, lockable = false}),
           item("file_slot", "SLOT", {lockable = false, min = 1, max = 128, step = 1, snaps = {1, 2, 4, 8, 16, 32, 64, 128}}),
           item("trim_start", "T-ST", {lockable = false, trim_scan = true, min = 0, max = 3600, step = 0.01, fine_step = 0.001}),

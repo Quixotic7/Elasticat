@@ -511,11 +511,6 @@ elasticat.osc_report = function(path, args)
   return false
 end
 
-local function machine_is_continuous()
-  local machine_param = params:lookup_param(id("machine"))
-  return machine_param == nil or params:get(id("machine")) == 1
-end
-
 -- Header messages auto-expire after ~1s. Expiry is handled by the redraw metro
 -- (see start_redraw_metro) via a timestamp rather than a per-message clock --
 -- rapid encoder edits used to churn clock.run/clock.cancel and could leave a
@@ -2677,9 +2672,11 @@ set_playing = function(state, reset_transport)
   params:set(id("play"), playing and 1 or 0, true)
   print("elasticat: K3/play state " .. tostring(playing and 1 or 0))
   if not reset_transport then
-    -- all_tracks: the master transport drives track 1 exactly as before PLUS
-    -- every other active track's chain (each gated on its own machine).
-    elasticat.play(playing and machine_is_continuous(), true)
+    -- Transport is GLOBAL: hand elasticat.play the raw state and let it gate EACH
+    -- track's reader by that track's own machine. Pre-gating by the selected
+    -- track's machine (machine_is_continuous) silenced every loop track whenever
+    -- a slice track was the editing focus (e.g. a slice on track 1, loop on 2).
+    elasticat.play(playing, true)
   end
   if grid_ui ~= nil then
     grid_ui:set_transport(playing, reset_transport)
