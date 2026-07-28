@@ -285,8 +285,10 @@ local page_model = {
       item("env_mode", "ENVELOPE MODE", {options = 2}),
       item("env_range", "ENVELOPE RANGE", {options = 10}),
       item("portamento", "PORTAMENTO", {binary = true, min = 0, max = 1, step = 1}),
-      item("slice_hold_to_step", "SLICE HOLD", {binary = true, min = 0, max = 1, step = 1}),
-      item("slice_polyphony", "SLICE POLY", {options = 2})
+      item("slice_hold_to_step", "SLICE HOLD", {binary = true, min = 0, max = 1, step = 1})
+      -- SLICE POLY removed: voicing is the MACHINE selector now (Slice/Razor mono,
+      -- Slice Poly/Razor Poly poly). The slice_polyphony param stays registered
+      -- for old-project compatibility but no longer drives anything.
     }
   },
   fx = {

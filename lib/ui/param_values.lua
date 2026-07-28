@@ -9,6 +9,17 @@ local PATTERN_RATES = TrackSequencer.RATES
 -- Rate labels come from TrackSequencer (shown as fractions, one source).
 local rate_label = TrackSequencer.rate_label
 
+-- Region params (loop/range) are the resolver's live-scrub inputs and are
+-- p-lockable per STEP only, never per slice (owner: "unlikely I'd want to lock
+-- region per slice"). effective_param_locks already drops them from the slice
+-- merge; the UI mirrors that, so editing range while holding a SLICE does the
+-- normal base edit rather than silently writing a slice lock that never applies.
+-- A held STEP still region-locks as before (the signature live-scrub feature).
+local SLICE_LOCK_EXCLUDED = {
+  loop_start = true, loop_end = true,
+  range_start = true, range_end = true
+}
+
 local function fmt_round(value)
   return tostring(math.floor((value or 0) + 0.5))
 end
@@ -189,6 +200,20 @@ function ParamValues:item_locked(param_item)
   return grid_ui:held_param_lock(param_item.lock_id or param_item.id) ~= nil
 end
 
+-- True if ANY step in the pattern p-locks this param (the low-profile corner dot,
+-- owner cue). STEP locks only -- scene locks are surfaced by holding the Scene
+-- keys, not this marker.
+function ParamValues:item_step_locked(param_item)
+  if param_item == nil or param_item.blank or param_item.lockable ~= true then
+    return false
+  end
+  local grid_ui = self.get_grid_ui()
+  if grid_ui == nil or grid_ui.any_step_locks == nil then
+    return false
+  end
+  return grid_ui:any_step_locks(param_item.lock_id or param_item.id) == true
+end
+
 function ParamValues:item_param_id(param_item)
   if param_item == nil or param_item.pseudo ~= nil then
     return nil
@@ -205,6 +230,10 @@ function ParamValues:item_long_name(param_item)
     return "trig length"
   elseif param_item.pseudo == "step_velocity" then
     return "velocity"
+  elseif param_item.pseudo == "slice_choke" then
+    return "choke group"
+  elseif param_item.pseudo == "slice_select" then
+    return "edit slice"
   elseif param_item.id == "default_length" then
     return "trig length"
   elseif param_item.id == "default_velocity" then
@@ -267,12 +296,24 @@ function ParamValues:item_raw_value(param_item)
   elseif param_item.pseudo == "step_velocity" then
     local fallback = self.param_value_or("default_velocity", self.get_default_trig_velocity())
     return grid_ui ~= nil and (grid_ui:held_param_lock("velocity") or fallback) or fallback
+  elseif param_item.pseudo == "slice_choke" then
+    -- Per-slice choke group of the held/selected slice (0 = None). Not a param.
+    return grid_ui ~= nil and grid_ui.choke_value ~= nil and grid_ui:choke_value() or 0
+  elseif param_item.pseudo == "slice_select" then
+    -- The Razor editor's selected slice (its Start/End edit target). Not a param.
+    return grid_ui ~= nil and grid_ui.get_selected_slice ~= nil and grid_ui:get_selected_slice() or 1
   elseif param_item.file then
     return self.sample_name()
   elseif params:lookup_param(self.id(param_item.id)) ~= nil then
     local lock_id = param_item.lock_id or param_item.id
+    -- While a step OR a slice is held, the cell shows that lock's value (the
+    -- slice's own identity for a held slice). held_param_lock routes to whichever.
+    -- Region params are step-lockable only, so a held slice does not show/edit
+    -- them as a slice lock (SLICE_LOCK_EXCLUDED).
     local step_edit = grid_ui ~= nil and grid_ui.screen_edit ~= nil and grid_ui:screen_edit() or nil
-    if step_edit ~= nil and param_item.lockable == true then
+    local slice_edit = step_edit == nil and grid_ui ~= nil and grid_ui.slice_edit ~= nil
+      and not SLICE_LOCK_EXCLUDED[lock_id] and grid_ui:slice_edit() or nil
+    if (step_edit ~= nil or slice_edit ~= nil) and param_item.lockable == true then
       local locked = grid_ui:held_param_lock(lock_id)
       if locked ~= nil then
         return locked
@@ -306,9 +347,13 @@ function ParamValues:format_item_value(param_item, value)
     if machine == "loop_trig" then
       return "trig"
     elseif machine == "grid_slice" then
-      return "grid"
+      return "slice"
     elseif machine == "razor_slice" then
       return "razor"
+    elseif machine == "slice_poly" then
+      return "s.poly"
+    elseif machine == "razor_poly" then
+      return "r.poly"
     end
     return machine
   elseif param_item.id == "mode" then
@@ -331,6 +376,11 @@ function ParamValues:format_item_value(param_item, value)
     return string.format("%.2f", value or self:item_raw_value(param_item))
   elseif param_item.pseudo == "step_velocity" then
     return tostring(math.floor(((value or self:item_raw_value(param_item)) * 100) + 0.5))
+  elseif param_item.pseudo == "slice_choke" then
+    local group = math.floor((value or self:item_raw_value(param_item)) + 0.5)
+    return group <= 0 and "None" or tostring(group)
+  elseif param_item.pseudo == "slice_select" then
+    return tostring(math.floor((value or self:item_raw_value(param_item)) + 0.5))
   elseif param_item.file then
     return self.sample_name()
   elseif param_item.binary then
@@ -486,6 +536,16 @@ function ParamValues:apply_item_value(param_item, value)
     if params:lookup_param(self.id("default_velocity")) ~= nil then
       params:set(self.id("default_velocity"), next_velocity, true)
     end
+  elseif param_item.pseudo == "slice_choke" then
+    -- Per-slice choke group: write the held/selected slice(s). Not a param.
+    if grid_ui ~= nil and grid_ui.set_choke_value ~= nil then
+      grid_ui:set_choke_value(util.clamp(math.floor(value + 0.5), param_item.min or 0, param_item.max or 8))
+    end
+  elseif param_item.pseudo == "slice_select" then
+    -- Move the Razor editor's selected slice. Not a param.
+    if grid_ui ~= nil and grid_ui.set_selected_slice ~= nil then
+      grid_ui:set_selected_slice(value)
+    end
   elseif params:lookup_param(self.id(param_item.id)) ~= nil then
     params:set(self.id(param_item.id), value)
   end
@@ -574,8 +634,15 @@ function ParamValues:delta_item(param_item, delta)
     delta = acc
   end
 
+  -- P-lock target: a held STEP, or (none held) a held SLICE -- its own identity
+  -- (MPC chop program). held_param_lock / set_held_param_lock route to whichever
+  -- is active, so the edit lands on the step or the slice. Region params are
+  -- step-lockable only: while holding a slice they fall through to a normal base
+  -- edit (SLICE_LOCK_EXCLUDED), never a per-slice lock.
   local step_edit = grid_ui ~= nil and grid_ui.screen_edit ~= nil and grid_ui:screen_edit() or nil
-  local locking = step_edit ~= nil and param_item.lockable == true
+  local slice_edit = step_edit == nil and grid_ui ~= nil and grid_ui.slice_edit ~= nil
+    and not SLICE_LOCK_EXCLUDED[lock_id] and grid_ui:slice_edit() or nil
+  local locking = (step_edit ~= nil or slice_edit ~= nil) and param_item.lockable == true
   local current = locking and (grid_ui:held_param_lock(lock_id) or self:item_raw_value(param_item)) or self:item_raw_value(param_item)
   local next_value = self:adjusted_value(param_item, current, delta, self.get_alt())
 

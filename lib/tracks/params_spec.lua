@@ -109,7 +109,7 @@ ParamsSpec.SPEC = {
   {suffix = "slice_count", name = "slice count", spec = {1, 32, "lin", 1, 16, "", 1 / 31}},
   {suffix = "slice_index", name = "slice index", spec = {1, 32, "lin", 1, 1, "", 1 / 31}},
   {suffix = "slice_play_mode", name = "slice play mode", kind = "option",
-    options = {"1 shot", "1 shot hold", "loop", "continue"}, default = 1},
+    options = {"1 shot", "hold", "loop", "continue", "ping-pong", "cont loop"}, default = 1},
   {suffix = "slice_reverse", name = "slice reverse", kind = "binary", default = 0},
   {suffix = "slice_sync", name = "slice clock sync", kind = "binary", default = 1, cmd = "setSliceSyncToClock"},
   {suffix = "slice_rate", name = "slice rate", spec = {0.125, 8, "exp", 0.01, 1, "x", 0.01}, cmd = "setSliceRate", queue = true},

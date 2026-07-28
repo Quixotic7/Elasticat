@@ -1650,6 +1650,26 @@ local function source_sample_items()
   return MachineRegistry.source_items(param_value_or("machine", 1), ParamItem)
 end
 
+-- Razor slice-point EDITOR (source page 1 for Razor / Razor Poly). Grid keys (or
+-- the SLIC selector) pick a slice; the bottom row edits THAT slice's Start / End
+-- (the real razor_NN params, global), plus the snap toggle and choke. Reverse is
+-- dropped here (it lives on the Machine page). `razor_point` tags Start/End so the
+-- waveform can draw their markers and FN can zoom around them. On the elasticat
+-- module table (not a file local) -- the coordinator is at LuaJIT's 200-local cap.
+elasticat.razor_editor_items = function()
+  local sel = (grid_ui ~= nil and grid_ui.get_selected_slice ~= nil) and grid_ui:get_selected_slice() or 1
+  return {
+    ParamItem.item("pitch", "P/T", {lockable = true, min = -24, max = 24, step = 0.1, snaps = {-24, -12, -7, 0, 7, 12, 24}}),
+    ParamItem.item("slice_play_mode", "PLAY", {lockable = true, options = 6}),
+    ParamItem.item("slice_select", "SLIC", {pseudo = "slice_select", lockable = false, min = 1, max = 32, step = 1, snaps = {1, 2, 4, 8, 16, 32}}),
+    ParamItem.item("sample_slot", "SLOT", {lockable = true, min = 1, max = 128, step = 1, snaps = {1, 2, 4, 8, 16, 32, 64, 128}}),
+    ParamItem.item(string.format("razor_%02d_start", sel), "STRT", {lockable = false, min = 0, max = 128, step = 0.5, razor_point = "start", razor_slice = sel}),
+    ParamItem.item(string.format("razor_%02d_end", sel), "END", {lockable = false, min = 0, max = 128, step = 0.5, razor_point = "end", razor_slice = sel}),
+    ParamItem.item("slice_snap", "SNAP", {lockable = false, options = 3}),
+    ParamItem.item("slice_choke", "CHOK", {pseudo = "slice_choke", lockable = false, min = 0, max = 8, step = 1})
+  }
+end
+
 local function source_machine_items()
   return MachineRegistry.machine_items(param_value_or("machine", 1), ParamItem)
 end
@@ -1660,9 +1680,10 @@ local function source_warp_items()
   -- p-lockable and cannot change during playback -- changing the warp algorithm
   -- mid-run respawns the reader (and would need a different per-warp slice def),
   -- so every slice in a session shares one warp. `no_edit_playing` blocks the
-  -- encoder edit while the transport runs (see the enc handler).
+  -- encoder edit while the transport runs; `fn_to_edit` requires FN held to
+  -- change it at all, so the knob can't flip the warp engine by accident (owner).
   table.insert(items, 1, ParamItem.item("mode", "WARP",
-    {lockable = false, no_edit_playing = true, options = 6}))
+    {lockable = false, no_edit_playing = true, fn_to_edit = true, options = 6}))
   return items
 end
 
@@ -1922,14 +1943,24 @@ local function page_items_for(category, page, page_index)
   elseif category == "trig" and page_index == 3 then
     return trig_machine_items()
   elseif category == "source" and page_index == 1 then
+    local machine = param_value_or("machine", 1)
+    if machine == 4 or machine == 6 then   -- Razor / Razor Poly: slice-point editor
+      return elasticat.razor_editor_items()
+    end
     return source_sample_items()
   elseif category == "source" and page_index == 2 then
     return source_machine_items()
   elseif category == "source" and page_index == 3 then
-    local machine_items = MachineRegistry.source_page2_items(param_value_or("machine", 1), ParamItem)
+    local machine = param_value_or("machine", 1)
+    local machine_items = MachineRegistry.source_page2_items(machine, ParamItem)
     if machine_items ~= nil then
       return machine_items
     end
+    -- WARP page: WARP selector + the current warp mode's params (grain size/
+    -- density, OLA window, PC window, ...), same as the loop machine. Slice SYNC
+    -- and RATE are NOT added here -- they live on the Machine page, and appending
+    -- them could overrun the warp mode's own params and render on top of them
+    -- (owner: the chopped engine collided).
     return source_warp_items()
   end
   return page.items or {}
@@ -2305,7 +2336,21 @@ local source_page = SourcePage.new({
   -- (slice_count) follow the selection; globals pass through unchanged.
   id = ui_id,
   get_alt = fn_active,
-  get_last_trim_focus = function() return last_trim_focus end
+  get_last_trim_focus = function() return last_trim_focus end,
+  -- Slices currently sounding on the selected track (sequenced while playing +
+  -- live grid holds), for the waveform to light up which slice is playing.
+  active_slices = function()
+    return grid_ui ~= nil and grid_ui.active_slices ~= nil and grid_ui:active_slices() or {}
+  end,
+  -- A slice's [start, end] in 0-128 for the waveform boundaries: equal divisions
+  -- (Grid) or the razor points (Razor). Selected track.
+  slice_bounds = function(slice)
+    return elasticat.seq_slice_range(elasticat.engine_track(), slice)
+  end,
+  -- The slice the Razor editor is editing, so the waveform marks its Start/End.
+  selected_slice = function()
+    return grid_ui ~= nil and grid_ui.get_selected_slice ~= nil and grid_ui:get_selected_slice() or 1
+  end
 })
 
 -- ---- MIX overview page (master category, page 2) ---------------------------
@@ -2540,8 +2585,9 @@ local function register_settings_focus_handler()
       elseif action == "page_delta" then
         -- Preserve the FN+E1-leftward "close settings" gesture; a plain E1
         -- walks every settings page across all categories (so norns-only users
-        -- can reach master's PROJECT page).
-        if alt and (value or 0) < 0 then
+        -- can reach master's PROJECT page). fn_active(): the grid FN counts too,
+        -- not just norns K1 -- one FN source of truth.
+        if fn_active() and (value or 0) < 0 then
           nav:close_param_settings()
         else
           nav:settings_page_or_category_delta(value or 0)
@@ -2805,11 +2851,17 @@ end
 elasticat.seq_trigger_slice = function(track, slice, start_point, end_point, options)
   local mode = (elasticat.track_param_value(track, "slice_play_mode") or 1) - 1
   local reverse = elasticat.track_param_value(track, "slice_reverse") == 1
+  -- Voicing is the MACHINE now: Slice (3) / Razor (4) are MONO, Slice Poly (5) /
+  -- Razor Poly (6) are POLY. A mono voice steals this track's previous slice on
+  -- the next trig; poly stacks up to the voice cap.
+  local machine = elasticat.track_param_value(track, "machine") or 1
+  local mono = (machine == 3 or machine == 4) and 1 or 0
   -- One path: the facade applies THIS track's file-trim/range mapping. The
   -- background branch that used to live here sent raw points (see
-  -- seq_set_loop_region above).
+  -- seq_set_loop_region above). options.choke is the slice's per-slice choke
+  -- group (MPC mute group), resolved per slice by the caller.
   elasticat.trigger_slice(slice, start_point, end_point, mode, reverse,
-    options.velocity, options.length_seconds, options.pitch, track)
+    options.velocity, options.length_seconds, options.pitch, track, options.choke, mono)
 end
 
 elasticat.seq_trigger_region = function(track, start_point, end_point, options)
@@ -2827,7 +2879,8 @@ end
 -- Grid Slice divides THIS track's loop region; Razor reads the shared split
 -- table (still global -- 64 params x 8 tracks is deferred, see params_spec).
 elasticat.seq_slice_range = function(track, slice)
-  if (elasticat.track_param_value(track, "machine") or 1) == 4 then
+  local machine = elasticat.track_param_value(track, "machine") or 1
+  if machine == 4 or machine == 6 then   -- Razor + Razor Poly: arbitrary points
     local start_point = params:get(id(string.format("razor_%02d_start", slice)))
     local end_point = params:get(id(string.format("razor_%02d_end", slice)))
     if end_point <= start_point then
@@ -3192,6 +3245,7 @@ function init()
     trigger_slice = elasticat.seq_trigger_slice,
     release_slice = elasticat.seq_release_slice,
     release_all_slices = elasticat.seq_release_all_slices,
+    kill_all_slices = elasticat.kill_all_slices,
     apply_step_param_locks = elasticat.seq_apply_locks,
     get_track_slice_range = elasticat.seq_slice_range,
     -- Macro key LEDs read the live macro value (0-127) for their brightness.
@@ -3667,58 +3721,116 @@ local function draw_pattern_quantize_menu()
   end
 end
 
+-- ---- Base-surface input actions (elasticat-input-actions) ------------------
+-- The norns key/encoder base surface routes through the input router's action
+-- layer: physical inputs -> NAMED actions bound in ONE table, modifier-aware, so
+-- a remap is one edit (here) not 40, and a new device (MIDI/OSC, knob
+-- controllers) is one translator that emits the same action names. The handler
+-- closes over the coordinator state the actions need. param_edit carries the
+-- pair SLOT (1/2) -- the seam a future MIDI knob binds to, to address any page
+-- param, not just norns' selected pair.
+input_router:set_base({
+  bindings = {
+    ["key:2"] = "nav_prev", ["key:3"] = "nav_next",
+    ["enc:1"] = "page_delta", ["enc:2"] = "param_edit_left", ["enc:3"] = "param_edit_right",
+  },
+  -- Most specific first: a held macro re-purposes E2/E3; a held scene anchor /
+  -- held step / FN re-purpose the keys; FN also re-purposes E1.
+  modifier_layers = {
+    {mod = "macro_held", map = {["enc:2"] = "macro_assign_left", ["enc:3"] = "macro_assign_right"}},
+    {mod = "scene_held", map = {["key:2"] = "clear_scene_lock", ["key:3"] = "clear_scene_lock"}},
+    {mod = "step_held",  map = {["key:2"] = "clear_step_lock",  ["key:3"] = "clear_step_lock"}},
+    -- A held SLICE (no step) routes B2/B3 to the same clear -- clear_held_param_
+    -- lock resolves to the held slice's own p-lock (MPC chop program). Placed
+    -- before fn so FN+slice+B2 still clears just that slice.
+    {mod = "slice_held", map = {["key:2"] = "clear_step_lock",  ["key:3"] = "clear_step_lock"}},
+    {mod = "fn",         map = {["key:2"] = "clear_all_step_locks", ["key:3"] = "clear_all_step_locks",
+                                ["enc:1"] = "settings_delta"}},
+  },
+  modifiers = {
+    fn = fn_active,
+    scene_held = function() return scene_store ~= nil and scene_store:edit_target_scene() ~= nil end,
+    step_held = function() return grid_ui ~= nil and grid_ui.screen_edit ~= nil and grid_ui:screen_edit() ~= nil end,
+    slice_held = function() return grid_ui ~= nil and grid_ui.slice_edit ~= nil and grid_ui:slice_edit() ~= nil end,
+    macro_held = function() return grid_ui ~= nil and grid_ui.held_macro ~= nil and grid_ui:held_macro() ~= nil end,
+  },
+  handler = function(action, value, physical)
+    local slot = (physical == "key:3" or physical == "enc:3") and 2 or 1
+    if action == "nav_prev" then
+      nav:cycle_group(-1)
+    elseif action == "nav_next" then
+      nav:cycle_group(1)
+    elseif action == "clear_scene_lock" then
+      clear_scene_lock_for_slot(slot)
+    elseif action == "clear_step_lock" then
+      clear_lock_for_slot(slot, false)
+    elseif action == "clear_all_step_locks" then
+      clear_lock_for_slot(slot, true)
+    elseif action == "page_delta" then
+      nav:select_global_page_delta(value)
+    elseif action == "settings_delta" then
+      if value > 0 then
+        nav:open_param_settings(nav:current_category())
+      elseif value < 0 then
+        nav:close_param_settings()
+      end
+    elseif action == "param_edit_left" or action == "param_edit_right" then
+      local left, right = nav:current_group_items()
+      local item = slot == 2 and right or left
+      -- Owner: warp mode (no_edit_playing) can't change while the transport runs.
+      if item ~= nil and item.no_edit_playing == true and playing then
+        show_message("Stop to change " .. (item.short or "this"))
+      -- Owner: the Warp Type (fn_to_edit) only changes with FN held, so the knob
+      -- can't flip the warp engine by accident.
+      elseif item ~= nil and item.fn_to_edit == true and not fn_active() then
+        show_message("FN + turn to change " .. (item.short or "this"))
+      -- Held A/B anchor: the edit p-locks into that scene instead (PRD §6.6).
+      elseif not scene_edit_item(item, value) then
+        elasticat.undo_record_param(item)
+        param_values:delta_item(item, value)
+        scene_base_follow(item)
+      end
+    elseif action == "macro_assign_left" or action == "macro_assign_right" then
+      -- Held macro = mod-matrix assign: E2/E3 dial the SIGNED depth from this
+      -- macro to the target param's mod destination (never edits the value).
+      local held_macro = grid_ui ~= nil and grid_ui:held_macro() or nil
+      local left, right = nav:current_group_items()
+      local target = slot == 2 and right or left
+      local dest = (held_macro ~= nil and target ~= nil) and elasticat.macro_dest_for_param(target.id) or nil
+      if dest ~= nil then
+        local pid = elasticat.macro_depth_id(held_macro, dest)
+        if pid ~= nil and params:lookup_param(pid) ~= nil then
+          params:set(pid, util.clamp((params:get(pid) or 64) + value, 0, 128))
+          show_message(string.format("M%d %s %+d", held_macro,
+            target.short or dest.key, (params:get(pid) or 64) - 64))
+        end
+      elseif held_macro ~= nil then
+        show_message(string.format("M%d: turn a mod dest", held_macro))
+      end
+    end
+  end,
+})
+
 function key(n, z)
   -- The text-entry modal swallows all front-panel input while open (PRD §7.3).
   if text_entry ~= nil and text_entry:key(n, z) then
     request_redraw()
     return
   end
-
-  -- Universal input router: any open modal layer (e.g. the pattern-change
-  -- pop-up) consumes semantic actions -- K3=confirm, K2=cancel per the project
-  -- input conventions (lib/input/router.lua). K1 is never routed: FN only.
-  if input_router:norns_key(n, z) then
-    request_redraw()
-    return
-  end
-
+  -- K1 is the FN modifier only (never an action) -- track its norns source;
+  -- fn_active() OR's this with the grid FN. Modals never see K1.
   if n == 1 then
     alt = z == 1
     request_redraw()
     return
   end
-
-  if z == 0 then
+  -- Base key actions fire on key-DOWN only (matches the old z==0 early return).
+  if z ~= 1 then
     return
   end
-
-  -- NOTE: the settings layer's K2/K3 handling now lives in the resident
-  -- "settings_layer" router focus handler (see init) -- K3/YES = confirm,
-  -- K2/NO = cancel -- so by the time execution reaches here the settings
-  -- layer is closed and these are the base-surface keys.
-  local step_edit = grid_ui ~= nil and grid_ui.screen_edit ~= nil and grid_ui:screen_edit() or nil
-  local scene_held = scene_store ~= nil and scene_store:edit_target_scene() ~= nil
-  if n == 2 or n == 3 then
-    local slot = n == 2 and 1 or 2
-    -- Held Scene anchor takes precedence: B2/B3 clears the selected param from
-    -- BOTH scenes (#43), the scene-lock analogue of the step-lock clear below.
-    if scene_held then
-      clear_scene_lock_for_slot(slot)
-      return
-    end
-    if step_edit ~= nil then
-      clear_lock_for_slot(slot, false)
-      return
-    elseif alt then
-      clear_lock_for_slot(slot, true)
-      return
-    end
-
-    local delta = n == 2 and -1 or 1
-    nav:cycle_group(delta)
-    request_redraw()
-  end
-
+  -- Modal focus stack first (K3=confirm / K2=cancel), then the base-surface
+  -- action layer (nav / clear, modifier-resolved) -- both via the router.
+  input_router:norns_key(n, z)
   request_redraw()
 end
 
@@ -3727,72 +3839,11 @@ function enc(n, d)
     request_redraw()
     return
   end
-
-  -- Universal input router: an open modal layer consumes encoder actions
-  -- (E2 = select_delta) before the base UI sees them.
-  if input_router:enc(n, d) then
-    request_redraw()
-    return
-  end
-
-  -- Held macro key (grid row 4, cols 1-4) = mod-matrix assign mode: turning a
-  -- destination param's encoder (E2 = the selected pair's left param, E3 =
-  -- right) dials that macro's SIGNED depth to that destination. Turning a param
-  -- that isn't a modulation destination just says so -- it never edits the
-  -- param value while a macro is held. The macro's own VALUE is driven from the
-  -- MACROS page (or an LFO targeting it).
-  local held_macro = (grid_ui ~= nil and grid_ui.held_macro ~= nil) and grid_ui:held_macro() or nil
-  if held_macro ~= nil and (n == 2 or n == 3) then
-    local left, right = nav:current_group_items()
-    local target = (n == 2) and left or right
-    local dest = target ~= nil and elasticat.macro_dest_for_param(target.id) or nil
-    if dest ~= nil then
-      local pid = elasticat.macro_depth_id(held_macro, dest)
-      if pid ~= nil and params:lookup_param(pid) ~= nil then
-        params:set(pid, util.clamp((params:get(pid) or 64) + d, 0, 128))
-        show_message(string.format("M%d %s %+d", held_macro,
-          target.short or dest.key, (params:get(pid) or 64) - 64))
-      end
-    else
-      show_message(string.format("M%d: turn a mod dest", held_macro))
-    end
-    request_redraw()
-    return
-  end
-
-  -- NOTE: the settings layer's E1/E2/E3 handling now lives in the resident
-  -- "settings_layer" router focus handler (see init); with settings closed the
-  -- router falls through to the base behavior below.
-  if n == 1 and alt then
-    if d > 0 then
-      nav:open_param_settings(nav:current_category())
-    elseif d < 0 then
-      nav:close_param_settings()
-    end
-  elseif n == 1 then
-    nav:select_global_page_delta(d)
-  elseif n == 2 then
-    local left = nav:current_group_items()
-    -- Owner: warp mode (no_edit_playing) can't change while the transport runs.
-    if left ~= nil and left.no_edit_playing == true and playing then
-      show_message("Stop to change " .. (left.short or "this"))
-    -- Held A/B anchor: the edit p-locks into that scene instead (PRD §6.6).
-    elseif not scene_edit_item(left, d) then
-      elasticat.undo_record_param(left)
-      param_values:delta_item(left, d)
-      scene_base_follow(left)
-    end
-  elseif n == 3 then
-    local _, right = nav:current_group_items()
-    if right ~= nil and right.no_edit_playing == true and playing then
-      show_message("Stop to change " .. (right.short or "this"))
-    elseif not scene_edit_item(right, d) then
-      elasticat.undo_record_param(right)
-      param_values:delta_item(right, d)
-      scene_base_follow(right)
-    end
-  end
-
+  -- Modal focus stack first (E2=select_delta, ...), then the base-surface action
+  -- layer (page nav / param edit / macro assign / settings, modifier-resolved) --
+  -- both via the router. All the old E1/E2/E3 + FN + macro-held + scene-anchor
+  -- branches now live in the base handler registered above (set_base).
+  input_router:enc(n, d)
   request_redraw()
 end
 

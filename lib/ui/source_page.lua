@@ -34,7 +34,10 @@ function SourcePage.new(opts)
     visual_param_value = opts.visual_param_value,
     id = opts.id,
     get_alt = opts.get_alt,
-    get_last_trim_focus = opts.get_last_trim_focus
+    get_last_trim_focus = opts.get_last_trim_focus,
+    active_slices = opts.active_slices,
+    slice_bounds = opts.slice_bounds,
+    selected_slice = opts.selected_slice
   }, SourcePage)
 end
 
@@ -264,6 +267,11 @@ function SourcePage:draw_waveform(opts)
     view_lo, view_hi = 0, 1
   elseif opts.range_edit then
     view_lo, view_hi = trim_lo, trim_hi
+  elseif opts.show_slices then
+    -- Slice machine: show the WHOLE trim window (all slices) at all times -- the
+    -- active slice is highlighted IN the waveform (below), so the view never
+    -- zooms to a single slice or sweeps markers around (owner).
+    view_lo, view_hi = trim_lo, trim_hi
   else
     -- Main view follows the Actual Range so the shown slice re-renders with a
     -- sequenced sweep.
@@ -311,6 +319,33 @@ function SourcePage:draw_waveform(opts)
     shade_lo, shade_hi = trim_lo, trim_hi
   end
 
+  -- Slice machine: the ACTIVE slice's waveform is shaded bright (the highlight),
+  -- the rest dim. Boundaries come from slice_bounds (0-128): equal divisions for
+  -- Grid, the arbitrary razor points for Razor -- so the chops render where they
+  -- actually are. Precompute each slice's column span [lo, hi) once, and the set
+  -- of bright columns, so the render loop stays a single level pass.
+  local slice_count, slice_ranges, bright_col
+  if opts.show_slices then
+    slice_count = util.clamp(math.floor((params:get(self.id("slice_count")) or 1) + 0.5), 1, 32)
+    local slice_active = self.active_slices ~= nil and self.active_slices() or {}
+    slice_ranges = {}
+    bright_col = {}
+    for s = 1, slice_count do
+      local lo, hi
+      if self.slice_bounds ~= nil then
+        lo, hi = self.slice_bounds(s)
+      else
+        lo, hi = (s - 1) * 128 / slice_count, s * 128 / slice_count
+      end
+      local c_lo = math.floor((util.clamp(math.min(lo, hi), 0, 128) / 128) * width + 0.5)
+      local c_hi = math.floor((util.clamp(math.max(lo, hi), 0, 128) / 128) * width + 0.5)
+      slice_ranges[s] = {lo = c_lo, hi = c_hi, active = slice_active[s] == true}
+      if slice_active[s] then
+        for c = c_lo, c_hi - 1 do bright_col[c] = true end
+      end
+    end
+  end
+
   local current_level = nil
   for column = 0, width - 1 do
     local fraction = view_lo + ((view_hi - view_lo) * (column / math.max(1, width - 1)))
@@ -319,7 +354,12 @@ function SourcePage:draw_waveform(opts)
     local amp = math.max(1, math.floor((height / 2) * peak))
     local top = util.clamp(center - amp, y0, y0 + height - 1)
     local bottom = util.clamp(center + amp, y0, y0 + height - 1)
-    local level = (fraction >= shade_lo and fraction <= shade_hi) and 6 or 2
+    local level
+    if opts.show_slices then
+      level = bright_col[column] and 8 or 2
+    else
+      level = (fraction >= shade_lo and fraction <= shade_hi) and 6 or 2
+    end
     if level ~= current_level then
       screen.level(level)
       current_level = level
@@ -329,14 +369,54 @@ function SourcePage:draw_waveform(opts)
   end
 
   if opts.show_slices then
-    local slice_count = util.clamp(math.floor((params:get(self.id("slice_count")) or 1) + 0.5), 1, 32)
+    -- Accent each ACTIVE slice with a bright bar across the top + bottom of its
+    -- segment (one level pass, redraw-metro law).
+    local any_active = false
+    screen.level(15)
+    for s = 1, slice_count do
+      local r = slice_ranges[s]
+      if r.active then
+        any_active = true
+        local w = math.max(1, r.hi - r.lo)
+        screen.rect(x0 + r.lo, y0, w, 1)
+        screen.rect(x0 + r.lo, y0 + height - 1, w, 1)
+      end
+    end
+    if any_active then screen.fill() end
+    -- Division line at each slice boundary (razor points / equal divisions).
     screen.level(3)
-    for slice = 1, slice_count - 1 do
-      local x = x0 + math.floor((width * slice / slice_count) + 0.5)
+    for s = 2, slice_count do
+      local x = x0 + slice_ranges[s].lo
       screen.move(x, y0 + 1)
       screen.line(x, y0 + height - 1)
     end
     screen.stroke()
+    -- Razor editor: mark the SELECTED slice's Start / End -- the points the
+    -- bottom row edits -- with arrow markers so you can see what you're moving.
+    if self.selected_slice ~= nil then
+      local sel = self.selected_slice()
+      local sr = slice_ranges[sel]
+      if sr ~= nil then
+        screen.level(12)
+        self:draw_marker_at_px(x0 + util.clamp(sr.lo, 0, width - 1), y0, height, "start")
+        self:draw_marker_at_px(x0 + util.clamp(sr.hi, 0, width - 1), y0, height, "end")
+      end
+    end
+  end
+
+  -- Slice machine has no loop start/end points (it sequences slices), so it
+  -- draws no start/end markers or playhead sweep -- the bright active-slice
+  -- waveform above IS the position readout (owner). Every other view keeps them.
+  if opts.show_slices then
+    if meta.channels ~= nil then
+      screen.level(0)
+      screen.rect(x0 + 1, y0 + 1, 11, 7)
+      screen.fill()
+      screen.level(9)
+      screen.move(x0 + 2, y0 + 7)
+      screen.text(meta.channels >= 2 and "ST" or "MO")
+    end
+    return
   end
 
   local start_point, end_point = self.active_region()

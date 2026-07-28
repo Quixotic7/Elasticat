@@ -35,13 +35,17 @@ local NORNS_KEYS = {
   [3] = "confirm"
 }
 
+-- The modal nav bindings are compiled from the shared grid layout, so they use
+-- the SAME buttons GridSequencer's base dispatch does -- move a key once, in
+-- lib/input/grid_layout.lua, and both follow (elasticat-input-actions).
+local GridLayout = include("lib/input/grid_layout")
 local GRID_KEYS = {
-  ["11:6"] = "confirm",
-  ["11:7"] = "cancel",
-  ["13:6"] = "up",
-  ["13:7"] = "down",
-  ["12:7"] = "left",
-  ["14:7"] = "right"
+  [GridLayout.key_id(GridLayout.yes)] = "confirm",
+  [GridLayout.key_id(GridLayout.no)] = "cancel",
+  [GridLayout.key_id(GridLayout.up)] = "up",
+  [GridLayout.key_id(GridLayout.down)] = "down",
+  [GridLayout.key_id(GridLayout.left)] = "left",
+  [GridLayout.key_id(GridLayout.right)] = "right",
 }
 
 local ENCODERS = {
@@ -109,17 +113,65 @@ function InputRouter:dispatch(action, value)
   return false
 end
 
--- ---- Device translators (return true when a focus layer consumed the event).
+-- ---- Base-surface action layer -------------------------------------------
+-- Beyond the modal focus stack, the BASE surface (param pages: norns keys +
+-- encoders, and later the grid + MIDI/OSC) routes through here too, so every
+-- base intent is a NAMED action bound in ONE place (rebind here, not at 40 call
+-- sites) and a new device is one translator that emits the same names.
+-- `bindings` maps a physical id ("key:2", "enc:2") to an action. `modifier_
+-- layers` is a precedence-ordered list of {mod = <modifier name>, map =
+-- {physical -> action}} whose entries OVERRIDE the base binding while that
+-- modifier is active -- so one key means different things under FN / a held step
+-- / a held scene anchor / a held macro, resolved most-specific-first to match the
+-- hand-written precedence. `modifiers` is a table of named predicates (the
+-- coordinator's fn_active / scene-held / step-held / macro-held). `handler`
+-- (also the coordinator's, since it closes over nav / param_values / clear fns)
+-- runs the resolved action, so the router stays device- and app-agnostic.
+function InputRouter:set_base(opts)
+  opts = opts or {}
+  self.base_bindings = opts.bindings or {}
+  self.modifier_layers = opts.modifier_layers or {}
+  self.modifiers = opts.modifiers or {}
+  self.base_handler = opts.handler
+end
+
+-- Resolve a physical id to its action for the CURRENT modifiers: the first
+-- active modifier layer that binds it wins, else the unmodified binding.
+function InputRouter:resolve_base(physical)
+  for _, layer in ipairs(self.modifier_layers or {}) do
+    local pred = self.modifiers ~= nil and self.modifiers[layer.mod] or nil
+    if pred ~= nil and pred() and layer.map[physical] ~= nil then
+      return layer.map[physical]
+    end
+  end
+  return self.base_bindings ~= nil and self.base_bindings[physical] or nil
+end
+
+-- Run the resolved base action (value = encoder delta, nil for a key). Returns
+-- true when an action ran, so a translator can report the event consumed.
+function InputRouter:run_base(physical, value)
+  if self.base_handler == nil then
+    return false
+  end
+  local action = self:resolve_base(physical)
+  if action == nil then
+    return false
+  end
+  return self.base_handler(action, value, physical) ~= false
+end
+
+-- ---- Device translators. Modal focus stack first, then the base surface.
+-- Return true when the event was handled (by a modal layer OR a base action).
 
 function InputRouter:norns_key(n, z)
   if z ~= 1 then
     return false
   end
   local action = NORNS_KEYS[n]
-  if action == nil then
-    return false
+  if action ~= nil and self:dispatch(action) then
+    return true
   end
-  return self:dispatch(action)
+  return self:run_base("key:" .. n, nil)
 end
 
 function InputRouter:grid_key(x, y, z)
@@ -140,10 +192,10 @@ end
 
 function InputRouter:enc(n, d)
   local action = ENCODERS[n]
-  if action == nil then
-    return false
+  if action ~= nil and self:dispatch(action, d) then
+    return true
   end
-  return self:dispatch(action, d)
+  return self:run_base("enc:" .. n, d)
 end
 
 return InputRouter

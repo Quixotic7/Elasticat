@@ -3,6 +3,7 @@ GridSequencer.__index = GridSequencer
 
 local Step = include("lib/sequencer/step")
 local TrackSequencer = include("lib/sequencer/track_sequencer")
+local GridLayout = include("lib/input/grid_layout")  -- shared grid coordinate map
 local INTRO_CAT_HEX = include("lib/intro_cat_frames")  -- 55 frames of 16x8 grid levels
 
 local INTRO_CAT_FPS = 10  -- must match the screen logo fps so the two stay in sync
@@ -151,6 +152,15 @@ function GridSequencer.new(options)
   self.loop_tap_key = nil
   self.loop_tap_kind = nil
   self.slice_holds = {}
+  -- Stopped slice-audition parity: which held slice's TRACK-level p-locks are
+  -- currently pushed to the engine (newest press), and whether an override is
+  -- live, so a held-slice preview sounds identical to sequenced playback.
+  self.slice_preview_slice = nil
+  self.slice_preview_active = false
+  -- Which slice the Razor editor is editing (its Start/End on the source page).
+  -- A slice grid key press selects it; distinct from slice_index (the sequencer
+  -- default). Transient UI state (not saved).
+  self.selected_slice = 1
   self.preview_active = false
   self.step_holds = {}
   self.step_press_time = {}
@@ -683,7 +693,10 @@ function GridSequencer:toggle_step_slice(index, slice)
   record.trig = true
   record.slices = record.slices or {}
   local was_active = record.slices[slice] == true
-  if self.options.get_slice_polyphony ~= nil and self.options.get_slice_polyphony() == 2 then
+  -- Voicing is the MACHINE now: Slice (3) / Razor (4) are mono, so a step holds
+  -- ONE slice (adding another replaces it); the Poly variants (5/6) stack.
+  local machine = self:machine()
+  if machine == 3 or machine == 4 then
     record.slices = {}
   end
   record.slices[slice] = not was_active
@@ -711,6 +724,25 @@ function GridSequencer:apply_step_pitch(record)
 end
 
 function GridSequencer:set_held_param_lock(param_id, value)
+  -- A held STEP takes precedence; otherwise a held SLICE p-locks the slice's own
+  -- identity (MPC chop program) -- it applies whenever that slice plays, under a
+  -- step's own p-locks. No step and no slice held -> nothing to lock.
+  if next(self.step_holds) == nil then
+    local slice_locked = false
+    for slice, held in pairs(self.slice_holds or {}) do
+      if held then
+        self.seq:set_slice_lock(slice, param_id, value)
+        slice_locked = true
+      end
+    end
+    if slice_locked then
+      -- Re-apply so a track-level edit (filter/env/reverse) is heard live on the
+      -- still-sounding audition, the way refresh_held_step does for a held step.
+      -- Per-voice pitch/velocity edits take effect on the next press.
+      self:refresh_slice_preview_locks()
+      return true
+    end
+  end
   local did_lock = false
   self:record_step_undo("plock:" .. tostring(param_id), self:held_step_indices(), param_id)
   for step, held in pairs(self.step_holds) do
@@ -824,6 +856,12 @@ end
 function GridSequencer:held_param_lock(param_id)
   local index = self:held_step_index()
   if index == nil then
+    -- No step held: a held SLICE's own lock (its identity), if any.
+    for slice, held in pairs(self.slice_holds or {}) do
+      if held then
+        return self.seq:slice_lock(slice, param_id)
+      end
+    end
     return nil
   end
   local record = self:step_record(index, false)
@@ -844,6 +882,21 @@ function GridSequencer:held_param_lock(param_id)
 end
 
 function GridSequencer:clear_held_param_lock(param_id)
+  -- No step held: clear a held SLICE's own lock (mirrors set_held_param_lock).
+  if next(self.step_holds) == nil then
+    local slice_cleared = false
+    for slice, held in pairs(self.slice_holds or {}) do
+      if held then
+        self.seq:clear_slice_lock(slice, param_id)
+        slice_cleared = true
+      end
+    end
+    if slice_cleared then
+      -- Re-apply so the cleared param reverts live on the audition.
+      self:refresh_slice_preview_locks()
+      return true
+    end
+  end
   local did_clear = false
   for step, held in pairs(self.step_holds) do
     if held then
@@ -866,6 +919,26 @@ function GridSequencer:clear_held_param_lock(param_id)
     end
   end
   return did_clear
+end
+
+-- True if ANY step in the SELECTED track's pattern p-locks this param. Drives the
+-- low-profile "step-locked" corner dot -- STEP locks only (scene locks are found
+-- by holding the Scene keys). Mirrors clear_all_param_locks' record scan and
+-- early-exits on the first hit.
+function GridSequencer:any_step_locks(param_id)
+  for _, record in pairs(self.seq.steps) do
+    if record.param_locks ~= nil and record.param_locks[param_id] ~= nil then
+      return true
+    end
+    if param_id == "pitch" and record.pitch ~= nil then
+      return true
+    elseif param_id == "velocity" and record.velocity ~= nil then
+      return true
+    elseif param_id == "length" and record.length ~= nil then
+      return true
+    end
+  end
+  return false
 end
 
 function GridSequencer:clear_all_param_locks(param_id)
@@ -1279,6 +1352,35 @@ function GridSequencer:slice_range(slice)
   return self.seq:slice_range(slice)
 end
 
+-- Which slice indices to HIGHLIGHT on the source-page waveform: the selected
+-- track's current step slices while PLAYING, plus any slices held live on the
+-- grid (slice_holds). Returns a {slice -> true} set. Empty for non-slice
+-- machines / when nothing is sounding.
+function GridSequencer:active_slices()
+  local out = {}
+  if self.playing and self.seq.active_slices ~= nil then
+    for s in pairs(self.seq.active_slices) do
+      out[s] = true
+    end
+  end
+  for s in pairs(self.slice_holds or {}) do
+    out[s] = true
+  end
+  -- A held STEP previews its slice(s) audibly, so light them on the waveform too
+  -- (owner: the grid showed the held step's slice but the display did not).
+  for step, held in pairs(self.step_holds or {}) do
+    if held and self.step_record_for_page_step ~= nil then
+      local record = self:step_record_for_page_step(self.selected_page, step, false)
+      if record ~= nil and record.slices ~= nil then
+        for s, on in pairs(record.slices) do
+          if on then out[s] = true end
+        end
+      end
+    end
+  end
+  return out
+end
+
 function GridSequencer:trigger_region(record)
   self.seq:trigger_region(record)
 end
@@ -1362,6 +1464,14 @@ end
 function GridSequencer:start_sequence(reset_sequence)
   if self.seq_metro ~= nil then
     self.seq_metro:stop()
+  end
+  -- Hand the param override layer to the transport cleanly: drop any stopped
+  -- slice-audition override so the sequencer starts from base, not from a held
+  -- slice's preview locks.
+  if self.slice_preview_active then
+    self.seq:push_param_locks(nil)
+    self.slice_preview_active = false
+    self.slice_preview_slice = nil
   end
   self.playing = true
   -- Fresh start vs. resume-from-pause. A resume shifts the shared origin by the
@@ -1607,6 +1717,57 @@ function GridSequencer:on_pattern_applied(restart)
   self:request_redraw()
 end
 
+-- A held SLICE (with no step held) is the p-lock target for that slice's own
+-- identity (MPC chop program). Returns the held-slice set, or nil. Distinct from
+-- screen_edit (a held STEP), which takes precedence.
+function GridSequencer:slice_edit()
+  if next(self.step_holds) ~= nil then
+    return nil
+  end
+  if next(self.slice_holds or {}) ~= nil then
+    return self.slice_holds
+  end
+  return nil
+end
+
+-- Which slice(s) the source-page CHOKE param edits: the held slice(s) if any
+-- are down (set the pad you are auditioning), else the SELECTED slice (slice
+-- index). Choke is inherently per-slice -- there is no track base -- so the
+-- CHOKE param always targets a concrete slice.
+function GridSequencer:choke_target_slices()
+  if next(self.slice_holds or {}) ~= nil then
+    local held = {}
+    for slice, on in pairs(self.slice_holds) do
+      if on then held[#held + 1] = slice end
+    end
+    return held
+  end
+  return {self:slice_index()}
+end
+
+-- The Razor editor's edit target (SLIC on the razor source page). Clamped to the
+-- live slice count. Set by a slice grid key OR the SLIC encoder.
+function GridSequencer:get_selected_slice()
+  return util.clamp(math.floor((self.selected_slice or 1) + 0.5), 1, self:slice_count())
+end
+
+function GridSequencer:set_selected_slice(n)
+  self.selected_slice = util.clamp(math.floor((tonumber(n) or 1) + 0.5), 1, self:slice_count())
+end
+
+-- The choke group shown for the CHOKE param (the first target slice's).
+function GridSequencer:choke_value()
+  local targets = self:choke_target_slices()
+  return self.seq:slice_choke(targets[1] or self:slice_index())
+end
+
+-- Set the choke group on every target slice.
+function GridSequencer:set_choke_value(group)
+  for _, slice in ipairs(self:choke_target_slices()) do
+    self.seq:set_slice_choke(slice, group)
+  end
+end
+
 function GridSequencer:screen_edit()
   local index, step = self:held_step_index()
   if index == nil then
@@ -1691,7 +1852,7 @@ end
 -- Press = select (the whole editing surface -- steps, params, pages -- follows
 -- the selection); FN+press = mute toggle (engine \trMute: a muted track keeps
 -- advancing but outputs silence). Cols 1-7/16 of row 4 stay reserved.
-local TRACK_KEY_MIN_COL, TRACK_KEY_MAX_COL = 8, 15
+local TRACK_KEY_MIN_COL, TRACK_KEY_MAX_COL = GridLayout.track.cols[1], GridLayout.track.cols[2]
 
 function GridSequencer:active_track_count()
   if self.options.get_active_track_count ~= nil then
@@ -1878,26 +2039,29 @@ function GridSequencer:key(x, y, z)
     return
   end
 
-  if x == 16 and y == 7 then
+  -- Coordinates come from the shared layout (lib/input/grid_layout.lua) so a
+  -- remap is one edit there; the dispatch LOGIC below is unchanged.
+  local L = GridLayout
+  if L.is_key(L.page_toggle, x, y) then
     self.page_down = z == 1
     self:redraw()
     self:request_redraw()
     return
   end
 
-  -- FILL (16,6): momentary fill while held, FN+press latches. Handled here (not
-  -- in the z==1-only navigation path) so it sees key release for the momentary
-  -- mode. Gates FILL/!FILL trig conditions (PRD §6.5).
-  if x == 16 and y == 6 then
+  -- FILL: momentary fill while held, FN+press latches. Handled here (not in the
+  -- z==1-only navigation path) so it sees key release for the momentary mode.
+  -- Gates FILL/!FILL trig conditions (PRD §6.5).
+  if L.is_key(L.fill, x, y) then
     self:key_fill(z)
     self:redraw()
     self:request_redraw()
     return
   end
 
-  -- YES (11,6): a context key. On the File page it holds-to-preview the sample.
-  -- Handled here (not in the z==1-only navigation path) so it sees key release.
-  if x == 11 and y == 6 then
+  -- YES: a context key. On the File page it holds-to-preview the sample. Handled
+  -- here (not in the z==1-only navigation path) so it sees key release.
+  if L.is_key(L.yes, x, y) then
     self:key_yes(z)
     self:redraw()
     self:request_redraw()
@@ -1911,7 +2075,7 @@ function GridSequencer:key(x, y, z)
   -- gates the press (z==1): the release always reaches key_pattern() so an
   -- overlay opened before FN got held still closes/latches correctly
   -- (key_pattern() is a safe no-op when no (8,5) press session is in flight).
-  if x == 8 and y == 5 then
+  if L.is_key(L.pattern, x, y) then
     if z == 1 and self.fn_down then
       if self.options.open_pattern_quantize_menu ~= nil then
         self.options.open_pattern_quantize_menu()
@@ -1935,29 +2099,29 @@ function GridSequencer:key(x, y, z)
     return
   end
 
-  if y == 1 and CATEGORY_KEYS[x] ~= nil and z == 1 then
+  if y == L.category_row and CATEGORY_KEYS[x] ~= nil and z == 1 then
     self:key_category(CATEGORY_KEYS[x])
-  elseif y == 1 then
+  elseif y == L.category_row then
     self:key_controls(x, z)
-  elseif self.page_down and y == 8 then
+  elseif self.page_down and y == L.step_row then
     if z == 1 then
       self:handle_page_step(x)
     end
-  elseif is_slice_machine(self:machine()) and (y == 2 or y == 3) then
+  elseif is_slice_machine(self:machine()) and (y == L.loop_row or y == L.loop_row_hi) then
     self:key_slice_control(x, y, z)
-  elseif y == 2 then
+  elseif y == L.loop_row then
     self:key_loop_control(x, z)
-  elseif y == 3 and self:loop_division() > 16 then
+  elseif y == L.loop_row_hi and self:loop_division() > 16 then
     self:key_loop_control(x + 16, z)
-  elseif y == 8 then
+  elseif y == L.step_row then
     self:key_step_row(x, z)
-  elseif y == 5 and (x == 1 or x == 2) then
+  elseif L.in_region(L.octave, x, y) then
     self:key_octave(x, z)
-  elseif y == 5 and x >= 9 and x <= 16 then
+  elseif L.in_region(L.scene, x, y) then
     self:key_scene(x, z)
-  elseif y == 4 and x >= 1 and x <= 4 then
+  elseif L.in_region(L.macro, x, y) then
     self:key_macro(x, z)
-  elseif y == 4 and x >= TRACK_KEY_MIN_COL and x <= TRACK_KEY_MAX_COL then
+  elseif L.in_region(L.track, x, y) then
     self:key_track(x - TRACK_KEY_MIN_COL + 1, z)
   elseif self:key_pitch_control(x, y, z) then
     -- handled
@@ -2276,6 +2440,12 @@ function GridSequencer:key_controls(x, z)
     if used then
       return
     end
+    -- STOP while ALREADY stopped = panic: hard-kill every lingering slice voice
+    -- (a stuck or long-releasing note ignores a plain stop's gate-off) (owner).
+    if not self.playing and self.options.kill_all_slices ~= nil then
+      self.options.kill_all_slices()
+      self:message("Killed all voices")
+    end
     if self.options.set_playing ~= nil then
       self.options.set_playing(false, true)
     end
@@ -2540,6 +2710,43 @@ function GridSequencer:update_preview_state()
   end
 end
 
+-- Stopped slice-audition parity (owner: a slice preview should sound the same as
+-- what plays once you press play). Push the newest held slice's TRACK-level
+-- p-locks -- filter/env/reverse/send/pan/vol -- through the SAME resolver path a
+-- firing step uses (effective_param_locks -> push_param_locks), so the track
+-- chain the slice voice routes through is configured exactly as playback would.
+-- Per-voice pitch/velocity ride the trigger itself (key_slice_control). No-op
+-- while playing (the transport owns the override layer then, and reconciles any
+-- override left behind on the next step); reverts to base when no slice is held.
+function GridSequencer:refresh_slice_preview_locks()
+  if self.options.apply_step_param_locks == nil or self.playing then
+    return
+  end
+  -- Prefer the most recent press; if it was released, fall back to any still-held
+  -- slice so releasing the top of a stack reveals the one underneath.
+  local primary = self.slice_preview_slice
+  if primary == nil or self.slice_holds[primary] ~= true then
+    primary = nil
+    for slice, held in pairs(self.slice_holds) do
+      if held then
+        primary = slice
+        break
+      end
+    end
+    self.slice_preview_slice = primary
+  end
+  if primary == nil then
+    if self.slice_preview_active then
+      self.seq:push_param_locks(nil)   -- last slice released -> back to base
+      self.slice_preview_active = false
+    end
+    return
+  end
+  local record = {trig = true, slices = {[primary] = true}, param_locks = {}}
+  self.seq:push_param_locks(self.seq:effective_param_locks(record))
+  self.slice_preview_active = true
+end
+
 -- Trigger the first held previewable step's slice(s) on the selected track --
 -- the stopped step-hold preview for a slice machine (the loop reader stays off).
 function GridSequencer:preview_held_step_slices()
@@ -2751,14 +2958,31 @@ function GridSequencer:key_slice_control(x, y, z)
 
   if z == 1 then
     self.slice_holds[slice] = true
+    -- The last slice pressed is the Razor editor's edit target (its Start/End
+    -- show on the source page).
+    self.selected_slice = slice
+    -- Configure the track chain (filter/env/reverse/...) with THIS slice's
+    -- track-level p-locks BEFORE the voice sounds, so a stopped audition matches
+    -- sequenced playback. Newest press wins the (single) track filter/env.
+    self.slice_preview_slice = slice
+    self:refresh_slice_preview_locks()
     if self.options.trigger_slice ~= nil then
       local start_point, end_point = self:slice_range(slice)
       local mode = self.options.get_slice_play_mode ~= nil and self.options.get_slice_play_mode() or 1
-      local length_seconds = (mode >= 3) and 60 or 0
+      -- One-Shot (1) plays the whole range (sweep-end gates it); Hold/Loop/
+      -- Continue (2/3/4) stay open until the key is released (release_slice), so a
+      -- long value keeps the gate open until then (engine caps it at 60s).
+      local length_seconds = (mode == 1) and 0 or 3600
+      -- Live play applies the slice's own per-slice p-locks (MPC chop program):
+      -- pitch/velocity resolve from the slice lock so you hear the lock while
+      -- auditioning/editing, matching what the sequenced trigger will play.
+      local pitch = self.seq:slice_lock(slice, "pitch") or self:base_pitch()
+      local velocity = self.seq:slice_lock(slice, "velocity") or 1
       self.seq:call("trigger_slice", slice, start_point, end_point, {
-        velocity = 1,
+        velocity = velocity,
         length_seconds = length_seconds,
-        pitch = self:base_pitch(),
+        pitch = pitch,
+        choke = self.seq:slice_choke(slice),
         manual = true
       })
       self:mark_region_current(start_point, end_point)
@@ -2769,6 +2993,9 @@ function GridSequencer:key_slice_control(x, y, z)
     if mode ~= 1 and self.options.release_slice ~= nil then
       self.seq:call("release_slice", slice)
     end
+    -- Re-point the audition to a still-held slice, or revert to base when the
+    -- last slice is released.
+    self:refresh_slice_preview_locks()
   end
 end
 

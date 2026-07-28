@@ -723,6 +723,36 @@ function PageRender:draw_pair_bracket(items, lo, hi, cell_for, row_y)
   self:draw_selection_bracket(cells, row_y)
 end
 
+-- A 2x2 dot at the top-right of every cell in items[lo..hi] whose param is
+-- p-locked on ANY step, so the pattern's step locks are visible at a glance
+-- (owner cue; steps only). ONE level pass for the whole row (redraw-metro law).
+-- On an inverted (currently-locked) chip a level-15 dot is invisible, which is
+-- fine -- that cell already reads as locked.
+function PageRender:draw_step_lock_dots(items, lo, hi, cell_for, row_y)
+  local pv = self.param_values
+  if pv == nil or pv.item_step_locked == nil then
+    return
+  end
+  local xs = {}
+  for i = lo, hi do
+    local it = items[i]
+    if it ~= nil and not it.blank and pv:item_step_locked(it) then
+      local cell = cell_for(i)
+      if cell >= 0 and cell <= 3 then   -- an off-row cell is not drawn
+        xs[#xs + 1] = LowProfile.cell_x(cell) + LowProfile.CELL_W - 2
+      end
+    end
+  end
+  if #xs == 0 then
+    return
+  end
+  screen.level(15)
+  for _, x in ipairs(xs) do
+    screen.rect(x, row_y, 2, 2)
+  end
+  screen.fill()
+end
+
 -- The 42-bar filter magnitude render (owner redesign). Bars grow from the
 -- bottom; the cutoff (+/- envelope-depth band while stopped, single bar while
 -- playing) is drawn brighter. Two level-batched passes (performance law).
@@ -961,6 +991,9 @@ function PageRender:draw_envelope_page(items, group, prefix, mode_id, bottom_fir
     self:draw_pair_bracket(items, sel_lo, sel_lo + 1,
       function(i) return first_cell + (i - 5) end, FENV_ROW_BOTTOM_Y)
   end
+  -- Step-lock dots, one level pass per row.
+  self:draw_step_lock_dots(items, 1, 4, function(i) return i - 1 end, FENV_ROW_TOP_Y)
+  self:draw_step_lock_dots(items, 5, #items, function(i) return first_cell + (i - 5) end, FENV_ROW_BOTTOM_Y)
   self:draw_envelope_bars(items, sel_lo, prefix, mode_id)
 end
 
@@ -987,6 +1020,7 @@ function PageRender:draw_filter_page(items, group, playing)
     self:draw_low_profile_cell(items[i], i - 1, i == sel_lo or i == sel_lo + 1)
   end
   self:draw_pair_bracket(items, sel_lo, sel_lo + 1, function(i) return i - 1 end, FILTER_ROW_Y)
+  self:draw_step_lock_dots(items, 1, 4, function(i) return i - 1 end, FILTER_ROW_Y)
   self:draw_filter_bars(items, playing == true)
 end
 

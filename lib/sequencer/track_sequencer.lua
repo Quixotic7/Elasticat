@@ -104,6 +104,8 @@ local MACHINE_LOOP = 1
 local MACHINE_LOOP_TRIG = 2
 local MACHINE_GRID_SLICE = 3
 local MACHINE_RAZOR_SLICE = 4
+local MACHINE_SLICE_POLY = 5
+local MACHINE_RAZOR_POLY = 6
 
 -- Trig chance/condition/ratchet are p-lockable per step, but they steer the
 -- SEQUENCER, not the engine. They live in a step's param_locks (so the grid
@@ -127,8 +129,9 @@ local REGION_LOCKS = {
   range_end = true
 }
 
+-- All four slice machines: Grid/Razor (mono) and their Poly variants (>= 3).
 local function is_slice_machine(machine)
-  return machine == MACHINE_GRID_SLICE or machine == MACHINE_RAZOR_SLICE
+  return machine >= MACHINE_GRID_SLICE and machine <= MACHINE_RAZOR_POLY
 end
 TrackSequencer.is_slice_machine = is_slice_machine
 
@@ -195,6 +198,16 @@ function TrackSequencer.new(index, ctx)
   -- Live override state, PER TRACK -- this is what lets a background track have
   -- the full region-lock / trig-release behaviour instead of a bare noteOn.
   self.param_lock_holds = {}
+  -- Per-SLICE p-locks (MPC chop program): each slice carries its own param values
+  -- (its identity) that apply whenever it plays -- live or on a step -- UNDER the
+  -- step's own p-locks (step wins). slice_locks[slice] = {param_id -> value}.
+  -- Serialized with the pattern.
+  self.slice_locks = {}
+  -- Per-SLICE choke group (MPC mute group): slice_choke[slice] = group (1..N);
+  -- 0/nil = None. A voice in group G cuts other live voices in the same group on
+  -- this track (poly only). Resolved per voice and passed to the engine; kept out
+  -- of slice_locks because it is steal metadata, not an engine param that morphs.
+  self.slice_choke_map = {}
   self.seq_anchor = nil
   self.seq_release_mode = nil
   self.current_region_start = nil
@@ -285,7 +298,7 @@ end
 -- ---- Per-track settings ----------------------------------------------------
 
 function TrackSequencer:machine()
-  return self:param_int("machine", 1, 1, 4)
+  return self:param_int("machine", 1, 1, 6)
 end
 
 function TrackSequencer:pattern_steps()
@@ -498,7 +511,20 @@ function TrackSequencer:serialize()
       page_loop[page] = true
     end
   end
-  return {steps = steps, rate_index = self.rate_index, page_loop = page_loop}
+  local slice_locks = {}
+  for slice, s in pairs(self.slice_locks) do
+    if next(s) ~= nil then
+      slice_locks[slice] = deep_copy(s)
+    end
+  end
+  local slice_choke = {}
+  for slice, group in pairs(self.slice_choke_map) do
+    if group and group > 0 then
+      slice_choke[slice] = group
+    end
+  end
+  return {steps = steps, rate_index = self.rate_index, page_loop = page_loop,
+    slice_locks = slice_locks, slice_choke = slice_choke}
 end
 
 -- Restore pattern-owned state. Transport state (position, pass counters) is
@@ -510,6 +536,16 @@ function TrackSequencer:deserialize(snapshot)
     self.steps[index] = deep_copy(record)
   end
   self.rate_index = snapshot.rate_index or TrackSequencer.RATE_UNITY
+  self.slice_locks = {}
+  for slice, s in pairs(snapshot.slice_locks or {}) do
+    self.slice_locks[slice] = deep_copy(s)
+  end
+  self.slice_choke_map = {}
+  for slice, group in pairs(snapshot.slice_choke or {}) do
+    if group and group > 0 then
+      self.slice_choke_map[slice] = group
+    end
+  end
   self.page_loop = {}
   for page, on in pairs(snapshot.page_loop or {}) do
     if on then
@@ -654,12 +690,100 @@ function TrackSequencer:expire_param_lock_holds(now)
   return changed
 end
 
+-- ---- Per-slice p-locks (MPC chop program) ----------------------------------
+
+function TrackSequencer:slice_lock(slice, param_id)
+  local s = self.slice_locks[slice]
+  return s and s[param_id] or nil
+end
+
+function TrackSequencer:set_slice_lock(slice, param_id, value)
+  local s = self.slice_locks[slice]
+  if s == nil then
+    s = {}
+    self.slice_locks[slice] = s
+  end
+  s[param_id] = value
+end
+
+-- Clear one param (or, param_id nil, the whole slice). Returns true if anything
+-- was removed.
+function TrackSequencer:clear_slice_lock(slice, param_id)
+  local s = self.slice_locks[slice]
+  if s == nil then
+    return false
+  end
+  if param_id == nil then
+    self.slice_locks[slice] = nil
+    return true
+  end
+  if s[param_id] == nil then
+    return false
+  end
+  s[param_id] = nil
+  if next(s) == nil then
+    self.slice_locks[slice] = nil
+  end
+  return true
+end
+
+function TrackSequencer:slice_lock_set(slice)
+  return self.slice_locks[slice]
+end
+
+-- Per-slice choke group (0 = None). Getter returns 0 for an unset slice so the
+-- trigger path can pass it straight through.
+function TrackSequencer:slice_choke(slice)
+  return self.slice_choke_map[slice] or 0
+end
+
+function TrackSequencer:set_slice_choke(slice, group)
+  group = math.floor((tonumber(group) or 0) + 0.5)
+  if group <= 0 then
+    self.slice_choke_map[slice] = nil
+  else
+    self.slice_choke_map[slice] = group
+  end
+end
+
+-- The first slice a step actually fires -- its locks form the per-step base.
+function TrackSequencer:primary_slice(record)
+  if record ~= nil and record.slices ~= nil then
+    for slice, on in pairs(record.slices) do
+      if on then
+        return slice
+      end
+    end
+  end
+  return nil
+end
+
 function TrackSequencer:effective_param_locks(record)
   local now = util.time()
   self:expire_param_lock_holds(now)
 
   local locks = {}
   local has_locks = false
+  -- Per-slice p-locks are the BASE layer (the slice's identity); the held layer
+  -- and the step's own p-locks below override them. Only a step firing an
+  -- explicit slice, and only if that slice has locks -- so loop steps and the
+  -- default-slice case are untouched. This covers the TRACK-level params
+  -- (filter, env, reverse, ...); pitch/velocity are resolved PER VOICE in
+  -- trigger_step_slices, so they are excluded here -- pushing them as track
+  -- params would churn against apply_step_pitch and the per-voice value.
+  if next(self.slice_locks) ~= nil then
+    local slice = self:primary_slice(record)
+    local sl = slice ~= nil and self.slice_locks[slice] or nil
+    if sl ~= nil then
+      for lock_id, value in pairs(sl) do
+        if not REGION_LOCKS[lock_id] and not SEQUENCER_DOMAIN_LOCKS[lock_id]
+          and lock_id ~= "pitch" and lock_id ~= "velocity" then
+          locks[lock_id] = value
+          has_locks = true
+        end
+      end
+    end
+  end
   for lock_id, hold in pairs(self.param_lock_holds) do
     if not REGION_LOCKS[lock_id] then
       locks[lock_id] = hold.value
@@ -947,25 +1071,45 @@ function TrackSequencer:trigger_step_slices(record)
   if record.trig and table_count(slices) == 0 then
     slices = {[self:slice_index()] = true}
   end
+  -- Gate length by play mode (owner): One-Shot (1) passes 0 -> the engine plays
+  -- the whole slice range regardless of step length (its read sweep-end gates
+  -- it). Hold/Loop/Continue (2/3/4) pass the STEP note length so a longer step
+  -- gates a longer note; the envelope hold can shorten it further (AHR).
+  local play_mode = self:param_int("slice_play_mode", 1, 1, 6)
+  local slice_length = (play_mode == 1) and 0 or self:note_seconds(record)
+  local fired = nil
   for slice = 1, self:slice_count() do
     if slices[slice] then
+      fired = fired or {}
+      fired[slice] = true
       local start_point, end_point = self:slice_range(slice)
       first_start = first_start or start_point
       first_end = first_end or end_point
       self:call("trigger_slice", slice, start_point, end_point, {
-        velocity = record.velocity or self:default_velocity(),
-        -- Natural pitch, like the live Loop/Slice keys (which pass 0). Passing
-        -- the step note length here made syncToClock stretch each slice to fit
-        -- the step, so a sequenced slice played higher-pitched than the same
-        -- slice hit live. 0 = the engine's natural-length branch (Digitakt-style
-        -- slicing); mono steals the previous slice at the next trig.
-        length_seconds = 0,
-        pitch = record.pitch or self:base_pitch()
+        -- PER-VOICE resolve (each slice its own): the step's p-lock overrides the
+        -- SLICE's p-lock (its identity), which overrides the track base. Track-
+        -- level slice params (filter/env/reverse) come through effective_param_
+        -- locks, which already merged this slice's locks under the step's.
+        velocity = record.velocity or self:slice_lock(slice, "velocity") or self:default_velocity(),
+        -- Natural pitch, like the live Loop/Slice keys (which pass 0). The read
+        -- rate is set by clock-sync/RATE, not the note length, so passing a length
+        -- here no longer pitches the slice -- it only gates it (see slice_length).
+        length_seconds = slice_length,
+        pitch = record.pitch or self:slice_lock(slice, "pitch") or self:base_pitch(),
+        -- Per-slice choke group (MPC mute group); 0 = None. Engine cuts other
+        -- live voices in the same group on this track (poly only).
+        choke = self:slice_choke(slice)
       })
     end
   end
   if first_start ~= nil then
     self:mark_region_current(first_start, first_end)
+  end
+  -- The step's slices, for the source-page waveform highlight (which slice is
+  -- playing). Only updated when a step actually fires slices, so between trigs
+  -- the last one stays lit; the grid reads it only while playing.
+  if fired ~= nil then
+    self.active_slices = fired
   end
 end
 
@@ -1116,6 +1260,11 @@ function TrackSequencer:enter_step(reset_sequence)
   elseif is_slice_machine(machine) then
     if fires then
       self:trigger_step_slices(record)
+    else
+      -- Clear the source-page highlight when this step fires no slice, so it does
+      -- not stick on the last slice that played (owner). Empty/failed steps read
+      -- as "nothing sounding".
+      self.active_slices = nil
     end
   end
 

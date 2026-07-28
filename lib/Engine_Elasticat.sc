@@ -124,11 +124,18 @@ Engine_Elasticat : CroneEngine {
 	// (the 32-slot voice map plus slice polyphony/mono) is unchanged.
 	var <sliceAttack = 0.002;
 	var <sliceRelease = 0.02;
-	var <sliceMono = 1;   // default MONO (owner): one slice voice at a time
+	var <>sliceMono = 1;   // default MONO (owner): one slice voice at a time
 	var <sliceSyncToClock = 1;
 	var <sliceRate = 1;
 	var sliceVoiceOrder;
-	var maxSliceVoices = 16;
+	// Slice voice budget (owner). Per TRACK: at most maxSliceVoicesPerTrack (the
+	// "poly 8" option), so one track cannot hog the pool. GLOBAL: at most
+	// maxSliceVoices across ALL 8 tracks -- 8x8 = 64 would cliff the CPU, so a
+	// SHARED 24-voice pool is stolen oldest-first (per-track cap first, then the
+	// global pool). With the bounded slice envelope above, these are backstops,
+	// not the primary limit.
+	var maxSliceVoicesPerTrack = 8;
+	var maxSliceVoices = 24;
 
 	// --- OSC -----------------------------------------------------------------
 	var scriptAddress;
@@ -725,21 +732,32 @@ Engine_Elasticat : CroneEngine {
 				sliceAttack=0.002, sliceRelease=0.02,
 				envMode=1, envAttack=0.0001, envDecay=0.15, envSustain=0.8, envRelease=0.0001, envHold=1000000,
 				lengthSeconds=0, syncToClock=1, sliceRate=1,
-				targetBpm=120, macro=0, grainSize=0.08, grainOverlap=8,
+				targetBpm=120, derivedSourceBpm=120, macro=0, grainSize=0.08, grainOverlap=8,
 				grainJitter=0, wsolaWindow=0.1, wsolaSearch=0.03,
 				pvWindow=0.2, pvDispersion=0, pitchModBus=0, steal=0;
 				var frames, startFrame, endFrame, loFrame, hiFrame, continueMode, readLo, readHi, loopMode;
-				var directionSign, resetFrame, rangeFrames, duration, pitchRatio, freePitchRatio, freeRate, fitRate, readRate;
-				var pos, loopPos, sweepFrames, sweepForwardPos, sweepReversePos, sweepPos, readPhase, env, adsrEnv, ahrEnv, sig, playAmp;
-				var grainDur, grainCount, grainRandom, olaTrig, olaPos, stealFade;
+				var directionSign, resetFrame, rangeFrames, duration, pitchRatio, freePitchRatio, freeRate, syncedRate, readRate;
+				var pos, loopPos, sweepFrames, sweepForwardPos, sweepReversePos, sweepPos, readPhase, env, sig, playAmp;
+				var grainDur, grainCount, grainRandom, olaTrig, olaPos, stealFade, sweptFrames, oneShotOpen, noteGate;
+				var pingPongMode, pingPongPos, posMode;
 
 				frames = BufFrames.kr(bufL).max(4);
 				startFrame = (startPoint.clip(0, 127.99) / 128) * (frames - 1);
 				endFrame = (endPoint.clip(0.01, 128) / 128) * (frames - 1);
 				loFrame = startFrame.min(endFrame).clip(0, frames - 2);
 				hiFrame = startFrame.max(endFrame).clip(loFrame + 1, frames - 1);
-				continueMode = (playMode >= 3);
-				loopMode = ((playMode >= 2) * (playMode < 3)).clip(0, 1);
+				// Play modes: 0 One-Shot, 1 Hold, 2 Loop, 3 Continue, 4 Ping-Pong,
+				// 5 Continue-Loop. continueMode extends the read to the SAMPLE END
+				// (Continue + Continue-Loop). loopMode uses the wrapping Phasor (Loop +
+				// Continue-Loop -- the latter loops [0, sample end] starting at the slice,
+				// so it plays on past the slice and then keeps looping the whole sample).
+				// pingPongMode bounces within the slice range. One-Shot/Hold/Continue
+				// read the one-shot sweep.
+				// NB: `==` is object identity on UGens, not a signal op -- use the
+				// integer-distance form (playMode is an integer control).
+				continueMode = (((playMode - 3).abs < 0.5) + ((playMode - 5).abs < 0.5)).clip(0, 1);
+				loopMode = (((playMode - 2).abs < 0.5) + ((playMode - 5).abs < 0.5)).clip(0, 1);
+				pingPongMode = ((playMode - 4).abs < 0.5);
 				readLo = loFrame * (1 - continueMode);
 				readHi = (hiFrame * (1 - continueMode)) + ((frames - 1) * continueMode);
 				directionSign = 1 - (reverse.clip(0, 1) * 2);
@@ -751,9 +769,19 @@ Engine_Elasticat : CroneEngine {
 				// raw reads the buffer at the pitched rate; the warp UGens apply pitch
 				// themselves, so their read position advances at 1x (build-time choice).
 				freePitchRatio = if(warpKind == \raw, { pitchRatio }, { DC.kr(1) });
+				// Read rate (owner: warp modes must match the loop machine, keyed to the
+				// WHOLE sample's tempo, not a per-slice fit). CLOCK SYNC ON -> the slice
+				// plays at the same rate the loop reader plays the whole sample when
+				// tempo-matched: natural rate x (targetBpm / derivedSourceBpm). Matched
+				// (target==source) that is exactly 1.0 (no pitch shift), and changing the
+				// BPM scales it -- so a chop sounds like the loop locked to that segment.
+				// CLOCK SYNC OFF -> the RATE knob (freeRate) speeds up / slows down the
+				// slice directly. `duration` no longer feeds the rate (it was a fit-to-
+				// lifetime stretch that made Continue a slow aliased crawl); it is now
+				// only the gate/lifetime.
 				freeRate = BufRateScale.kr(bufL) * sliceRate.max(0.03125) * freePitchRatio;
-				fitRate = rangeFrames / (duration * SampleRate.ir).max(1);
-				readRate = Select.kr(syncToClock.clip(0, 1), [freeRate, fitRate]) * directionSign;
+				syncedRate = BufRateScale.kr(bufL) * (targetBpm / derivedSourceBpm.max(1)) * freePitchRatio;
+				readRate = Select.kr(syncToClock.clip(0, 1), [freeRate, syncedRate]) * directionSign;
 				loopPos = Phasor.ar(
 					0,
 					readRate,
@@ -765,22 +793,39 @@ Engine_Elasticat : CroneEngine {
 				sweepForwardPos = resetFrame + sweepFrames;
 				sweepReversePos = resetFrame - sweepFrames;
 				sweepPos = Select.ar(reverse.clip(0, 1), [sweepForwardPos, sweepReversePos]);
-				pos = Select.ar(loopMode, [sweepPos.clip(readLo, readHi), loopPos]);
+				// Ping-pong: fold the (abs) sweep into the range so it bounces
+				// forward/back between readLo and readHi.
+				pingPongPos = readLo + sweepFrames.fold(0, rangeFrames);
+				// pos source: 0 = one-shot sweep (Shot/Hold/Continue), 1 = wrapping loop
+				// (Loop/Continue-Loop), 2 = ping-pong bounce.
+				posMode = ((loopMode * 1) + (pingPongMode * 2)).clip(0, 2);
+				pos = Select.ar(posMode, [sweepPos.clip(readLo, readHi), loopPos, pingPongPos]);
 				readPhase = (pos / (frames - 1)).clip(0, 0.999999);
-				// Amp envelope (shared with the readers). ADSR sustains while the slice
-				// gate is held and releases on gate-off; AHR is a fixed attack/hold/
-				// release burst (Hold matters, same as the loop reader). Hold/release are
-				// capped so an INF setting can't strand a polyphonic voice. Both run at
-				// doneAction 0; FreeSelf frees on gate-release+decay (ADSR) or when the
-				// burst completes (AHR).
-				adsrEnv = EnvGen.kr(
-					Env.adsr(envAttack.max(0.0001), envDecay.max(0.0001), envSustain.clip(0, 1), envRelease.clip(0.0001, 30), 1, -4),
-					gate, doneAction: 0);
-				ahrEnv = EnvGen.kr(
-					Env([0, 1, 1, 0], [envAttack.max(0.0001), envHold.clip(0.0001, 30), envRelease.clip(0.0001, 30)], [-4, 0, -4]),
-					gate, doneAction: 0);
-				env = Select.kr(envMode.clip(0, 1), [adsrEnv, ahrEnv]);
-				FreeSelf.kr(Select.kr(envMode.clip(0, 1), [(gate < 0.5) * (adsrEnv < 0.0004), Done.kr(ahrEnv)]));
+				// noteGate: how the voice's release is triggered, per play mode (owner).
+				//  * One-Shot (playMode 0) ignores the external gate and releases when
+				//    the read reaches the END of the slice range, so the whole slice
+				//    plays through regardless of step length.
+				//  * Hold / Loop / Continue use the EXTERNAL gate: the step's note length
+				//    closes it (the trigger Routine), or a live key release does
+				//    (releaseSlice). So releasing a held Continue/Loop actually stops it,
+				//    and a longer step gates a longer note.
+				sweptFrames = A2K.kr(sweepFrames);
+				oneShotOpen = (sweptFrames < rangeFrames);
+				noteGate = Select.kr((playMode <= 0), [gate, oneShotOpen]);
+				// ONE gate-responsive amp envelope. The "hold" for AHR is the gate-open
+				// time (sustain at peak until the gate closes), so gate-off ALWAYS
+				// releases the voice -- an AHR one-shot that IGNORED gate-off was the
+				// stuck-note bug (Continue with an INF hold played forever). ADSR sustains
+				// at S, AHR at 1; releaseNode 2 waits for the gate, doneAction 2 frees on
+				// release. RELEASE is bounded to 2s so an INF default can never strand a
+				// voice. envMode: 0 = ADSR, 1 = AHR.
+				env = EnvGen.kr(
+					Env([0, 1, Select.kr(envMode.clip(0, 1), [envSustain.clip(0, 1), 1]), 0],
+						[envAttack.max(0.0001),
+						 Select.kr(envMode.clip(0, 1), [envDecay.max(0.0001), 0.0001]),
+						 envRelease.clip(0.0001, 2)],
+						[-4, -4, -4], releaseNode: 2),
+					noteGate, doneAction: 2);
 				// Only THIS warp's UGens are built (warpKind is a build-time constant).
 				sig = switch(warpKind,
 					\raw, {
@@ -1443,10 +1488,10 @@ Engine_Elasticat : CroneEngine {
 		// Slice voices. \trSliceTrigger is the contract name; \trTriggerSlice
 		// is what the script's mechanical tr-name derivation produces from its
 		// "triggerSlice" spec entry -- both land on the same method.
-		this.addCommand(\trSliceTrigger, "iiffiifff", { arg msg;
+		this.addCommand(\trSliceTrigger, "iiffiifffii", { arg msg;
 			this.trackTriggerSlice(msg);
 		});
-		this.addCommand(\trTriggerSlice, "iiffiifff", { arg msg;
+		this.addCommand(\trTriggerSlice, "iiffiifffii", { arg msg;
 			this.trackTriggerSlice(msg);
 		});
 		this.addCommand(\trReleaseSlice, "ii", { arg msg;
@@ -1455,6 +1500,9 @@ Engine_Elasticat : CroneEngine {
 		this.addCommand(\trReleaseAllSlices, "i", { arg msg;
 			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.releaseAllSlices; });
 		});
+		// Panic: HARD-kill every slice voice on every track (20ms fade + free),
+		// unlike releaseAllSlices which only opens the gate. Owner: stop-twice.
+		this.addCommand(\killAllSlices, "", { this.stealAllSlices; });
 		// Generic warp-param escape hatch (live set only, same as before).
 		this.addCommand(\trModeParam, "isf", { arg msg;
 			var tr; tr = this.track(msg[1]);
@@ -1648,7 +1696,7 @@ Engine_Elasticat : CroneEngine {
 		var tr;
 		tr = this.track(msg[1]);
 		if(tr.isNil, { ^nil });
-		tr.triggerSlice(msg[2], msg[3], msg[4], msg[5], msg[6], msg[7], msg[8], msg[9]);
+		tr.triggerSlice(msg[2], msg[3], msg[4], msg[5], msg[6], msg[7], msg[8], msg[9], msg[10], msg[11]);
 	}
 
 	// =======================================================================
@@ -1658,14 +1706,36 @@ Engine_Elasticat : CroneEngine {
 	// engine-wide bookkeeping -- oldest first, across ALL tracks. 8 tracks x 8
 	// voices would cliff the CPU, so hitting the cap steals the oldest voice.
 	// The per-track limit (the 32-slot map + slice mono) is untouched.
-	registerSliceVoice { arg tr, slot, synth;
+	registerSliceVoice { arg tr, slot, synth, chokeGroup = 0;
 		var oldest;
+		// Choke group first (MPC mute group, POLY only -- mono already steals every
+		// voice, so choke is moot there). A new voice in group G > 0 cuts every live
+		// voice in the SAME group on the SAME track (open/closed hat), before the
+		// caps and before this voice is added, so it never steals itself. Other
+		// groups (and group 0 = None) are untouched -- they stay polyphonic.
+		if(chokeGroup > 0, {
+			sliceVoiceOrder.select({ arg e;
+				(e[\track] === tr) and: { e[\chokeGroup] == chokeGroup }
+			}).do({ arg victim;
+				sliceVoiceOrder = sliceVoiceOrder.reject({ arg e; e === victim });
+				victim[\track].stealSlice(victim[\slot], victim[\synth]);
+			});
+		});
+		// Per-track cap: steal THIS track's oldest so it stays within its own
+		// budget and can't starve the shared pool. detect returns the oldest (the
+		// list is oldest-first).
+		while({ sliceVoiceOrder.count({ arg e; e[\track] === tr }) >= maxSliceVoicesPerTrack }, {
+			oldest = sliceVoiceOrder.detect({ arg e; e[\track] === tr });
+			sliceVoiceOrder = sliceVoiceOrder.reject({ arg e; e === oldest });
+			oldest[\track].stealSlice(oldest[\slot], oldest[\synth]);
+		});
+		// Then the global pool cap across all tracks.
 		while({ sliceVoiceOrder.size >= maxSliceVoices }, {
 			oldest = sliceVoiceOrder[0];
 			sliceVoiceOrder = sliceVoiceOrder.drop(1);
 			oldest[\track].stealSlice(oldest[\slot], oldest[\synth]);
 		});
-		sliceVoiceOrder = sliceVoiceOrder.add((track: tr, slot: slot, synth: synth));
+		sliceVoiceOrder = sliceVoiceOrder.add((track: tr, slot: slot, synth: synth, chokeGroup: chokeGroup));
 	}
 
 	forgetSliceVoice { arg synth;
@@ -1680,6 +1750,12 @@ Engine_Elasticat : CroneEngine {
 
 	releaseAllSlices {
 		this.activeTracks.do({ arg tr; tr.releaseAllSlices; });
+	}
+
+	// Panic hard-kill: steal (fade+free) every slice voice on every track, so a
+	// stuck or long-releasing voice dies NOW instead of gate-off + release.
+	stealAllSlices {
+		this.activeTracks.do({ arg tr; tr.stealActiveSlices; });
 	}
 
 	// =======================================================================
@@ -3061,29 +3137,33 @@ ElasticatTrack {
 	// this track's filter -- a slice on track 3 must never play through track
 	// 1's filter. The 32 slots are the per-track voice map; engine-side there
 	// is also a hard cap on total concurrent voices across all 8 tracks.
-	triggerSlice { arg sliceIndex, startPoint, endPoint, playMode, reverse, velocity, lengthSeconds, notePitch;
-		var idx, startPos, endPos, mode, rev, pitchValue, pitchRatio, duration, sliceRatio, synth;
+	triggerSlice { arg sliceIndex, startPoint, endPoint, playMode, reverse, velocity, lengthSeconds, notePitch, chokeGroup = 0, mono = (-1);
+		var idx, startPos, endPos, mode, rev, pitchValue, pitchRatio, duration, sliceRatio, synth, chk, isMono;
 		if(group.isNil, { ^nil });
 		idx = sliceIndex.asInteger.clip(1, 32);
+		chk = (chokeGroup ? 0).asInteger.clip(0, 8);
 		startPos = startPoint.asFloat.clip(0, 127.99);
 		endPos = endPoint.asFloat.clip(0.01, 128);
 		if(endPos <= startPos, { endPos = (startPos + 0.01).clip(0.01, 128); });
-		mode = playMode.asInteger.clip(0, 3);
+		mode = playMode.asInteger.clip(0, 5);
 		rev = reverse.asInteger.clip(0, 1);
 		pitchValue = notePitch.asFloat.clip(-48, 48);
 		pitchRatio = pitchValue.midiratio.max(0.001);
 		duration = lengthSeconds.asFloat;
+		// `duration` is the GATE/lifetime now, not the read rate. Gated modes pass a
+		// real length from Lua (step note length, or a long value for a live key-hold
+		// that releaseSlice ends); One-Shot passes 0 and the read sweep-end gates it,
+		// so this natural length is only the envHold reference + a lifetime cap.
 		if(duration <= 0, {
-			if(mode >= 2, {
-				duration = 60;
-			}, {
-				sliceRatio = ((endPos - startPos).abs / 128).max(0.0001);
-				duration = ((sourceFrames.max(1) * sliceRatio) / sourceRate.max(1)) / pitchRatio;
-			});
+			sliceRatio = ((endPos - startPos).abs / 128).max(0.0001);
+			duration = ((sourceFrames.max(1) * sliceRatio) / sourceRate.max(1)) / pitchRatio;
 		});
 		duration = duration.clip(0.005, 60);
 
-		if(engine.sliceMono == 1, { this.stealActiveSlices; });
+		// Voicing: the caller (Slice/Razor = mono, *Poly = poly) passes mono 0/1;
+		// mono < 0 falls back to the engine's global default (old callers, tests).
+		isMono = if(mono < 0, { engine.sliceMono }, { mono.asInteger });
+		if(isMono == 1, { this.stealActiveSlices; });
 		this.releaseSlice(idx);
 
 		// Pick the lean per-warp slice def for THIS track's warp mode (machine):
@@ -3116,6 +3196,7 @@ ElasticatTrack {
 			\syncToClock, engine.sliceSyncToClock,
 			\sliceRate, engine.sliceRate,
 			\targetBpm, engine.targetBpm,
+			\derivedSourceBpm, derivedSourceBpm,
 			\macro, macro,
 			\grainSize, grainSize,
 			\grainOverlap, grainOverlap,
@@ -3128,17 +3209,32 @@ ElasticatTrack {
 			\gate, 1
 		]);
 		sliceVoices[idx - 1] = synth;
-		engine.registerSliceVoice(this, idx, synth);
+		engine.registerSliceVoice(this, idx, synth, chk);
+		// Drop the voice from the global order when it ACTUALLY frees (envelope,
+		// steal, or free) -- NOT at its gate-close time. A bounded release outlives
+		// `duration`, so forgetting at `duration` made the poly cap under-count live
+		// voices and never reach the steal threshold. The steal paths forget
+		// synchronously too; onFree is idempotent with them.
+		// On ACTUAL free (envelope done, steal, or free) drop the voice from the
+		// global order AND release its slot, so the gate Routine below never \gate a
+		// node the envelope already freed (One-Shot frees at its sweep-end, before the
+		// Routine timer).
+		synth.onFree({ engine.forgetSliceVoice(synth); if(sliceVoices[idx - 1] == synth, { sliceVoices[idx - 1] = nil; }); });
 		Routine({
-			duration.wait;
-			// Only close the gate if this voice still owns the slot: a stolen or
-			// replaced voice is already gone, and setting a freed node just
-			// makes the server log a failure.
+			var gateSeconds;
+			// Gate window for the EXTERNAL gate (Hold/Loop/Continue). AHR: the HOLD caps
+			// it, so shortening the envelope hold releases the note early (owner); a long
+			// default hold falls back to the note length. ADSR uses the note length as-is.
+			// One-Shot ignores this gate (its own sweep-end releases it) -- harmless here.
+			gateSeconds = if(envMode.asInteger == 1, { min(duration, envHold) }, { duration });
+			gateSeconds.clip(0.005, 60).wait;
+			// Close the gate (release) and free the slot only if this voice
+			// still owns it: a stolen or replaced voice is already gone, and setting
+			// a freed node just makes the server log a failure.
 			if(sliceVoices[idx - 1] == synth, {
 				synth.set(\gate, 0);
 				sliceVoices[idx - 1] = nil;
 			});
-			engine.forgetSliceVoice(synth);
 		}).play(SystemClock);
 		^synth;
 	}

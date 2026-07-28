@@ -29,7 +29,9 @@ elasticat.machines = {
   "loop",
   "loop_trig",
   "grid_slice",
-  "razor_slice"
+  "razor_slice",
+  "slice_poly",
+  "razor_poly"
 }
 
 elasticat.modes = {
@@ -1734,8 +1736,11 @@ function elasticat.set_reverse(reverse, track)
     (reverse == true or reverse == 1) and 1 or 0)
 end
 
-function elasticat.trigger_slice(slice_index, start_point, end_point, play_mode, reverse, velocity, length_seconds, pitch_value, track)
+function elasticat.trigger_slice(slice_index, start_point, end_point, play_mode, reverse, velocity, length_seconds, pitch_value, track, choke_group, mono)
   track = track or engine_track
+  -- mono nil = "use the engine's global default"; 0/1 forces poly/mono for this
+  -- voice (the machine drives it -- Slice/Razor mono, *Poly poly).
+  local mono_flag = mono == nil and -1 or (mono == 1 and 1 or 0)
   tr_call(track, "triggerSlice",
     slice_index,
     map_trim_point(start_point, track),
@@ -1744,7 +1749,15 @@ function elasticat.trigger_slice(slice_index, start_point, end_point, play_mode,
     (reverse == true or reverse == 1) and 1 or 0,
     velocity or 1,
     length_seconds or 0,
-    pitch_value or 0)
+    pitch_value or 0,
+    math.floor((tonumber(choke_group) or 0) + 0.5),
+    mono_flag)
+end
+
+-- Panic hard-kill of every slice voice on every track (stop-twice). A plain
+-- stop only opens the gate; a stuck or long-releasing voice needs the steal.
+function elasticat.kill_all_slices()
+  engine_call("killAllSlices")
 end
 
 -- Retrigger the amp envelope on the active reader with the given note length
@@ -2950,7 +2963,7 @@ function elasticat.params(options)
     cs.new(0, 1, "lin", 0.001, 0, "", 0.001),
     function(x) elasticat.tr_queue(param_id(prefix, "pv_dispersion"), 1, "pvDispersion", x) end)
 
-  params:add_group(param_id(prefix, "group_slices"), "slice machines", 11)
+  params:add_group(param_id(prefix, "group_slices"), "slice machines", 12)
 
   add_control(param_id(prefix, "slice_count"), "slice count",
     cs.new(1, 32, "lin", 1, 16, "", 1 / 31),
@@ -2962,7 +2975,7 @@ function elasticat.params(options)
     function(_) end,
     function(param) return tostring(math.floor(param:get() + 0.5)) end)
 
-  params:add_option(param_id(prefix, "slice_play_mode"), "slice play mode", {"1 shot", "1 shot hold", "loop", "continue"}, 1)
+  params:add_option(param_id(prefix, "slice_play_mode"), "slice play mode", {"1 shot", "hold", "loop", "continue", "ping-pong", "cont loop"}, 1)
   params:set_action(param_id(prefix, "slice_play_mode"), function(_) end)
 
   params:add_binary(param_id(prefix, "slice_reverse"), "slice reverse", "toggle", 0)
@@ -2988,6 +3001,13 @@ function elasticat.params(options)
 
   params:add_binary(param_id(prefix, "slice_hold_to_step"), "slice hold to step", "toggle", 1)
   params:set_action(param_id(prefix, "slice_hold_to_step"), function(_) end)
+
+  -- Razor slice-point editor snap (owner). Off = free; Zero-X snaps edited (and
+  -- auto-chopped) slice points to the nearest zero crossing; Transient auto-chops
+  -- at detected onsets. The engine analysis is wired separately -- this is the
+  -- toggle. Global (like the razor points), registered once.
+  params:add_option(param_id(prefix, "slice_snap"), "slice snap", {"off", "zero-x", "transient"}, 1)
+  params:set_action(param_id(prefix, "slice_snap"), function(_) end)
 
   add_control(param_id(prefix, "slice_attack"), "slice attack",
     cs.new(0.0001, 0.2, "lin", 0.0001, 0.002, "", 0.0005 / 0.1999),

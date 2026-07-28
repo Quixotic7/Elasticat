@@ -4,7 +4,9 @@ local machines = {
   [1] = include("lib/machines/loop"),
   [2] = include("lib/machines/loop_trig"),
   [3] = include("lib/machines/grid_slice"),
-  [4] = include("lib/machines/razor_slice")
+  [4] = include("lib/machines/razor_slice"),
+  [5] = include("lib/machines/slice_poly"),
+  [6] = include("lib/machines/razor_poly")
 }
 
 function Registry.get(machine_id)
