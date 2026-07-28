@@ -197,7 +197,10 @@ local page_model = {
       }
     },
     settings = {
-      item("machine", "MACH", {options = 4}),
+      -- All 6 machines: Loop, Trig, Slice, Razor, Slice Poly, Razor Poly. The cap
+      -- is the encoder's clamp (param_values option_delta), so 4 hid the two poly
+      -- machines even though the param + display formatter already know all six.
+      item("machine", "MACH", {options = 6}),
       item("loop_division", "LDIV", {lockable = false, min = 2, max = 32, step = 2, snaps = {2, 4, 8, 16, 32}}),
       item("trig_polyphony", "POLY", {options = 2}),
       item("playhead_return", "PHED", {options = 3})

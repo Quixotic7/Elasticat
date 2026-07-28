@@ -39,6 +39,8 @@ local PATTERN_TAP_SECONDS = 0.25
 local MACHINE_LOOP = 1
 local MACHINE_GRID_SLICE = 3
 local MACHINE_RAZOR_SLICE = 4
+local MACHINE_SLICE_POLY = 5
+local MACHINE_RAZOR_POLY = 6
 local WHITE_KEYS = {[1] = 0, [2] = 2, [3] = 4, [4] = 5, [5] = 7, [6] = 9, [7] = 11, [8] = 12}
 local BLACK_KEYS = {[2] = 1, [3] = 3, [5] = 6, [6] = 8, [7] = 10}
 local CATEGORY_KEYS = {
@@ -105,9 +107,17 @@ local function format_region(start_point, end_point)
   return string.format("st %03.0f end %03.0f", start_point, end_point)
 end
 
+-- All FOUR slice machines: Slice (3) / Razor (4) and their Poly variants (5/6).
+-- This gates the grid key routing, sequencing and display; the two Poly machines
+-- were missing here, so their grid keys fell through to the LOOP path ("temp st
+-- ###", no slice audio, no slice sequencing). Matches track_sequencer's range
+-- check (mono/poly is the machine, resolved downstream -- not this predicate).
 local function is_slice_machine(machine)
-  return machine == MACHINE_GRID_SLICE or machine == MACHINE_RAZOR_SLICE
+  return machine ~= nil and machine >= MACHINE_GRID_SLICE and machine <= MACHINE_RAZOR_POLY
 end
+-- Exposed so a unit test can pin the machine range (must match track_sequencer's
+-- predicate); the two falling out of sync is exactly what broke the Poly machines.
+GridSequencer.is_slice_machine = is_slice_machine
 
 -- ---- Per-track sequencers (docs/PHASE2_CONTRACT.md) ------------------------
 -- Every track owns a TrackSequencer instance in self.tracks[1..8]. This class

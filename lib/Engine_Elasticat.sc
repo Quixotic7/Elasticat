@@ -100,6 +100,14 @@ Engine_Elasticat : CroneEngine {
 	// Eight copies of each now run; forwarding all of them would flood OSC and
 	// paint another track's modulation onto this track's page. Defaults to 1.
 	var uiTrack = 1;
+	// The on-screen SELECTED track (pushed from Lua on every track switch). Drives
+	// the per-track UI feeds -- the FAST 15Hz phase + meter (smooth playhead) AND
+	// the live mod-bus / filter-env streams (so the actual-value bars and filter
+	// render follow the SELECTED track's LFOs, not always track 1's). Separate from
+	// uiTrack, which is a track-1-assuming legacy handle kept only for the
+	// /elasticat/status stream (uiTrack is never pushed, so it stays 1).
+	var viewTrack = 1;
+	var meterAll = 0;   // 1 = the mixer view is up: forward EVERY track's meter
 
 	// --- Shared sample pool --------------------------------------------------
 	// One buffer set per slot, shared by every track (no duplication).
@@ -284,16 +292,25 @@ Engine_Elasticat : CroneEngine {
 			tr = if((t >= 1) and: { t <= 8 }, { tracks[t] }, { nil });
 			if(tr.notNil, {
 				tr.reportPhase(msg[4].asFloat);
-				// Per-track meter feed, for every track including 1 (one code
-				// path; track 1 is not special). Decimated 30Hz -> 15Hz, the
-				// norns screen refresh rate the mod feed already uses:
-				// forwarding all 8 readers undecimated would be 240 msg/s of
-				// meters alone.
-				levelDecim[t] = levelDecim[t] + 1;
-				if(levelDecim[t] >= 2, {
-					levelDecim[t] = 0;
+				// Meter feed (15Hz = screen rate): only the SELECTED (UI) track is on
+				// screen on most pages, so forward only its meter -- UNLESS the mixer
+				// view is up (meterAll), which shows all 8. A background track meter is
+				// out of view, so flooding OSC with it is waste (owner). Track 1 also
+				// rides /elasticat/status.
+				if((t == viewTrack) or: { meterAll == 1 }, {
 					scriptAddress.sendBundle(0, [
 						"/elasticat/track/level", t, msg[6].asFloat, msg[7].asFloat
+					]);
+				});
+				// FAST playhead for the SELECTED (UI) track, whichever it is: forward
+				// its phase at the reader's 15Hz so a loop on a track above 1 has a
+				// SMOOTH playhead. Without this it fell back to the 1Hz
+				// /track/position re-anchor and dead-reckoned (visibly snapping)
+				// between reports. Track 1 already gets its phase via /elasticat/
+				// status below, so skip the redundant send there. (Owner.)
+				if((t == viewTrack) and: { t != 1 }, {
+					scriptAddress.sendBundle(0, [
+						"/elasticat/track/position", t, msg[4].asFloat
 					]);
 				});
 			});
@@ -333,7 +350,7 @@ Engine_Elasticat : CroneEngine {
 		// existing positional handler working unchanged).
 		modResponder = OSCFunc({
 			arg msg;
-			if(msg[2].asInteger == uiTrack, {
+			if(msg[2].asInteger == viewTrack, {
 				scriptAddress.sendBundle(0, [
 					"/elasticat/mod",
 					msg[3].asFloat, msg[4].asFloat, msg[5].asFloat,
@@ -347,7 +364,7 @@ Engine_Elasticat : CroneEngine {
 		// can show the filter's own envelope sweeping the render.
 		filterEnvResponder = OSCFunc({
 			arg msg;
-			if(msg[2].asInteger == uiTrack, {
+			if(msg[2].asInteger == viewTrack, {
 				scriptAddress.sendBundle(0, [
 					"/elasticat/filterEnv", msg[3].asFloat, msg[2].asInteger
 				]);
@@ -586,7 +603,7 @@ Engine_Elasticat : CroneEngine {
 			// voice applies only its articulation gain (mode xfade, play gate, env).
 			sig = [sig[0], sig[1]] * (modeGain * playGate * ampEnv);
 			sig = LeakDC.ar(sig);
-			SendReply.kr(Impulse.kr(30), cmdName: '/elasticat/statusRaw', values: [
+			SendReply.kr(Impulse.kr(15), cmdName: '/elasticat/statusRaw', values: [
 				2, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
 			], replyID: trackIndex);
 			Out.ar(out, sig);
@@ -628,7 +645,7 @@ Engine_Elasticat : CroneEngine {
 			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento, envReleaseTrig);
 			sig = [sig[0], sig[1]] * (modeGain * gainNorm * playGate * ampEnv);
 			sig = LeakDC.ar(sig);
-			SendReply.kr(Impulse.kr(30), cmdName: '/elasticat/statusRaw', values: [
+			SendReply.kr(Impulse.kr(15), cmdName: '/elasticat/statusRaw', values: [
 				3, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
 			], replyID: trackIndex);
 			Out.ar(out, sig);
@@ -673,7 +690,7 @@ Engine_Elasticat : CroneEngine {
 			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento, envReleaseTrig);
 			sig = [sig[0], sig[1]] * (modeGain * gainNorm * playGate * ampEnv);
 			sig = LeakDC.ar(sig);
-			SendReply.kr(Impulse.kr(30), cmdName: '/elasticat/statusRaw', values: [
+			SendReply.kr(Impulse.kr(15), cmdName: '/elasticat/statusRaw', values: [
 				4, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
 			], replyID: trackIndex);
 			Out.ar(out, sig);
@@ -708,7 +725,7 @@ Engine_Elasticat : CroneEngine {
 			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento, envReleaseTrig);
 			sig = [sig[0], sig[1]] * (modeGain * playGate * ampEnv);
 			sig = LeakDC.ar(sig);
-			SendReply.kr(Impulse.kr(30), cmdName: '/elasticat/statusRaw', values: [
+			SendReply.kr(Impulse.kr(15), cmdName: '/elasticat/statusRaw', values: [
 				5, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
 			], replyID: trackIndex);
 			Out.ar(out, sig);
@@ -1311,7 +1328,7 @@ Engine_Elasticat : CroneEngine {
 			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento, envReleaseTrig);
 			sig = [sig[0], sig[1]] * (modeGain * playGate * ampEnv);
 			sig = LeakDC.ar(sig);
-			SendReply.kr(Impulse.kr(30), cmdName: '/elasticat/statusRaw', values: [
+			SendReply.kr(Impulse.kr(15), cmdName: '/elasticat/statusRaw', values: [
 				modeId, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
 			], replyID: trackIndex);
 			Out.ar(out, sig);
@@ -1522,6 +1539,8 @@ Engine_Elasticat : CroneEngine {
 		this.addCommand(\activeTrackCount, "i", { arg msg; this.setActiveTrackCount(msg[1]); });
 		// Which track's mod / filter-env stream the script receives.
 		this.addCommand(\uiTrack, "i", { arg msg; uiTrack = msg[1].asInteger.clip(1, 8); });
+		this.addCommand(\viewTrack, "i", { arg msg; viewTrack = msg[1].asInteger.clip(1, 8); });
+		this.addCommand(\meterAll, "i", { arg msg; meterAll = msg[1].asInteger.clip(0, 1); });
 		this.addCommand(\maxSliceVoices, "i", { arg msg;
 			maxSliceVoices = msg[1].asInteger.clip(1, 64);
 		});

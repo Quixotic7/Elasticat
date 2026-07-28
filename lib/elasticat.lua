@@ -285,6 +285,24 @@ function elasticat.resolve_base(track, suffix, track_value)
   return track_value
 end
 
+-- The crossfader-APPLIED value of a param: the live morph override if one is in
+-- effect for this track, else the track's own value. Deliberately SKIPS the
+-- step_override layer (resolve_base's source 0) -- a scene capture must snapshot
+-- what the CROSSFADER holds, never a transient firing step lock. This is what a
+-- scene capture reads instead of the raw track param: morph to A, then re-capture
+-- A, and it stores the value you HEAR (the A override) rather than the stale
+-- track value the knob last wrote at B (which would clobber A with B's value).
+function elasticat.crossfader_applied(track, suffix, track_value)
+  local layer = crossfader_override[track]
+  if layer ~= nil then
+    local v = layer[suffix]
+    if v ~= nil then
+      return v
+    end
+  end
+  return track_value
+end
+
 -- Range Start/End (0-128) carve a live performance window *inside* the file
 -- trim window: 0 = trim start, 128 = trim end. Unlike file trim (saved per
 -- sample) this is a global, p-lockable layer. Returns the window in seconds.
@@ -1041,6 +1059,17 @@ function elasticat.set_engine_track(track)
     end
   end
   engine_track = next_track
+  -- Tell the engine which track is on screen, so it forwards THAT track's phase +
+  -- meter at the fast 15Hz feed (a smooth visible playhead). Idempotent; sent on
+  -- every selection so a script reload re-establishes it.
+  engine_call("viewTrack", next_track)
+end
+
+-- The MIX overview shows every track's meter; every other page shows only the
+-- selected track's. Tell the engine which, so it doesn't forward off-screen
+-- meters at 15Hz for nothing.
+function elasticat.set_meter_all(on)
+  engine_call("meterAll", on and 1 or 0)
 end
 
 function elasticat.engine_track()

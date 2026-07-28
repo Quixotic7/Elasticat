@@ -403,8 +403,18 @@ local function reset_visual_phase()
   phase_report_ignore_until = util.time() + 1
 end
 
-local function phase_reports_allowed()
-  return (not playing) and util.time() >= phase_report_ignore_until
+-- During PLAY the selected (on-screen) track follows the engine's live 15Hz
+-- phase DIRECTLY (display_phase returns it un-reckoned), so its report has to be
+-- accepted even while playing -- otherwise the visible playhead sludges along at
+-- the ~1Hz background re-anchor rate instead of tracking the audio. Every OTHER
+-- track is only dead-reckoned for trig_release "return" and must NOT be yanked
+-- around by async reports mid-play, so it keeps the stopped-only gate. The
+-- post-reset ignore window applies to BOTH (a stale in-flight report can't
+-- clobber a fresh playhead jump). No `track` = the legacy stopped-only gate.
+local function phase_reports_allowed(track)
+  if util.time() < phase_report_ignore_until then return false end
+  if not playing then return true end
+  return track ~= nil and track == (elasticat.selected_track or 1)
 end
 
 -- ---- Per-track engine reports (Phase 2) ------------------------------------
@@ -422,7 +432,7 @@ elasticat.osc_report = function(path, args)
     -- The legacy status stream is track 1's (Engine_Elasticat.sc's
     -- statusResponder forwards replyID <= 1 only), so it is attributed to
     -- track 1 explicitly rather than to whatever happens to be selected.
-    if phase_reports_allowed() then
+    if phase_reports_allowed(1) then
       set_visual_phase(args[5], 1)
     end
     status.frames = tonumber(args[6]) or status.frames
@@ -437,10 +447,12 @@ elasticat.osc_report = function(path, args)
   elseif path == "/elasticat/track/position" then
     -- Per-track playhead report (1Hz, tracks 2-8). This is what lets the visual
     -- playhead follow the selected track: set_visual_phase re-anchors ONLY that
-    -- track, and display_phase dead-reckons from the selected track's own
-    -- anchor at that track's own loop rate.
-    if phase_reports_allowed() then
-      set_visual_phase(args[2], elasticat.osc_track(args[1]))
+    -- track, and during play the SELECTED track's phase is drawn from this feed
+    -- directly (phase_reports_allowed lets it through while playing; a background
+    -- track stays stopped-gated, dead-reckoned only for trig_release).
+    local pos_track = elasticat.osc_track(args[1])
+    if phase_reports_allowed(pos_track) then
+      set_visual_phase(args[2], pos_track)
     end
     return true
   elseif path == "/elasticat/track/level" then
@@ -469,7 +481,7 @@ elasticat.osc_report = function(path, args)
     elasticat.route_filter_env_report(args)
     return true
   elseif path == "/elasticat/transport" then
-    if phase_reports_allowed() then
+    if phase_reports_allowed(1) then
       set_visual_phase(args[1], 1)
     end
     return true
@@ -488,7 +500,7 @@ elasticat.osc_report = function(path, args)
     end
     return true
   elseif path == "/elasticat/requestedStatus" then
-    if phase_reports_allowed() then
+    if phase_reports_allowed(1) then
       set_visual_phase(args[4], 1)
     end
     status.frames = tonumber(args[5]) or status.frames
@@ -1973,6 +1985,10 @@ nav = Navigation.new({
     if elasticat.flush_dirty_pool_state ~= nil then
       elasticat.flush_dirty_pool_state()
     end
+    -- The MIX overview (master page 2) shows all 8 meters; every other page shows
+    -- only the selected track's. Tell the engine which meters to feed at 15Hz.
+    local _, page_index = nav:current_page()
+    elasticat.set_meter_all(nav:current_category() == "master" and page_index == 2)
   end
 })
 
@@ -2224,6 +2240,17 @@ elasticat.display_phase = function(track)
   local phase = elasticat.visual_phase(track)
   local previewing = grid_ui ~= nil and grid_ui.preview_active == true
   if not playing and not previewing then
+    return phase
+  end
+
+  -- The on-screen (selected) track gets a live 15Hz engine phase feed while the
+  -- transport plays -- use it DIRECTLY. The engine's true rate carries a dynamic
+  -- clock `correction` the Lua dead-reckon can't know, so reckoning on top always
+  -- diverged and each report yanked it back (a constant wobble). The norns screen
+  -- only refreshes at 15Hz anyway, so interpolating buys nothing here. Dead-reckon
+  -- is still used where there is NO live feed: a stopped preview (no transport),
+  -- or a background track the sequencer resolves for trig_release.
+  if sel and playing then
     return phase
   end
 
@@ -3182,6 +3209,21 @@ function init()
     -- macro depth morph targets) is skipped instead of throwing on load.
     get_value = function(full_id)
       return elasticat.param_exists(full_id) and params:get(full_id) or nil
+    end,
+    -- CAPTURE reads this, not get_value: the crossfader-APPLIED value, so a scene
+    -- snapshots what is actually SOUNDING. Morphing publishes a non-destructive
+    -- override (it never writes the track param), so mid-morph the track value is
+    -- stale -- capturing it clobbered the just-morphed scene with the OTHER
+    -- scene's value (owner's A->B->A workflow). crossfader_applied skips the
+    -- transient step_override so a firing step lock is never baked into a scene.
+    get_applied_value = function(full_id)
+      if not elasticat.param_exists(full_id) then
+        return nil
+      end
+      local body = full_id:sub(#PREFIX + 1)
+      local track = ParamsSpec.track_of_suffix(body) or 1
+      local suffix = body:gsub("^t%d+_", "")
+      return elasticat.crossfader_applied(track, suffix, params:get(full_id))
     end,
     -- Base-value model (docs/BASE_VALUE_RESOLVER.md): the morph is SOURCE 2. It
     -- publishes a non-destructive crossfader override (which re-sends the

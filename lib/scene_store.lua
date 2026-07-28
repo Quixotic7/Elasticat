@@ -147,16 +147,24 @@ end
 -- not one track (owner-confirmed, docs/PHASE2_CONTRACT.md). Values already held
 -- for INACTIVE tracks are preserved rather than dropped, so turning tracks off
 -- and on again does not lose a scene.
+--
+-- Reads the APPLIED value (get_applied_value), not the raw track param: the
+-- crossfader morph publishes a non-destructive override and never writes the
+-- track value, so mid-morph the track param is stale. Capturing it clobbered the
+-- just-morphed scene with the OTHER scene's value (morph to A, tweak, re-capture
+-- A -> A got B's cutoff). Capturing what is actually SOUNDING fixes that. Falls
+-- back to get_value when no applied getter is wired (tests / older callers).
 function SceneStore:capture(scene)
   if not self:in_bounds(scene) or self.opts.morph_ids == nil or self.opts.get_value == nil then
     return
   end
+  local applied = self.opts.get_applied_value or self.opts.get_value
   local values = deep_copy(self.scenes[scene])
   local other = self.scenes[scene == 1 and 2 or 1]
   local get_default = self.opts.get_default
   for _, key in ipairs(self.opts.morph_ids()) do
     if self:is_active(key) then
-      local value = self.opts.get_value(key)
+      local value = applied(key)
       -- SPARSE capture (owner-requested): a param sitting at its DEFAULT is
       -- only worth storing when the OTHER scene holds a value for it -- then
       -- this side must record the default so morphing back to it really
