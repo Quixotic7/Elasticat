@@ -852,7 +852,12 @@ function GridSequencer:refresh_preview_region(retrigger)
   self:push_active_range(locks.range_start, locks.range_end)
   local start_point, end_point = self:locked_region(record)
   self:apply_step_pitch(record)
-  if retrigger and not is_slice_machine(self:machine()) then
+  if retrigger and is_slice_machine(self:machine()) then
+    -- Slice machine: re-fire the held step's slice(s) so a SLICE or PITCH change
+    -- while holding the step is heard IMMEDIATELY (owner) -- no release + re-press.
+    -- The record's freshly-edited slice set + pitch lock feed the new audition.
+    self:preview_held_step_slices()
+  elseif retrigger then
     self:set_region_with_phase(start_point, end_point, 0)
     -- retrig_note forces a fresh attack even under portamento (a plain note_on
     -- on the still-held preview note would be swallowed as legato). Falls back
@@ -2734,6 +2739,13 @@ function GridSequencer:key_pitch_control(x, y, z)
     elseif self.options.set_pitch_param ~= nil then
       self.options.set_pitch_param(pitch)
       self:message(string.format("Pitch %+d", pitch))
+      -- Slice machine, nothing held: also AUDITION the currently-selected slice at
+      -- the new pitch (owner) -- like holding a slice + keyboard, but WITHOUT
+      -- p-locking pitch to the slice. We just set the TRACK pitch above, so an
+      -- un-locked slice auditions at exactly that pitch (base_pitch).
+      if is_slice_machine(self:machine()) and not self.seq:slice_muted(self:get_selected_slice()) then
+        self:trigger_slice_preview(self:get_selected_slice())
+      end
     elseif self.options.set_pitch ~= nil then
       self.seq:call("set_pitch", pitch)
       self:message(string.format("Pitch %+d", pitch))
@@ -3149,6 +3161,9 @@ function GridSequencer:key_slice_control(x, y, z)
       self:toggle_step_slice(index, slice)
       self.step_edited[step] = true
       self:message(string.format("Step %02d Slice %02d", step, slice))
+      -- Re-audition the held step's preview with the new slice set, so the slice
+      -- change is heard immediately (owner) instead of only after a re-press.
+      self:refresh_held_step(true)
     end
     return
   end

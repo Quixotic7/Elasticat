@@ -978,13 +978,17 @@ Engine_Elasticat : CroneEngine {
 				});
 				readRate = BufRateScale.kr(bufL) * freePitchRatio * Select.kr(syncToClock.clip(0, 1), [sliceRate.max(0.03125), syncedRate]) * directionSign;
 				loopPos = Phasor.ar(
-					0,
+					// Reset to resetFrame (the SLICE start) at voice spawn. Without this the
+					// Phasor starts at `start` = readLo, which continue modes force to 0 (the
+					// SAMPLE start) -- so Continue-Loop began at the sample start, not the slice.
+					Impulse.ar(0),
 					readRate,
 					readLo,
 					readHi.max(readLo + 1),
 					resetFrame
 				);
-				sweepFrames = Sweep.ar(0, readRate.abs * SampleRate.ir);
+				// Sweep is reset at spawn too, so Continue (one-shot) starts at resetFrame.
+				sweepFrames = Sweep.ar(Impulse.ar(0), readRate.abs * SampleRate.ir);
 				sweepForwardPos = resetFrame + sweepFrames;
 				sweepReversePos = resetFrame - sweepFrames;
 				sweepPos = Select.ar(reverse.clip(0, 1), [sweepForwardPos, sweepReversePos]);
