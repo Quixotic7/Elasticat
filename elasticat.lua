@@ -504,7 +504,15 @@ elasticat.osc_report = function(path, args)
     elasticat.route_filter_env_report(args)
     return true
   elseif path == "/elasticat/transport" then
-    if phase_reports_allowed(1) then
+    -- The 15Hz reader feed (/elasticat/status) is the AUTHORITY for track 1's
+    -- playhead -- it carries the phase the reader actually plays. The transport
+    -- phasor's 1Hz phase only AGREES for bus-following modes; for tape (native
+    -- rate) and Wavetable (MORF scan position) it advances on its own, so letting
+    -- it write here overwrote the real phase once a second and jittered the
+    -- playhead. Fall back to it only when the reader feed has gone stale (no
+    -- continuous reader streaming amp for >0.2s), so nothing regresses.
+    local reader_live = (util.time() - (status.amp_time[1] or 0)) < 0.2
+    if not reader_live and phase_reports_allowed(1) then
       set_visual_phase(args[1], 1)
     end
     return true
@@ -1994,6 +2002,28 @@ local function source_warp_items()
   -- change it at all, so the knob can't flip the warp engine by accident (owner).
   table.insert(items, 1, ParamItem.item("mode", "WARP",
     {lockable = false, no_edit_playing = true, fn_to_edit = true, options = #elasticat.modes}))
+  -- Pin the synced RATE multiplier to slot 8 (bottom-right) for EVERY warp mode,
+  -- so it always lives in the same place (owner). Free turn = 0.01 steps; FN snaps
+  -- to the same fractional divisions the pattern rate offers (TrackSequencer.
+  -- RATE_FRACTIONS: 1/16..2, triplets included), plus the 3/4/6/8x octaves so the
+  -- full range is snap-reachable. Chopped is the widest mode (WARP + 6 = slot 7),
+  -- so slot 8 never collides. Pad the gap with blanks: ParamBank pairs cells by
+  -- #items, and a sparse array would make the RATE cell unreachable.
+  for i = #items + 1, 7 do
+    items[i] = ParamItem.blank()
+  end
+  items[8] = ParamItem.item("warp_rate", "RATE", {
+    lockable = true, min = 0.0625, max = 8, step = 0.01,
+    -- Wider snap escape than the default 0.0001: a snapped fraction is stored
+    -- rounded to ~0.01 (7/6 -> 1.17), so the next-snap search must look past that
+    -- rounding to descend. 0.012 clears the 0.01 quantization and stays under half
+    -- the smallest gap between adjacent fractions (~0.042), so it never skips one.
+    snap_tolerance = 0.012,
+    snaps = {
+      1 / 16, 1 / 8, 1 / 6, 1 / 4, 1 / 3, 3 / 8, 1 / 2, 5 / 8, 2 / 3, 3 / 4,
+      5 / 6, 7 / 8, 1, 7 / 6, 5 / 4, 4 / 3, 3 / 2, 5 / 3, 7 / 4, 11 / 6, 2, 3, 4, 6, 8
+    }
+  })
   return items
 end
 

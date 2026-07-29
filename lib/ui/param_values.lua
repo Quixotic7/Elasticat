@@ -60,6 +60,30 @@ local function fmt_chop_steps(value)
   return string.format("%.2f", n)
 end
 
+-- warp RATE: when the value sits on one of the FN-snap fractions, show the
+-- musical ratio ("1/2", "3/4", or "2" for wholes) so a snap is visible; off a
+-- ratio, show the raw multiplier ("1.23x"). The clean ratio (no "x") vs the
+-- "x"-suffixed float doubles as a "snapped / free" indicator. Fractions ascend,
+-- matching source_warp_items' snap list.
+local WARP_RATE_FRACTIONS = {
+  {1, 16}, {1, 8}, {1, 6}, {1, 4}, {1, 3}, {3, 8}, {1, 2}, {5, 8}, {2, 3},
+  {3, 4}, {5, 6}, {7, 8}, {1, 1}, {7, 6}, {5, 4}, {4, 3}, {3, 2}, {5, 3},
+  {7, 4}, {11, 6}, {2, 1}, {3, 1}, {4, 1}, {6, 1}, {8, 1}
+}
+local function fmt_warp_rate(value)
+  local v = value or 1
+  -- 0.0075 window: a snapped fraction is stored rounded to 0.01, so the error can
+  -- be a full 0.005 (7/8 = 0.875 -> 0.88, 5/8 = 0.625 -> 0.63). 0.005 sat exactly
+  -- on that boundary and missed them; 0.0075 clears it and stays well under half
+  -- the smallest gap between fractions (~0.021), so it never labels the wrong one.
+  for _, f in ipairs(WARP_RATE_FRACTIONS) do
+    if math.abs(v - (f[1] / f[2])) < 0.0075 then
+      return f[2] == 1 and tostring(f[1]) or (f[1] .. "/" .. f[2])
+    end
+  end
+  return string.format("%.2fx", v)
+end
+
 -- Every simple numeric-display parameter maps its id to a formatter here.
 -- Adding a new one is a single line; only params with bespoke display logic
 -- (enum remapping, pseudo-items, etc.) need an explicit branch below instead.
@@ -130,6 +154,11 @@ local ID_FORMATTERS = {
   master_lofi_bits = fmt_round,
   master_lofi_rate = fmt_round,
   slice_rate = fmt_2dp,
+  warp_rate = fmt_warp_rate,
+  wt_window = fmt_round,
+  wt_cycle = fmt_round,
+  wt_lfo_rate = fmt_2dp,
+  wt_lfo_depth = fmt_2dp,
   pv_dispersion = fmt_2dp,
   chop_steps = fmt_chop_steps,
   grain_size = fmt_milli,
@@ -489,9 +518,17 @@ function ParamValues:snap_value(param_item, current, delta)
     return current
   end
 
+  -- Escape tolerance: how far past `current` a snap must sit to count as the
+  -- "next" one. It must exceed the param's storage quantization, or a snap value
+  -- that was stored rounded (e.g. 7/6 = 1.16667 stored as 1.17) strands the
+  -- ladder -- snapping DOWN from 1.17 would find 7/6 again and never reach 1.0.
+  -- snap_tolerance opts into a wider window; keep it < half the smallest gap
+  -- between adjacent snaps so it never skips a value. Default stays hair-thin.
+  local tol = param_item.snap_tolerance or 0.0001
+
   if delta >= 0 then
     for _, value in ipairs(snaps) do
-      if value > current + 0.0001 then
+      if value > current + tol then
         return value
       end
     end
@@ -499,7 +536,7 @@ function ParamValues:snap_value(param_item, current, delta)
   end
 
   for i = #snaps, 1, -1 do
-    if snaps[i] < current - 0.0001 then
+    if snaps[i] < current - tol then
       return snaps[i]
     end
   end

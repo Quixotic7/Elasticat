@@ -3358,11 +3358,18 @@ function GridSequencer:draw_slice_rows()
   local held_step = self:first_held_step()
   local held_record = held_step ~= nil and self:step_record_for_page_step(self.selected_page, held_step, false) or nil
   local play_record = self.playing and self:step_record(self.seq.play_index, false) or nil
+  -- While stopped, keep the currently-selected slice lit so the keyboard/preview
+  -- always shows which pad it targets (owner). During playback the play_record
+  -- highlight owns the row instead, so we only apply this when stopped.
+  local selected_slice = (not self.playing) and self:get_selected_slice() or nil
 
   for slice = 1, count do
     local row = slice <= 16 and 2 or 3
     local x = ((slice - 1) % 16) + 1
     local level = 3
+    if slice == selected_slice then
+      level = 7
+    end
     if held_record ~= nil and held_record.slices ~= nil and held_record.slices[slice] then
       level = 9
     end

@@ -106,12 +106,27 @@ ParamsSpec.SPEC = {
   {suffix = "pv_dispersion", name = "PC dispersion", spec = {0, 1, "lin", 0.001, 0, "", 0.001}, cmd = "pvDispersion", queue = true},
   -- Harmonizer (mode 7) + Wavetable Scan (mode 8) warp params.
   {suffix = "harm_interval", name = "harmony interval", spec = {-24, 24, "lin", 1, 7, "st", 1 / 48}, cmd = "harmInterval", queue = true},
-  {suffix = "wt_window", name = "wavetable window", spec = {16, 8192, "exp", 1, 512, "smp", 1 / 8176}, cmd = "wtWindow", queue = true},
+  -- Two extra harmony voices (chords). 0 st = that voice OFF (owner).
+  {suffix = "harm_interval2", name = "harmony interval 2", spec = {-24, 24, "lin", 1, 0, "st", 1 / 48}, cmd = "harmInterval2", queue = true},
+  {suffix = "harm_interval3", name = "harmony interval 3", spec = {-24, 24, "lin", 1, 0, "st", 1 / 48}, cmd = "harmInterval3", queue = true},
+  -- Wavetable Scan: WSIZ is now the SLICE COUNT (how many cycles the range is cut
+  -- into); the built-in LFO (rate/depth/shape) auto-scans MORF.
+  {suffix = "wt_window", name = "wavetable slices", spec = {2, 64, "lin", 1, 8, "", 1 / 62}, cmd = "wtWindow", queue = true},
+  {suffix = "wt_cycle", name = "wavetable cycle width", spec = {16, 8192, "exp", 1, 600, "smp", 1 / 8176}, cmd = "wtCycle", queue = true},
+  {suffix = "wt_lfo_rate", name = "wavetable LFO rate", spec = {0, 20, "lin", 0.01, 0, "Hz", 0.01 / 20}, cmd = "wtLfoRate", queue = true},
+  {suffix = "wt_lfo_depth", name = "wavetable LFO depth", spec = {0, 1, "lin", 0.01, 0, "", 0.01}, cmd = "wtLfoDepth", queue = true},
+  {suffix = "wt_lfo_shape", name = "wavetable LFO shape", kind = "option",
+    options = {"sine", "tri", "saw", "s&h", "rand"}, default = 1, cmd = "wtLfoShape", offset = -1, queue = true},
   -- Spectral Freeze (mode 9) + Formant (mode 10) share one FFT reader; both
   -- params live on it. Loop-only + track-1-only (enforced in engine spawnMode).
   {suffix = "freeze_amount", name = "spectral freeze", spec = {0, 1, "lin", 0.01, 0, "", 0.01}, cmd = "freezeAmount", queue = true},
   {suffix = "spectral_blur", name = "spectral blur", spec = {0, 1, "lin", 0.01, 0, "", 0.01}, cmd = "spectralBlur", queue = true},
   {suffix = "formant_shift", name = "formant shift", spec = {-24, 24, "lin", 1, 0, "st", 1 / 48}, cmd = "formantShift", queue = true},
+  -- Synced rate multiplier -- warp-page slot 8 for EVERY mode. Free turn = 0.01
+  -- steps; FN snaps to the pattern-rate fractions (source_warp_items in the
+  -- coordinator supplies those snaps). Scales the transport phasor (bus-following
+  -- modes) and the tape reader's native Phasor. p-lockable + morphable.
+  {suffix = "warp_rate", name = "warp rate", spec = {0.0625, 8, "exp", 0.01, 1, "x", 0.01}, cmd = "warpRate", fmt = "rate_x", queue = true},
   -- slice machines (grid_slice; razor split tables stay shared with track 1 in
   -- Phase 1 -- 64 params x 7 tracks is deferred until per-track razor lands)
   {suffix = "slice_count", name = "slice count", spec = {1, 32, "lin", 1, 16, "", 1 / 31}},

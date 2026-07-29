@@ -54,6 +54,12 @@ local pending_engine_sends = {}
 local pending_engine_order = {}
 local clock_origin = 0
 local clock_sequence = 0
+-- Clock-sync watchdog state: last_observation_time is stamped every time the sync
+-- fiber successfully emits an observation; the watchdog metro auto-recovers a
+-- wedged clock if that stops (see start_clock_watchdog).
+local last_observation_time = 0
+local clock_watchdog_metro = nil
+local last_clock_recovery = 0
 local ids = {}
 -- Param id prefix (options.prefix in elasticat.params, "elasticat_" in the
 -- shipping script). Declared HERE, above every reader: a local is only in
@@ -718,7 +724,9 @@ elasticat.param_formatters = {
   lofi_rate = format_lofi_rate,
   integer = function(param) return tostring(math.floor(param:get() + 0.5)) end,
   decimal2 = function(param) return string.format("%.2f", param:get()) end,
-  percent = function(param) return tostring(math.floor((param:get() * 100) + 0.5)) end
+  percent = function(param) return tostring(math.floor((param:get() * 100) + 0.5)) end,
+  -- Rate multiplier, e.g. "0.50x" / "1.00x" (5-char safe). Matches slice rate.
+  rate_x = function(param) return string.format("%.2fx", param:get()) end
 }
 
 -- Value transforms: param units -> engine units. (x, track) so the envelope
@@ -1707,6 +1715,37 @@ local function send_clock_observation()
   elseif engine.targetBpm ~= nil then
     engine.targetBpm(tempo)
   end
+  -- Proof-of-life for the watchdog: the sync fiber reached here, so the clock is
+  -- advancing and observations are flowing.
+  last_observation_time = util.time()
+end
+
+-- Auto-recovery for a wedged norns clock (owner: "adjusting pattern rates stops
+-- the internal clock; a double-stop fixes it"). The double-stop is reset_clock ->
+-- clock.cleanup(), which frees a leaked/exhausted clock-coroutine pool that the
+-- sync fiber's clock.sync() can no longer resume through. This does the SAME
+-- recovery automatically. It runs on a METRO -- deliberately, because a metro is
+-- not a clock coroutine, so it keeps ticking even when the clock pool is
+-- exhausted. Tightly gated: only while clock sync is on, only after a >3s gap in
+-- observations (normal cadence is one per 1/4 beat, <=1.5s even at 40 BPM), and
+-- at most once per 10s so a genuinely dead external clock source can't churn it.
+function elasticat.start_clock_watchdog()
+  if clock_watchdog_metro ~= nil then return end
+  if metro == nil or metro.init == nil then return end
+  clock_watchdog_metro = metro.init(function()
+    if ids.clock_sync == nil or params:get(ids.clock_sync) ~= 1 then return end
+    local now = util.time()
+    if (now - last_observation_time) > 3 and (now - last_clock_recovery) > 10 then
+      last_clock_recovery = now
+      last_observation_time = now  -- grace period so recovery isn't re-triggered
+      print("elasticat: clock wedged (>3s without a sync observation) -- auto-recovering")
+      if clock ~= nil and clock.cleanup ~= nil then
+        clock.cleanup()
+      end
+      elasticat.start_clock_sync()
+    end
+  end, 1, -1)
+  clock_watchdog_metro:start()
 end
 
 function elasticat.stop_clock_sync()
@@ -1728,6 +1767,10 @@ end
 function elasticat.start_clock_sync()
   elasticat.stop_clock_sync()
   reset_clock_origin()
+  -- Grace period: don't let the watchdog trip on the gap between (re)starting the
+  -- fiber and its first observation.
+  last_observation_time = util.time()
+  elasticat.start_clock_watchdog()
   sync_thread = clock.run(function()
     while true do
       clock.sync(1 / 4)
@@ -2544,8 +2587,14 @@ function elasticat.params(options)
       push("pv_dispersion", "pvDispersion")
     elseif mode == 7 then
       push("harm_interval", "harmInterval")
+      push("harm_interval2", "harmInterval2")
+      push("harm_interval3", "harmInterval3")
     elseif mode == 8 then
       push("wt_window", "wtWindow")
+      push("wt_cycle", "wtCycle")
+      push("wt_lfo_rate", "wtLfoRate")
+      push("wt_lfo_depth", "wtLfoDepth")
+      push("wt_lfo_shape", "wtLfoShape", -1)
     elseif mode == 9 then
       push("freeze_amount", "freezeAmount")
       push("spectral_blur", "spectralBlur")
@@ -2553,6 +2602,9 @@ function elasticat.params(options)
       push("formant_shift", "formantShift")
       push("freeze_amount", "freezeAmount")
     end
+    -- Rate multiplier applies to EVERY warp mode (transport scaling), so re-push it
+    -- on any mode switch regardless of which branch ran above.
+    push("warp_rate", "warpRate")
   end
 
   -- ---- PROJECT group (PRD §7, workstream C) --------------------------------
@@ -3077,7 +3129,7 @@ function elasticat.params(options)
     lofi_rate = ids.master_lofi_rate
   }, "master", "master fx")
 
-  params:add_group(param_id(prefix, "group_engine_modes"), "engine algorithms", 17)
+  params:add_group(param_id(prefix, "group_engine_modes"), "engine algorithms", 24)
 
   add_control(param_id(prefix, "chop_steps"), "chop steps",
     cs.new(0.05, 16, "lin", 0.05, 1, "steps", 0.05 / 15.95),
@@ -3142,9 +3194,35 @@ function elasticat.params(options)
     cs.new(-24, 24, "lin", 1, 7, "st", 1 / 48),
     function(x) elasticat.tr_queue(param_id(prefix, "harm_interval"), 1, "harmInterval", x) end)
 
-  add_control(param_id(prefix, "wt_window"), "wavetable window",
-    cs.new(16, 8192, "exp", 1, 512, "smp", 1 / 8176),
+  -- Two extra harmony voices (chords). 0 st = that voice OFF (owner).
+  add_control(param_id(prefix, "harm_interval2"), "harmony interval 2",
+    cs.new(-24, 24, "lin", 1, 0, "st", 1 / 48),
+    function(x) elasticat.tr_queue(param_id(prefix, "harm_interval2"), 1, "harmInterval2", x) end)
+
+  add_control(param_id(prefix, "harm_interval3"), "harmony interval 3",
+    cs.new(-24, 24, "lin", 1, 0, "st", 1 / 48),
+    function(x) elasticat.tr_queue(param_id(prefix, "harm_interval3"), 1, "harmInterval3", x) end)
+
+  -- Wavetable Scan: WSIZ = SLICE COUNT; a built-in LFO (rate/depth/shape) auto-
+  -- scans MORF. Track 1 hand-registered here; tracks 2-8 get these from the SPEC.
+  add_control(param_id(prefix, "wt_window"), "wavetable slices",
+    cs.new(2, 64, "lin", 1, 8, "", 1 / 62),
     function(x) elasticat.tr_queue(param_id(prefix, "wt_window"), 1, "wtWindow", x) end)
+
+  add_control(param_id(prefix, "wt_cycle"), "wavetable cycle width",
+    cs.new(16, 8192, "exp", 1, 600, "smp", 1 / 8176),
+    function(x) elasticat.tr_queue(param_id(prefix, "wt_cycle"), 1, "wtCycle", x) end)
+
+  add_control(param_id(prefix, "wt_lfo_rate"), "wavetable LFO rate",
+    cs.new(0, 20, "lin", 0.01, 0, "Hz", 0.01 / 20),
+    function(x) elasticat.tr_queue(param_id(prefix, "wt_lfo_rate"), 1, "wtLfoRate", x) end)
+
+  add_control(param_id(prefix, "wt_lfo_depth"), "wavetable LFO depth",
+    cs.new(0, 1, "lin", 0.01, 0, "", 0.01),
+    function(x) elasticat.tr_queue(param_id(prefix, "wt_lfo_depth"), 1, "wtLfoDepth", x) end)
+
+  params:add_option(param_id(prefix, "wt_lfo_shape"), "wavetable LFO shape", {"sine", "tri", "saw", "s&h", "rand"}, 1)
+  params:set_action(param_id(prefix, "wt_lfo_shape"), function(x) tr_call(1, "wtLfoShape", x - 1) end)
 
   add_control(param_id(prefix, "freeze_amount"), "spectral freeze",
     cs.new(0, 1, "lin", 0.01, 0, "", 0.01),
@@ -3157,6 +3235,13 @@ function elasticat.params(options)
   add_control(param_id(prefix, "formant_shift"), "formant shift",
     cs.new(-24, 24, "lin", 1, 0, "st", 1 / 48),
     function(x) elasticat.tr_queue(param_id(prefix, "formant_shift"), 1, "formantShift", x) end)
+
+  -- Synced rate multiplier -- warp-page slot 8, every mode (see source_warp_items).
+  -- Track 1 hand-registered here; tracks 2-8 get it from ParamsSpec.SPEC.
+  add_control(param_id(prefix, "warp_rate"), "warp rate",
+    cs.new(0.0625, 8, "exp", 0.01, 1, "x", 0.01),
+    function(x) elasticat.tr_queue(param_id(prefix, "warp_rate"), 1, "warpRate", x) end,
+    function(param) return string.format("%.2fx", param:get()) end)
 
   params:add_group(param_id(prefix, "group_slices"), "slice machines", 13)
 
