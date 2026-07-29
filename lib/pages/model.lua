@@ -203,7 +203,15 @@ local page_model = {
       item("machine", "MACH", {options = 6}),
       item("loop_division", "LDIV", {lockable = false, min = 2, max = 32, step = 2, snaps = {2, 4, 8, 16, 32}}),
       item("trig_polyphony", "POLY", {options = 2}),
-      item("playhead_return", "PHED", {options = 3})
+      -- Auto-Chop / Transient-snap sensitivity (%), tweakable on-device.
+      item("slice_chop_sense", "CHOP%", {lockable = false, min = 0, max = 100, step = 1, snaps = {0, 25, 50, 75, 100}}),
+      -- Razor slice-point ACTION rows (K3 / YES / Right confirms), like the
+      -- PROJECT Load/Save buttons: `razor_action` instead of a real param id, so
+      -- they route to elasticat.lua's razor_redistribute / razor_autochop and
+      -- never through the generic ParamValues value path. They rewrite the razor
+      -- points, so they only take audible effect on a Razor / Razor Poly machine.
+      {razor_action = "redistribute", short = "REDISTRIBUTE"},
+      {razor_action = "autochop", short = "AUTO-CHOP"}
     }
   },
   file = {
@@ -211,25 +219,41 @@ local page_model = {
     pages = {
       {
         title = "SAMPLE",
+        -- Five B2/B3 groups (owner layout). The MIDDLE group is a 1-param group
+        -- (Sample Preview on knob 3, blank on knob 2) that lives ON the waveform,
+        -- not the cell grid -- `wave_group` items are skipped by the cell renderer
+        -- and selecting that group highlights the waveform. So the physical layout
+        -- is: top cell row [BPM STEP FILE SLOT], the waveform (preview), bottom
+        -- cell row [T-ST T-EN SNAP GAIN].
         items = {
-          -- fn_to_edit: the sample's detected BPM / step count only change with FN
-          -- held, so a stray knob turn can't silently rewrite the warp reference
-          -- and force a recalculation (owner). FN also does the trim-zoom here,
-          -- but that only triggers on the trim items, so there is no conflict.
-          item("sample_bpm", "BPM", {lockable = false, fn_to_edit = true, always_value = true, min = 20, max = 300, step = 1, snaps = {60, 80, 90, 100, 110, 120, 128, 136, 140, 160, 180}}),
-          item("sample_steps", "STEP", {lockable = false, fn_to_edit = true, always_value = true, min = 1, max = 512, step = 1, snaps = {4, 8, 16, 32, 48, 64, 96, 128, 256, 512}}),
+          -- BPM stays FN-locked (fn_to_edit) so a stray knob can't rewrite the warp
+          -- reference, but FN now adjusts it PRECISELY (fn_fine = 1 bpm) instead of
+          -- snapping to musical BPMs -- the sample's exact tempo must be settable.
+          item("sample_bpm", "BPM", {lockable = false, fn_to_edit = true, fn_fine = true, always_value = true, min = 20, max = 300, step = 1}),
+          -- STEP is UNLOCKED now (it means how many steps the trim stretches over, an
+          -- everyday adjustment): a plain knob nudges precisely by 1, FN snaps to
+          -- multiples of 8 (owner). No fn_to_edit, no discrete snaps list.
+          item("sample_steps", "STEP", {lockable = false, fn_snap_multiple = 8, always_value = true, min = 1, max = 512, step = 1}),
           item("sample", "FILE", {file = true, lockable = false}),
           item("file_slot", "SLOT", {lockable = false, min = 1, max = 128, step = 1, snaps = {1, 2, 4, 8, 16, 32, 64, 128}}),
-          item("trim_start", "T-ST", {lockable = false, trim_scan = true, min = 0, max = 3600, step = 0.01, fine_step = 0.001}),
-          item("trim_end", "T-EN", {lockable = false, trim_scan = true, min = 0, max = 3600, step = 0.01, fine_step = 0.001}),
-          item("gain", "GAIN", {lockable = false, min = 0, max = 4, step = 0.01, snaps = {0, 0.5, 1, 1.5, 2, 3, 4}}),
-          item("sample_preview", "PREV", {lockable = false, binary = true, min = 0, max = 1, step = 1})
+          -- Middle group = the waveform. Blank on knob 2, Sample Preview on knob 3.
+          {blank = true, short = "", lockable = false, wave_group = true},
+          item("sample_preview", "PREV", {lockable = false, binary = true, min = 0, max = 1, step = 1, wave_group = true}),
+          -- Trim edits delegate to the coordinator's seconds-domain SNAP editor
+          -- (FN+knob = grid/zoom/zero-x/transient; no FN = 0.01s), so they carry a
+          -- `trim_point` marker instead of the generic scan path.
+          item("trim_start", "T-ST", {lockable = false, trim_point = "start", min = 0, max = 3600, step = 0.01, fine_step = 0.001}),
+          item("trim_end", "T-EN", {lockable = false, trim_point = "end", min = 0, max = 3600, step = 0.01, fine_step = 0.001}),
+          item("trim_snap", "SNAP", {lockable = false, options = 4}),
+          item("gain", "GAIN", {lockable = false, min = 0, max = 4, step = 0.01, snaps = {0, 0.5, 1, 1.5, 2, 3, 4}})
         }
       }
     },
     settings = {
       item("bpm_step_mode", "BPM/STEP MODE", {options = 4}),
-      item("recalc_bpm_steps", "RECALC BPM/STEP", {options = 2})
+      -- Recalc is a "[ ]" ACTION button (like the razor redistribute/auto-chop):
+      -- computes the TRIMMED portion's step count from the filename/current BPM.
+      {razor_action = "recalc", short = "RECALC BPM/STEP"}
     }
   },
   filter = {
@@ -412,6 +436,16 @@ local page_model = {
           item("menv_release", "REL", {lockable = true, min = 0, max = 127, step = 1}),
           item("menv_dest", "DEST", {lockable = false, options = 10}),
           item("menv_depth", "DEPTH", {lockable = true, min = 0, max = 128, step = 1, snaps = {0, 32, 64, 96, 128}})
+        }
+      },
+      -- VELOCITY as a mod source: DEST + DEPTH, like the LFOs / mod env. The
+      -- engine latches the last trigger velocity (per track) and routes it to the
+      -- destination via the mod matrix.
+      {
+        title = "VELOCITY",
+        items = {
+          item("mvel_dest", "DEST", {lockable = false, options = 10}),
+          item("mvel_depth", "DEPTH", {lockable = true, min = 0, max = 128, step = 1, snaps = {0, 32, 64, 96, 128}})
         }
       },
       -- MACRO page: the 4 macro VALUE knobs (0-127, p-lockable). Each macro's

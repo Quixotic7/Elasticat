@@ -1,7 +1,10 @@
 local ParamRenderer = {}
 
 function ParamRenderer.draw_cell_value(text, width)
-  text = tostring(text or "")
+  -- Hard 5-character cap on any value shown in a param BOX (owner) -- a slot is
+  -- too narrow for longer strings. Does NOT touch the header/show_message path,
+  -- which uses item_display_value directly.
+  text = string.sub(tostring(text or ""), 1, 5)
   if #text <= 3 then
     screen.text(text)
   else

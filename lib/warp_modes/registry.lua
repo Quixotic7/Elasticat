@@ -6,7 +6,11 @@ local modes = {
   [3] = include("lib/warp_modes/chopped"),
   [4] = include("lib/warp_modes/granular"),
   [5] = include("lib/warp_modes/random_ola"),
-  [6] = include("lib/warp_modes/pitch_corrected")
+  [6] = include("lib/warp_modes/pitch_corrected"),
+  [7] = include("lib/warp_modes/harmonizer"),
+  [8] = include("lib/warp_modes/wavetable"),
+  [9] = include("lib/warp_modes/spectral_freeze"),
+  [10] = include("lib/warp_modes/formant")
 }
 
 function Registry.get(mode_id)

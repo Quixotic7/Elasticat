@@ -104,6 +104,14 @@ ParamsSpec.SPEC = {
   {suffix = "wsola_search", name = "OLA wander", spec = {0, 0.1, "lin", 0.001, 0.015, "s", 0.001 / 0.1}, cmd = "wsolaSearch", queue = true},
   {suffix = "pv_window", name = "PC window", spec = {0.005, 2, "lin", 0.001, 0.2, "", 0.001 / 1.995}, cmd = "pvWindow", queue = true},
   {suffix = "pv_dispersion", name = "PC dispersion", spec = {0, 1, "lin", 0.001, 0, "", 0.001}, cmd = "pvDispersion", queue = true},
+  -- Harmonizer (mode 7) + Wavetable Scan (mode 8) warp params.
+  {suffix = "harm_interval", name = "harmony interval", spec = {-24, 24, "lin", 1, 7, "st", 1 / 48}, cmd = "harmInterval", queue = true},
+  {suffix = "wt_window", name = "wavetable window", spec = {16, 8192, "exp", 1, 512, "smp", 1 / 8176}, cmd = "wtWindow", queue = true},
+  -- Spectral Freeze (mode 9) + Formant (mode 10) share one FFT reader; both
+  -- params live on it. Loop-only + track-1-only (enforced in engine spawnMode).
+  {suffix = "freeze_amount", name = "spectral freeze", spec = {0, 1, "lin", 0.01, 0, "", 0.01}, cmd = "freezeAmount", queue = true},
+  {suffix = "spectral_blur", name = "spectral blur", spec = {0, 1, "lin", 0.01, 0, "", 0.01}, cmd = "spectralBlur", queue = true},
+  {suffix = "formant_shift", name = "formant shift", spec = {-24, 24, "lin", 1, 0, "st", 1 / 48}, cmd = "formantShift", queue = true},
   -- slice machines (grid_slice; razor split tables stay shared with track 1 in
   -- Phase 1 -- 64 params x 7 tracks is deferred until per-track razor lands)
   {suffix = "slice_count", name = "slice count", spec = {1, 32, "lin", 1, 16, "", 1 / 31}},
@@ -111,6 +119,10 @@ ParamsSpec.SPEC = {
   {suffix = "slice_play_mode", name = "slice play mode", kind = "option",
     options = {"1 shot", "hold", "loop", "continue", "ping-pong", "cont loop"}, default = 1},
   {suffix = "slice_reverse", name = "slice reverse", kind = "binary", default = 0},
+  -- Capped at 4: >=5 rapid retriggers on a poly slice pile up bounded-release
+  -- warp voices faster than they free, blowing CPU into audible garble (owner).
+  -- A proper engine-side same-slice hard-steal could raise this later.
+  {suffix = "slice_ratchet", name = "slice ratchet", spec = {1, 4, "lin", 1, 1, "x", 1 / 3}},
   {suffix = "slice_sync", name = "slice clock sync", kind = "binary", default = 1, cmd = "setSliceSyncToClock"},
   {suffix = "slice_rate", name = "slice rate", spec = {0.125, 8, "exp", 0.01, 1, "x", 0.01}, cmd = "setSliceRate", queue = true},
   {suffix = "slice_polyphony", name = "slice polyphony", kind = "option", options = {"poly 8", "mono"}, default = 1},
@@ -262,6 +274,13 @@ ParamsSpec.SPEC = {
     cmd = "menvRelease", xform = "env_seconds", fmt = "env_time", queue = true, t1 = true},
   {suffix = "menv_depth", name = "mod env depth", spec = {0, 128, "lin", 1, 64, "", 1 / 128},
     cmd = "menvDepth", xform = "bipolar", fmt = "filter_depth", queue = true, t1 = true},
+  -- Velocity as a mod source: dest + depth, like the LFOs / mod env. The engine
+  -- latches the last trigger velocity (per-track) and routes velocity*depth to
+  -- the dest bus via the same mod matrix.
+  {suffix = "mvel_dest", name = "velocity mod dest", kind = "option",
+    options = "mod_dests", default = 1, cmd = "mvelDest", offset = -1, queue = true, t1 = true},
+  {suffix = "mvel_depth", name = "velocity mod depth", spec = {0, 128, "lin", 1, 64, "", 1 / 128},
+    cmd = "mvelDepth", xform = "bipolar", fmt = "filter_depth", queue = true, t1 = true},
 
   -- behaviour settings that describe how THIS track plays. portamento and
   -- mode_switch_fade reach the engine; the rest are read live by the
@@ -271,8 +290,6 @@ ParamsSpec.SPEC = {
   {suffix = "mode_switch_fade", name = "mode switch fade",
     spec = {0.001, 0.25, "lin", 0.001, 0.05, "", 0.001 / 0.249},
     cmd = "modeSwitchFade", queue = true, t1 = true},
-  {suffix = "playhead_return", name = "playhead return", kind = "option",
-    options = {"return", "boomerang", "reset"}, default = 1, t1 = true},
   {suffix = "loop_division", name = "loop key division", spec = {2, 32, "lin", 2, 16, "", 2 / 30},
     fmt = "integer", t1 = true},
   {suffix = "trig_polyphony", name = "trig polyphony", kind = "option",

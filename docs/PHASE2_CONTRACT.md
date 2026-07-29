@@ -91,7 +91,9 @@ exists): `amp`, `pan`, `filterMachine`, `filterType`, `filterCutoff`,
 `lofiBits`, `lofiRate`, `sendTap`, `sendLevel1`, `sendLevel2`, `lfo1Dest`,
 `lfo1Wave`, `lfo1Beats`, `lfo1Depth`, `lfo1Mode`, `lfo2Dest`, `lfo2Wave`,
 `lfo2Beats`, `lfo2Depth`, `lfo2Mode`, `menvDest`, `menvAttack`, `menvDecay`,
-`menvSustain`, `menvRelease`, `menvDepth`.
+`menvSustain`, `menvRelease`, `menvDepth`, `mvelDest`, `mvelDepth` (velocity as a
+mod source: the engine latches the last trigger velocity per track and routes
+`velocity * mvelDepth` to `mvelDest` through the same mod matrix).
 
 Plus indexed forms: `\trMacroBase (track, macro, value)` and
 `\trMacroDepth (track, macro, dest, value)`, and `\trSliceTrigger (track, ...)`

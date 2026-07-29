@@ -37,7 +37,11 @@ function SourcePage.new(opts)
     get_last_trim_focus = opts.get_last_trim_focus,
     active_slices = opts.active_slices,
     slice_bounds = opts.slice_bounds,
-    selected_slice = opts.selected_slice
+    selected_slice = opts.selected_slice,
+    -- Razor Zoom mode: the 0-128 position last edited (zoom centre) and the
+    -- current SNAP mode, so FN can magnify the waveform around that point.
+    get_razor_focus = opts.get_razor_focus,
+    get_slice_snap = opts.get_slice_snap
   }, SourcePage)
 end
 
@@ -142,9 +146,12 @@ function SourcePage:draw_main_cell(param_item, index, corner)
   else
     -- Show the value when flashing/locked, when the item asks to always show it
     -- (BPM/STEP), or while FN is held (peek all values); otherwise the label.
+    -- Exception: the FILE cell's value is the (often long) sample name, which
+    -- overruns neighbouring cells when FN reveals every value -- so keep its
+    -- LABEL under FN. The header shows the sample name instead (see draw path).
     local fn_held = self.get_alt ~= nil and self.get_alt()
     local show_value = self.param_values:item_value_flashing(param_item) or locked
-      or param_item.always_value == true or fn_held
+      or param_item.always_value == true or (fn_held and not param_item.file)
     local text = show_value and self.param_values:item_display_value(param_item) or (param_item.short or param_item.id)
     self:draw_text(text, x, y, locked)
   end
@@ -278,14 +285,38 @@ function SourcePage:draw_waveform(opts)
     view_lo, view_hi = active_lo, active_hi
   end
 
-  -- FN zoom is the Sample (file trim) page only. The Range page does not zoom
-  -- under FN -- there FN snaps the values to multiples of 8 instead.
-  if opts.sample_edit and self.get_alt() and duration > 0 and self:group_has_trim_items() then
-    local zoom_span = util.clamp(4.0 / duration, 0.04, 0.4)
+  -- FN zoom is the Sample (file trim) page only, and now ONLY in the "zoom" TRIM
+  -- snap mode (like razor) -- grid/zero-x/transient snap discretely under FN with
+  -- no zoom. ~4x tighter than before (target ~10% of the sample) for precise
+  -- trim edits. The Range page does not zoom under FN.
+  if opts.sample_edit and self.get_alt() and duration > 0 and self:group_has_trim_items()
+    and math.floor((self.param_value_or("trim_snap", 2)) + 0.5) == 2 then
+    local zoom_span = util.clamp(1.0 / duration, 0.01, 0.1)
     local focus = self.get_last_trim_focus() == "trim_end" and trim_end or trim_start
     local focus_fraction = util.clamp(focus / duration, 0, 1)
     view_lo = util.clamp(focus_fraction - (zoom_span / 2), 0, math.max(0, 1 - zoom_span))
     view_hi = util.clamp(view_lo + zoom_span, view_lo + 0.001, 1)
+  end
+
+  -- Razor Zoom mode: FN magnifies the waveform around the point being edited, the
+  -- Sample-page zoom for the slice editor. Only Razor / Razor Poly (machine 4/6),
+  -- and only Zoom (2) / friends (5) -- grid/zero-x/transient snap discretely under
+  -- FN, no zoom. The slice boundaries + markers remap through this view (below),
+  -- so they zoom WITH the waveform instead of sliding off it.
+  if opts.show_slices and self.get_alt() and duration > 0
+    and self.get_razor_focus ~= nil and self.get_slice_snap ~= nil then
+    local machine = self.param_value_or("machine", 1)
+    local snap = self.get_slice_snap()
+    local focus_pos = self.get_razor_focus()
+    if (machine == 4 or machine == 6) and (snap == 2 or snap == 5) and focus_pos ~= nil then
+      -- ~4x tighter than the File-page sample zoom (owner): a razor edit wants a
+      -- close look at the transient, so target ~10% of the sample (min 1%) rather
+      -- than 40%. Short drum loops previously pinned at the 0.4 ceiling.
+      local zoom_span = util.clamp(1.0 / duration, 0.01, 0.1)
+      local focus_frac = range_to_frac(focus_pos)
+      view_lo = util.clamp(focus_frac - (zoom_span / 2), trim_lo, math.max(trim_lo, trim_hi - zoom_span))
+      view_hi = util.clamp(view_lo + zoom_span, view_lo + 0.001, trim_hi)
+    end
   end
 
   screen.level(2)
@@ -330,6 +361,14 @@ function SourcePage:draw_waveform(opts)
     local slice_active = self.active_slices ~= nil and self.active_slices() or {}
     slice_ranges = {}
     bright_col = {}
+    -- A slice boundary (0-128) -> screen column THROUGH the current view, so a
+    -- Razor-Zoom sub-window magnifies the boundaries with the waveform. Un-zoomed
+    -- (view = trim window) this is exactly (pos/128)*width, so the normal render
+    -- is byte-for-byte unchanged.
+    local function point_to_col(pos)
+      local frac = range_to_frac(pos)
+      return ((frac - view_lo) / math.max(1e-9, view_hi - view_lo)) * width
+    end
     for s = 1, slice_count do
       local lo, hi
       if self.slice_bounds ~= nil then
@@ -337,8 +376,8 @@ function SourcePage:draw_waveform(opts)
       else
         lo, hi = (s - 1) * 128 / slice_count, s * 128 / slice_count
       end
-      local c_lo = math.floor((util.clamp(math.min(lo, hi), 0, 128) / 128) * width + 0.5)
-      local c_hi = math.floor((util.clamp(math.max(lo, hi), 0, 128) / 128) * width + 0.5)
+      local c_lo = math.floor(util.clamp(point_to_col(math.min(lo, hi)), 0, width) + 0.5)
+      local c_hi = math.floor(util.clamp(point_to_col(math.max(lo, hi)), 0, width) + 0.5)
       slice_ranges[s] = {lo = c_lo, hi = c_hi, active = slice_active[s] == true}
       if slice_active[s] then
         for c = c_lo, c_hi - 1 do bright_col[c] = true end
@@ -347,10 +386,22 @@ function SourcePage:draw_waveform(opts)
   end
 
   local current_level = nil
+  local wlen = #waveform
   for column = 0, width - 1 do
     local fraction = view_lo + ((view_hi - view_lo) * (column / math.max(1, width - 1)))
-    local index = math.floor(fraction * (#waveform - 1)) + 1
-    local peak = util.clamp((waveform[index] or 0) * gain, 0, 1)
+    -- The MAX cached peak over the buckets this column spans: at high zoom that's
+    -- one bucket (fine detail); un-zoomed it's the envelope of the ~8 buckets per
+    -- column (1024 buckets / 127 cols), not a single decimated sample.
+    local col_lo = view_lo + ((view_hi - view_lo) * (column / math.max(1, width)))
+    local col_hi = view_lo + ((view_hi - view_lo) * ((column + 1) / math.max(1, width)))
+    local i_lo = util.clamp(math.floor(col_lo * (wlen - 1)) + 1, 1, wlen)
+    local i_hi = util.clamp(math.floor(col_hi * (wlen - 1)) + 1, 1, wlen)
+    local raw = 0
+    for i = i_lo, i_hi do
+      local v = waveform[i] or 0
+      if v > raw then raw = v end
+    end
+    local peak = util.clamp(raw * gain, 0, 1)
     local amp = math.max(1, math.floor((height / 2) * peak))
     local top = util.clamp(center - amp, y0, y0 + height - 1)
     local bottom = util.clamp(center + amp, y0, y0 + height - 1)
@@ -523,17 +574,55 @@ function SourcePage:draw_main_page(items, page_number)
   })
 end
 
+-- File page cells for the wave-group layout: `wave_group` items (the Sample
+-- Preview group) live ON the waveform, not the grid, so they take no cell and
+-- everything after them shifts up one -- top row [BPM STEP FILE SLOT], bottom row
+-- [T-ST T-EN SNAP GAIN]. Selection corners still key off the ITEM index vs the
+-- current group, so a cell only brackets when a real (non-wave) item is selected.
+function SourcePage:draw_file_cells(items)
+  local sel_left = ((self.nav:clamp_current_group() - 1) * 2) + 1
+  local cell = 0
+  for i, param_item in ipairs(items) do
+    if not param_item.wave_group then
+      cell = cell + 1
+      local corner = nil
+      if i == sel_left then
+        corner = "tl"
+      elseif i == sel_left + 1 then
+        corner = "br"
+      end
+      self:draw_main_cell(param_item, cell, corner)
+    end
+  end
+end
+
+-- True when the selected B2/B3 group is the waveform (Sample Preview) group.
+function SourcePage:wave_group_selected(items)
+  local sel_left = ((self.nav:clamp_current_group() - 1) * 2) + 1
+  local a, b = items[sel_left], items[sel_left + 1]
+  return (a ~= nil and a.wave_group == true) or (b ~= nil and b.wave_group == true)
+end
+
 function SourcePage:draw_file_page(page, items)
   -- The File page edits its own file-edit slot, independent of playback.
   local slot = self.elasticat.file_edit_slot ~= nil and self.elasticat.file_edit_slot() or self.param_value_or("file_slot", 1)
   local name = self.elasticat.pool_label ~= nil and self.elasticat.pool_label(slot) or self.sample_name()
-  self:draw_editor({
-    items = items,
-    page_number = self.nav.page_index_by_category.file or 1,
-    title = string.format("%03d %s", slot, name),
+  self.draw_page_header(string.format("%03d %s", slot, name), self.nav.page_index_by_category.file or 1)
+  self:draw_waveform({
+    x = 1,
+    y = SOURCE_WAVEFORM_Y,
+    width = 127,
+    height = SOURCE_WAVEFORM_HEIGHT,
     sample_edit = true,
     slot = slot
   })
+  -- The middle B2/B3 group (Sample Preview) is the waveform: bracket it with the
+  -- same corners the cells use when it is the selected group.
+  if self:wave_group_selected(items) then
+    self.ParamRenderer.draw_selection_corner(1, SOURCE_WAVEFORM_Y, 127, SOURCE_WAVEFORM_HEIGHT, "tl")
+    self.ParamRenderer.draw_selection_corner(1, SOURCE_WAVEFORM_Y, 127, SOURCE_WAVEFORM_HEIGHT, "br")
+  end
+  self:draw_file_cells(items)
 end
 
 function SourcePage:draw_sample_page(page, items)

@@ -208,6 +208,10 @@ function TrackSequencer.new(index, ctx)
   -- this track (poly only). Resolved per voice and passed to the engine; kept out
   -- of slice_locks because it is steal metadata, not an engine param that morphs.
   self.slice_choke_map = {}
+  -- Per-SLICE mute (FN + slice key): slice_mute_map[slice] = true means that
+  -- slice is silent -- skipped on both the live audition and the sequenced
+  -- trigger, but still programmable/editable. Per track, saved with it.
+  self.slice_mute_map = {}
   self.seq_anchor = nil
   self.seq_release_mode = nil
   self.current_region_start = nil
@@ -523,8 +527,14 @@ function TrackSequencer:serialize()
       slice_choke[slice] = group
     end
   end
+  local slice_mute = {}
+  for slice, on in pairs(self.slice_mute_map) do
+    if on then
+      slice_mute[slice] = true
+    end
+  end
   return {steps = steps, rate_index = self.rate_index, page_loop = page_loop,
-    slice_locks = slice_locks, slice_choke = slice_choke}
+    slice_locks = slice_locks, slice_choke = slice_choke, slice_mute = slice_mute}
 end
 
 -- Restore pattern-owned state. Transport state (position, pass counters) is
@@ -544,6 +554,12 @@ function TrackSequencer:deserialize(snapshot)
   for slice, group in pairs(snapshot.slice_choke or {}) do
     if group and group > 0 then
       self.slice_choke_map[slice] = group
+    end
+  end
+  self.slice_mute_map = {}
+  for slice, on in pairs(snapshot.slice_mute or {}) do
+    if on then
+      self.slice_mute_map[slice] = true
     end
   end
   self.page_loop = {}
@@ -731,6 +747,20 @@ function TrackSequencer:slice_lock_set(slice)
   return self.slice_locks[slice]
 end
 
+-- Replace a slice's whole p-lock set (copy/paste of slice pads). An empty/nil
+-- table clears it, so pasting an unlocked pad wipes the destination.
+function TrackSequencer:set_slice_lock_set(slice, locks)
+  if locks == nil or next(locks) == nil then
+    self.slice_locks[slice] = nil
+  else
+    self.slice_locks[slice] = deep_copy(locks)
+  end
+end
+
+function TrackSequencer:clear_slice_locks(slice)
+  self.slice_locks[slice] = nil
+end
+
 -- Per-slice choke group (0 = None). Getter returns 0 for an unset slice so the
 -- trigger path can pass it straight through.
 function TrackSequencer:slice_choke(slice)
@@ -744,6 +774,23 @@ function TrackSequencer:set_slice_choke(slice, group)
   else
     self.slice_choke_map[slice] = group
   end
+end
+
+-- Per-slice mute (FN + slice key). A muted slice is silent on both trigger paths
+-- but stays programmable/editable.
+function TrackSequencer:slice_muted(slice)
+  return self.slice_mute_map[slice] == true
+end
+
+function TrackSequencer:set_slice_muted(slice, on)
+  self.slice_mute_map[slice] = on and true or nil
+end
+
+-- Toggle and return the new state.
+function TrackSequencer:toggle_slice_muted(slice)
+  local on = not self:slice_muted(slice)
+  self.slice_mute_map[slice] = on and true or nil
+  return on
 end
 
 -- The first slice a step actually fires -- its locks form the per-step base.
@@ -1054,6 +1101,16 @@ function TrackSequencer:slice_range(slice)
   return (slice - 1) * width, slice * width
 end
 
+-- Write a slice's start/end region (Razor machines only -- Grid divisions are
+-- derived, so the coordinator no-ops them). Used by the slice copy/paste "All"
+-- gesture. Returns whether the region was applied.
+function TrackSequencer:set_slice_range(slice, start_point, end_point)
+  if self.ctx.set_slice_range ~= nil then
+    return self.ctx.set_slice_range(self.index, slice, start_point, end_point)
+  end
+  return false
+end
+
 function TrackSequencer:trigger_region(record)
   local start_point, end_point = self:locked_region(record)
   self:set_region_with_phase(start_point, end_point, 0)
@@ -1077,9 +1134,15 @@ function TrackSequencer:trigger_step_slices(record)
   -- gates a longer note; the envelope hold can shorten it further (AHR).
   local play_mode = self:param_int("slice_play_mode", 1, 1, 6)
   local slice_length = (play_mode == 1) and 0 or self:note_seconds(record)
+  -- Ratchet subdivides ONE step slot (not the note length), so N retriggers land
+  -- evenly inside the step regardless of play mode / note length.
+  local step_slot = self:step_seconds()
   local fired = nil
   for slice = 1, self:slice_count() do
-    if slices[slice] then
+    -- A muted slice (FN + slice key) is skipped entirely: no voice, and it does
+    -- not light as "playing" either. It stays programmed on the step, so
+    -- unmuting brings it straight back.
+    if slices[slice] and not self:slice_muted(slice) then
       fired = fired or {}
       fired[slice] = true
       local start_point, end_point = self:slice_range(slice)
@@ -1098,7 +1161,13 @@ function TrackSequencer:trigger_step_slices(record)
         pitch = record.pitch or self:slice_lock(slice, "pitch") or self:base_pitch(),
         -- Per-slice choke group (MPC mute group); 0 = None. Engine cuts other
         -- live voices in the same group on this track (poly only).
-        choke = self:slice_choke(slice)
+        choke = self:slice_choke(slice),
+        -- Ratchet: step lock > slice lock > track param. >1 retriggers the slice
+        -- that many times over the step slot (scheduled in the coordinator).
+        ratchet = (record.param_locks and record.param_locks.slice_ratchet)
+          or self:slice_lock(slice, "slice_ratchet")
+          or self:param_int("slice_ratchet", 1, 1, 8),
+        step_seconds = step_slot
       })
     end
   end

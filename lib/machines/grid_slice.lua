@@ -33,6 +33,7 @@ function Machine.machine_items(Item)
     Item.item("slice_count", "SLIC", {lockable = true, min = 1, max = 32, step = 1, snaps = {1, 2, 4, 8, 16, 32}}),
     Item.item("slice_play_mode", "PLAY", {lockable = true, options = 6}),
     Item.item("slice_reverse", "SREV", {lockable = true, binary = true, min = 0, max = 1, step = 1}),
+    Item.item("slice_ratchet", "RTCH", {lockable = true, min = 1, max = 4, step = 1, snaps = {1, 2, 3, 4}}),
     Item.item("slice_sync", "SYNC", {lockable = false, binary = true, min = 0, max = 1, step = 1}),
     Item.item("slice_rate", "RATE", {lockable = true, min = 0.125, max = 8, step = 0.01, snaps = {0.125, 0.25, 0.5, 1, 2, 4, 8}})
   }

@@ -152,6 +152,16 @@ function ParamValues.new(opts)
     param_value_or = opts.param_value_or,
     get_grid_ui = opts.get_grid_ui,
     get_alt = opts.get_alt,
+    -- Razor slice-point editor: Start/End edits delegate here (SNAP mode +
+    -- friends coupling live in the coordinator, which owns the razor params).
+    razor_edit = opts.razor_edit,
+    -- Sample-editor Trim Start/End: FN+knob snap (grid/zoom/zero-x/transient)
+    -- delegates to the coordinator, which owns the seconds-domain trim state.
+    trim_edit = opts.trim_edit,
+    -- FN + PLAY on the razor page selects a chop action (Redistribute/Auto-Chop/
+    -- None); the coordinator owns the pending selection and commits on FN release.
+    razor_action_select = opts.razor_action_select,
+    razor_action_short = opts.razor_action_short,
     get_scene_edit = opts.get_scene_edit,
     get_scene_value = opts.get_scene_value,
     get_select_sample = opts.get_select_sample,
@@ -224,6 +234,8 @@ end
 function ParamValues:item_long_name(param_item)
   if param_item == nil then
     return ""
+  elseif self:showing_slice_count(param_item) then
+    return "slice count"
   elseif param_item.pseudo == "pattern_rate" then
     return "pattern rate"
   elseif param_item.pseudo == "step_length" then
@@ -233,7 +245,7 @@ function ParamValues:item_long_name(param_item)
   elseif param_item.pseudo == "slice_choke" then
     return "choke group"
   elseif param_item.pseudo == "slice_select" then
-    return "edit slice"
+    return self:showing_slice_count(param_item) and "slice count" or "edit slice"
   elseif param_item.id == "default_length" then
     return "trig length"
   elseif param_item.id == "default_velocity" then
@@ -244,8 +256,6 @@ function ParamValues:item_long_name(param_item)
     -- Use the per-engine label (DUTY/MIX/CHAOS/SMEAR) in messages instead of the
     -- generic "mode macro" param name.
     return string.lower(param_item.short or "macro")
-  elseif param_item.id == "playhead_return" then
-    return "ph mode"  -- short so "playhead return <value>" doesn't get cut off
   end
 
   local full_id = self:item_param_id(param_item)
@@ -272,6 +282,23 @@ function ParamValues:item_value_flashing(param_item)
   return key ~= nil and (self.value_flash_until[key] or 0) > util.time()
 end
 
+-- SLIC (slice_select) is a two-job knob: it selects the edited slice, but FN +
+-- turn changes the slice COUNT. While that count edit is fresh AND FN is still
+-- held, the cell shows the count (the value being changed) instead of the
+-- selected index. Releasing FN reverts instantly.
+-- The "SLIC" slice selector on EITHER slice source page: slice_select (pseudo,
+-- razor editor) or the real slice_index param (grid slice). FN + its knob edits
+-- the slice COUNT on both, so both show the count while that edit is fresh.
+local function is_slice_selector(param_item)
+  return param_item ~= nil
+    and (param_item.pseudo == "slice_select" or param_item.id == "slice_index")
+end
+
+function ParamValues:showing_slice_count(param_item)
+  return is_slice_selector(param_item)
+    and self.get_alt() and (self.slice_count_edit_until or 0) > util.time()
+end
+
 function ParamValues:pattern_rate_index()
   local grid_ui = self.get_grid_ui()
   if grid_ui ~= nil and grid_ui.seq ~= nil then
@@ -288,6 +315,10 @@ function ParamValues:item_raw_value(param_item)
     return 0
   elseif param_item.blank then
     return 0
+  elseif self:showing_slice_count(param_item) then
+    -- FN + the SLIC selector (slice_select OR slice_index) shows the slice COUNT
+    -- being edited rather than the selected slice, on both slice source pages.
+    return math.floor((params:get(self.id("slice_count")) or 1) + 0.5)
   elseif param_item.pseudo == "pattern_rate" then
     return self:pattern_rate_index()
   elseif param_item.pseudo == "step_length" then
@@ -301,6 +332,10 @@ function ParamValues:item_raw_value(param_item)
     return grid_ui ~= nil and grid_ui.choke_value ~= nil and grid_ui:choke_value() or 0
   elseif param_item.pseudo == "slice_select" then
     -- The Razor editor's selected slice (its Start/End edit target). Not a param.
+    -- Under a fresh FN+turn the cell tracks the slice COUNT being edited instead.
+    if self:showing_slice_count(param_item) then
+      return math.floor((params:get(self.id("slice_count")) or 1) + 0.5)
+    end
     return grid_ui ~= nil and grid_ui.get_selected_slice ~= nil and grid_ui:get_selected_slice() or 1
   elseif param_item.file then
     return self.sample_name()
@@ -434,6 +469,15 @@ end
 function ParamValues:item_display_value(param_item)
   if param_item ~= nil and param_item.file then
     return self.sample_name()
+  end
+  -- PLAY cell shows the chop action being selected (FN + turn) instead of the
+  -- play mode, on the razor page.
+  if param_item ~= nil and param_item.id == "slice_play_mode"
+    and self.razor_action_short ~= nil then
+    local ra = self.razor_action_short()
+    if ra ~= nil then
+      return ra
+    end
   end
   local value = self:item_raw_value(param_item)
   return self:format_item_value(param_item, value)
@@ -615,6 +659,68 @@ function ParamValues:delta_item(param_item, delta)
 
   if param_item.file then
     self:apply_item_value(param_item, 0)
+    return
+  end
+
+  -- Razor slice-point editor (source page 1): Start/End own their edit path so
+  -- the coordinator can apply the SNAP mode (grid/zoom/zero-x/transient/friends)
+  -- and the friends neighbour coupling. Never p-lockable, so this precedes the
+  -- lock routing entirely.
+  if param_item.razor_point ~= nil and self.razor_edit ~= nil then
+    self.razor_edit(param_item.razor_slice, param_item.razor_point, delta, self.get_alt())
+    -- razor_edit already set the param; mirror the generic path's feedback so the
+    -- value still flashes/prints (it stopped showing once these bypassed below).
+    self:flash_item_value(param_item)
+    if self.show_message ~= nil then
+      self.show_message(self:item_long_name(param_item) .. " " .. self:item_display_value(param_item))
+    end
+    return
+  end
+
+  -- FN + PLAY on the razor page selects a chop action instead of the play mode
+  -- (razor machines only; the coordinator gates + commits on FN release). Falls
+  -- through to a normal play-mode edit on grid slice / when razor_action_select
+  -- declines.
+  if param_item.id == "slice_play_mode" and self.get_alt()
+    and self.razor_action_select ~= nil and self.razor_action_select(delta) then
+    self:flash_item_value(param_item)
+    return
+  end
+
+  -- Sample-editor Trim Start/End: same pattern -- FN+knob applies the trim SNAP
+  -- mode (grid/zoom/zero-x/transient) via the coordinator's seconds-domain edit.
+  if param_item.trim_point ~= nil and self.trim_edit ~= nil then
+    -- Track which edge was last touched so the waveform zooms around it (the
+    -- razor path sets this via the generic branch; trim bypasses that).
+    if self.set_last_trim_focus ~= nil then
+      self.set_last_trim_focus(param_item.id)
+    end
+    self.trim_edit(param_item.trim_point, delta, self.get_alt())
+    self:flash_item_value(param_item)
+    if self.show_message ~= nil then
+      self.show_message(self:item_long_name(param_item) .. " " .. self:item_display_value(param_item))
+    end
+    return
+  end
+
+  -- SLIC selects the edited slice (slice_select on razor, slice_index on grid
+  -- slice); FN + the knob instead changes the slice COUNT (owner). One knob, two
+  -- jobs, gated on FN -- on BOTH slice source pages.
+  if is_slice_selector(param_item) and self.get_alt() then
+    local cid = self.id("slice_count")
+    if params:lookup_param(cid) ~= nil then
+      local nxt = util.clamp(math.floor((params:get(cid) or 1) + (delta >= 0 and 1 or -1) + 0.5), 1, 32)
+      params:set(cid, nxt)
+      self:flash_item_value(param_item)
+      -- While actively turning under FN, the SLIC cell shows the slice COUNT (the
+      -- value being edited) rather than the selected slice index. Each detent
+      -- refreshes the window; it reverts to the index shortly after you stop, or
+      -- immediately when FN releases (showing_slice_count gates on get_alt).
+      self.slice_count_edit_until = util.time() + self.value_flash_seconds
+      if self.show_message ~= nil then
+        self.show_message("Slice count " .. nxt)
+      end
+    end
     return
   end
 

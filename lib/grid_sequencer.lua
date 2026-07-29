@@ -198,7 +198,10 @@ function GridSequencer.new(options)
   self.crossfade = 0  -- A/B crossfader position (0 = A, 1 = B), PRD §6.6
   -- Copy/Clear/Paste buffers, one per scope (steps / page / pattern) so
   -- copying at one scope never clobbers another (Tonverk §6.6).
-  self.clipboard = {steps = nil, page = nil, pattern = nil}
+  self.clipboard = {steps = nil, page = nil, pattern = nil, slice = nil}
+  -- Two-press slice copy: {slice, region} tracks whether the 2nd REC on a still-
+  -- held slice has upgraded the buffer from Params to All. Cleared on release.
+  self.slice_copy_stage = nil
   self.macro_hold = nil  -- which macro key (1-4) is held; routes E2/E3 to it
   self.stop_held = false -- STOP held = CUT/PASTE modifier (see cut_paste_step)
   self.stop_used = false -- ... and whether this hold shuffled any steps
@@ -320,7 +323,8 @@ function GridSequencer:build_track_context()
     trigger_region = sink("trigger_region"),
     trigger_slice = sink("trigger_slice"),
     release_slice = sink("release_slice"),
-    release_all_slices = sink("release_all_slices")
+    release_all_slices = sink("release_all_slices"),
+    set_slice_range = sink("set_track_slice_range")
   }
 end
 
@@ -2302,6 +2306,80 @@ function GridSequencer:copy_held_steps()
     or string.format("%d steps copied", #held))
 end
 
+-- Copy / Clear / Paste a SLICE PAD's program (per-slice p-locks + choke group +
+-- mute), anchored at the lowest held slice. Mirrors the step copy/paste gesture:
+-- hold a slice key + REC (copy) / PLAY (clear) / STOP (paste).
+--
+-- Two-press copy (owner): the FIRST REC copies the PROGRAM only (locks/choke/
+-- mute) -> "Copy NN Params", so pasting a chop's processing onto another chop
+-- doesn't collapse two chops onto one region. A SECOND REC on the same still-held
+-- slice ALSO grabs its start/end region -> "Copy NN All". Releasing the slice
+-- ends the sequence, so a fresh hold+REC always starts back at Params.
+function GridSequencer:copy_held_slice()
+  local held = sorted_held_keys(self.slice_holds)
+  if #held == 0 then
+    return
+  end
+  local slice = held[1]
+  local stage = self.slice_copy_stage
+  if stage ~= nil and stage.slice == slice and not stage.region
+    and self.clipboard.slice ~= nil then
+    -- Second press: upgrade the existing buffer to include the razor region.
+    local lo, hi = self.seq:slice_range(slice)
+    self.clipboard.slice.region = {start_point = lo, end_point = hi}
+    stage.region = true
+    self:message(string.format("Copy %02d All", slice))
+    return
+  end
+  self.clipboard.slice = {
+    locks = deep_copy(self.seq:slice_lock_set(slice) or {}),
+    choke = self.seq:slice_choke(slice),
+    mute = self.seq:slice_muted(slice)
+  }
+  self.slice_copy_stage = {slice = slice, region = false}
+  self:message(string.format("Copy %02d Params", slice))
+end
+
+function GridSequencer:clear_held_slice()
+  local held = sorted_held_keys(self.slice_holds)
+  if #held == 0 then
+    return
+  end
+  for _, slice in ipairs(held) do
+    self.seq:clear_slice_locks(slice)
+    self.seq:set_slice_choke(slice, 0)
+    self.seq:set_slice_muted(slice, false)
+  end
+  self:refresh_slice_preview_locks()
+  self:message(#held == 1 and string.format("Slice %02d cleared", held[1])
+    or string.format("%d slices cleared", #held))
+end
+
+function GridSequencer:paste_on_held_slice()
+  local buf = self.clipboard.slice
+  if buf == nil then
+    self:message("Nothing copied")
+    return
+  end
+  local held = sorted_held_keys(self.slice_holds)
+  if #held == 0 then
+    return
+  end
+  for _, slice in ipairs(held) do
+    self.seq:set_slice_lock_set(slice, buf.locks)
+    self.seq:set_slice_choke(slice, buf.choke or 0)
+    self.seq:set_slice_muted(slice, buf.mute == true)
+    -- "All" copy also carried the start/end region (Razor machines only).
+    if buf.region ~= nil then
+      self.seq:set_slice_range(slice, buf.region.start_point, buf.region.end_point)
+    end
+  end
+  self:refresh_slice_preview_locks()
+  local scope = buf.region ~= nil and "All" or "Params"
+  self:message(#held == 1 and string.format("Paste %02d %s", held[1], scope)
+    or string.format("Paste %d slices %s", #held, scope))
+end
+
 function GridSequencer:paste_on_held_steps()
   local entries = self.clipboard.steps
   if entries == nil then
@@ -2430,13 +2508,21 @@ end
 function GridSequencer:key_controls(x, z)
   if x == 1 then
     self.fn_down = z == 1
+    -- Grid FN mirrors norns K1 for the razor chop action: arm a fresh selection
+    -- on press, commit it on release. Without this the grid-FN path never
+    -- committed -> the action never ran and the selector stuck active.
+    if z == 1 then
+      if self.options.razor_action_arm ~= nil then self.options.razor_action_arm() end
+    elseif self.options.razor_action_commit ~= nil then
+      self.options.razor_action_commit()
+    end
     return
   end
 
   -- STOP doubles as the CUT/PASTE modifier (hold it, tap steps). Its transport
   -- action therefore fires on RELEASE, and only if the hold wasn't used to
   -- shuffle steps -- so a tap still stops, but shuffling never kills playback.
-  if x == 5 and not any_keys(self.step_holds) then
+  if x == 5 and not any_keys(self.step_holds) and not any_keys(self.slice_holds) then
     if z == 1 then
       self.stop_held = true
       self.stop_used = false
@@ -2454,6 +2540,11 @@ function GridSequencer:key_controls(x, z)
     -- (a stuck or long-releasing note ignores a plain stop's gate-off) (owner).
     if not self.playing and self.options.kill_all_slices ~= nil then
       self.options.kill_all_slices()
+      -- Also re-init the norns clock fibers -- recovery for a wedged/leaked clock
+      -- (owner). Harmless when the clock is fine.
+      if self.options.reset_clock ~= nil then
+        self.options.reset_clock()
+      end
       self:message("Killed all voices")
     end
     if self.options.set_playing ~= nil then
@@ -2480,6 +2571,18 @@ function GridSequencer:key_controls(x, z)
       self:clear_held_step_locks()
     else
       self:paste_on_held_steps()
+    end
+    self:request_redraw()
+    return
+  end
+  -- Slice-pad scope (slice machines): hold a slice key + REC/PLAY/STOP.
+  if any_keys(self.slice_holds) then
+    if x == 3 then
+      self:copy_held_slice()
+    elseif x == 4 then
+      self:clear_held_slice()
+    else
+      self:paste_on_held_slice()
     end
     self:request_redraw()
     return
@@ -2626,6 +2729,8 @@ function GridSequencer:key_pitch_control(x, y, z)
       self:set_step_pitch(index, pitch)
       self.step_edited[step] = true
       self:message(string.format("Step %02d Pitch %+d", step, pitch))
+    elseif self:set_held_slice_pitch(pitch) then
+      -- A held slice took the keyboard pitch as its per-slice p-lock (+ re-audition).
     elseif self.options.set_pitch_param ~= nil then
       self.options.set_pitch_param(pitch)
       self:message(string.format("Pitch %+d", pitch))
@@ -2755,6 +2860,79 @@ function GridSequencer:refresh_slice_preview_locks()
   local record = {trig = true, slices = {[primary] = true}, param_locks = {}}
   self.seq:push_param_locks(self.seq:effective_param_locks(record))
   self.slice_preview_active = true
+end
+
+-- Fire ONE slice as a stopped-audition voice -- the press-to-preview path. Reads
+-- the slice's own per-slice p-locks (pitch/velocity/choke) so the audition
+-- matches the sequenced trigger. Shared by the slice-key press and the held-slice
+-- keyboard pitch entry, so an octave-key press can re-audition the held slice at
+-- its freshly-locked pitch.
+function GridSequencer:trigger_slice_preview(slice, with_ratchet)
+  if self.options.trigger_slice == nil then
+    return
+  end
+  local start_point, end_point = self:slice_range(slice)
+  local mode = self.options.get_slice_play_mode ~= nil and self.options.get_slice_play_mode() or 1
+  -- One-Shot (1) plays the whole range (sweep-end gates it); Hold/Loop/Continue
+  -- (2/3/4) stay open until the key is released (release_slice), so a long value
+  -- keeps the gate open until then (engine caps it at 60s).
+  local length_seconds = (mode == 1) and 0 or 3600
+  local pitch = self.seq:slice_lock(slice, "pitch") or self:base_pitch()
+  local velocity = self.seq:slice_lock(slice, "velocity") or 1
+  -- Auditioning a slice PAD honors its ratchet (the roll you'd hear sequenced),
+  -- over a one-step-at-current-rate window so the roll rate is musical. The pitch
+  -- re-audition path (octave keyboard) passes no flag -> a single clean hit.
+  local ratchet, step_seconds
+  if with_ratchet then
+    ratchet = self.seq:slice_lock(slice, "slice_ratchet") or self.seq:param_int("slice_ratchet", 1, 1, 8)
+    if (ratchet or 1) > 1 then
+      step_seconds = self.seq:step_seconds()
+    else
+      ratchet = nil
+    end
+  end
+  self.seq:call("trigger_slice", slice, start_point, end_point, {
+    velocity = velocity,
+    length_seconds = length_seconds,
+    pitch = pitch,
+    choke = self.seq:slice_choke(slice),
+    ratchet = ratchet,
+    step_seconds = step_seconds,
+    manual = true
+  })
+  self:mark_region_current(start_point, end_point)
+end
+
+-- Holding a slice key + the 1-octave keyboard writes that slice's own pitch
+-- p-lock (MPC chop program) -- the per-slice mirror of a held step's keyboard
+-- pitch entry -- and re-auditions the focused held slice at the new pitch so it
+-- plays like a keyboard. A held STEP owns the keyboard first (checked by the
+-- caller); the pitch lock lands on EVERY held slice (matching the knob p-lock
+-- path), but only the primary (most-recent) held slice re-fires. Returns true
+-- when a held slice took the pitch.
+function GridSequencer:set_held_slice_pitch(pitch)
+  if next(self.step_holds) ~= nil then
+    return false
+  end
+  local locked = false
+  for slice, held in pairs(self.slice_holds or {}) do
+    if held then
+      self.seq:set_slice_lock(slice, "pitch", pitch)
+      locked = true
+    end
+  end
+  if not locked then
+    return false
+  end
+  -- refresh_slice_preview_locks resolves + records the primary held slice into
+  -- slice_preview_slice; re-fire THAT one at its new pitch for the keyboard feel.
+  self:refresh_slice_preview_locks()
+  local primary = self.slice_preview_slice
+  if primary ~= nil then
+    self:trigger_slice_preview(primary)
+    self:message(string.format("Slice %02d Pitch %+d", primary, pitch))
+  end
+  return true
 end
 
 -- Trigger the first held previewable step's slice(s) on the selected track --
@@ -2956,6 +3134,15 @@ function GridSequencer:key_slice_control(x, y, z)
     return
   end
 
+  -- FN + a slice key toggles that slice's MUTE. Highest priority, so it works
+  -- whether or not a step is held; a muted slice stays programmed/editable but is
+  -- silent on both the audition and the sequencer.
+  if z == 1 and self.fn_down then
+    local muted = self.seq:toggle_slice_muted(slice)
+    self:message(string.format("Slice %02d %s", slice, muted and "Mute" or "Unmute"))
+    return
+  end
+
   local index, step = self:held_step_index()
   if index ~= nil then
     if z == 1 then
@@ -2976,29 +3163,17 @@ function GridSequencer:key_slice_control(x, y, z)
     -- sequenced playback. Newest press wins the (single) track filter/env.
     self.slice_preview_slice = slice
     self:refresh_slice_preview_locks()
-    if self.options.trigger_slice ~= nil then
-      local start_point, end_point = self:slice_range(slice)
-      local mode = self.options.get_slice_play_mode ~= nil and self.options.get_slice_play_mode() or 1
-      -- One-Shot (1) plays the whole range (sweep-end gates it); Hold/Loop/
-      -- Continue (2/3/4) stay open until the key is released (release_slice), so a
-      -- long value keeps the gate open until then (engine caps it at 60s).
-      local length_seconds = (mode == 1) and 0 or 3600
-      -- Live play applies the slice's own per-slice p-locks (MPC chop program):
-      -- pitch/velocity resolve from the slice lock so you hear the lock while
-      -- auditioning/editing, matching what the sequenced trigger will play.
-      local pitch = self.seq:slice_lock(slice, "pitch") or self:base_pitch()
-      local velocity = self.seq:slice_lock(slice, "velocity") or 1
-      self.seq:call("trigger_slice", slice, start_point, end_point, {
-        velocity = velocity,
-        length_seconds = length_seconds,
-        pitch = pitch,
-        choke = self.seq:slice_choke(slice),
-        manual = true
-      })
-      self:mark_region_current(start_point, end_point)
+    -- A muted slice still selects (so it can be edited/unmuted) but does not sound.
+    if not self.seq:slice_muted(slice) then
+      self:trigger_slice_preview(slice, true)   -- pad audition ratchets (rolls)
     end
   else
     self.slice_holds[slice] = nil
+    -- Releasing the copy anchor ends the two-press copy sequence, so the next REC
+    -- on a re-held slice starts fresh at "Params" (never jumps straight to "All").
+    if self.slice_copy_stage ~= nil and self.slice_copy_stage.slice == slice then
+      self.slice_copy_stage = nil
+    end
     local mode = self.options.get_slice_play_mode ~= nil and self.options.get_slice_play_mode() or 1
     if mode ~= 1 and self.options.release_slice ~= nil then
       self.seq:call("release_slice", slice)
@@ -3181,6 +3356,11 @@ function GridSequencer:draw_slice_rows()
     end
     if self.slice_holds[slice] then
       level = 15
+    end
+    -- Muted slices (FN + slice key) read faint regardless of program/play state,
+    -- so the mute pattern is visible at a glance.
+    if self.seq:slice_muted(slice) then
+      level = 1
     end
     self.g:led(x, row, self:pressed_level(x, row, level))
   end

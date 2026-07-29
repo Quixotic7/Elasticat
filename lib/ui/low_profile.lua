@@ -74,8 +74,13 @@ function LowProfile.draw(opts)
     screen.fill()
   end
 
-  -- Name (or the live value while editing), row y+1..y+5.
-  local text = (opts.editing and opts.display_value) or opts.label or ""
+  -- Name (or the live value while editing), row y+1..y+5. The VALUE is hard-capped
+  -- to 5 chars (owner) -- the cell is too narrow for more; the header keeps the
+  -- full value. The label is already a short (<=4 char) name, so it is left as-is.
+  local text = opts.label or ""
+  if opts.editing and opts.display_value ~= nil then
+    text = string.sub(tostring(opts.display_value), 1, 5)
+  end
   screen.level(name_level)
   screen.move(x + BAR_X, y + 6)
   screen.text(tostring(text))

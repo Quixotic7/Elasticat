@@ -162,7 +162,12 @@ local sample_waveforms = {}
 local value_flash_until = {}
 local last_trim_focus = "trim_start"
 local VALUE_FLASH_SECONDS = 0.85
-local WAVEFORM_BUCKETS = 126
+-- 1024 (was 126, one per screen column): the razor/trim ZOOM magnifies a small
+-- slice of the waveform, so it needs many more cached peaks than the 127px width
+-- to stay detailed when zoomed in. The render takes the max bucket per column,
+-- so the un-zoomed view still shows the full envelope (not a decimated sample).
+-- Same whole-file read cost; ~8KB/slot of cached peaks.
+local WAVEFORM_BUCKETS = 1024
 local SOURCE_CELL_X = {1, 33, 65, 97}
 local SOURCE_CELL_WIDTH = 31
 local SOURCE_CELL_HEIGHT = 11
@@ -320,11 +325,19 @@ end
 
 local function cache_sample_waveform(slot, path)
   slot = math.floor((tonumber(slot) or 1) + 0.5)
+  -- The RAW onset envelope is cached alongside the waveform, computed once per
+  -- load (owner: "process and cache at sample load"). The THRESHOLD is applied
+  -- later in slot_transients from the live sensitivity knob, so re-picking onsets
+  -- needs no re-read. On the module table -- the coordinator is at LuaJIT's
+  -- 200-local ceiling. Feeds the razor editor's Transient snap + Auto-Chop.
+  elasticat.sample_onsets = elasticat.sample_onsets or {}
   if path == nil or path == "" or path == "-" or path:sub(-1) == "/" then
     sample_waveforms[slot] = nil
+    elasticat.sample_onsets[slot] = nil
     return
   end
   sample_waveforms[slot] = WavReader.read_wav_waveform(path, WAVEFORM_BUCKETS) or WavReader.fallback_waveform(path, WAVEFORM_BUCKETS)
+  elasticat.sample_onsets[slot] = WavReader.read_wav_onsets(path)
 end
 
 local function active_waveform(slot)
@@ -340,12 +353,22 @@ local function active_waveform(slot)
     return nil
   end
   if waveform == nil and elasticat.pool_path ~= nil then
-    if not playing or not param_values.applying_step_locks then
-      cache_sample_waveform(slot, path)
-      waveform = sample_waveforms[slot]
-    else
-      return WavReader.fallback_waveform(path, WAVEFORM_BUCKETS)
+    -- Lazy cache (owner): reading the WAV is a multi-hundred-ms FREEZE, so it is
+    -- deferred to first view instead of blocking startup (the intro plays over
+    -- the empty init). Two rules:
+    --   * NEVER read while playing -- the user stops to view a sample. Show the
+    --     synthetic fallback shape meanwhile (no I/O).
+    --   * When stopped, FLAG the slot; the redraw metro shows "Loading..." one
+    --     tick, then does the blocking read the next, so the message is on screen
+    --     DURING the freeze rather than after it (active_waveform can't message
+    --     from here -- it's defined before show_message/request_redraw).
+    if not playing then
+      local wp = elasticat.waveform_pending
+      if wp == nil or wp.slot ~= slot then
+        elasticat.waveform_pending = {slot = slot, path = path, shown = false}
+      end
     end
+    return WavReader.fallback_waveform(path, WAVEFORM_BUCKETS)
   end
   return waveform
 end
@@ -690,6 +713,19 @@ local function apply_pattern_state(snapshot, restart)
     grid_ui:on_pattern_applied(restart == true)
   end
   applying_pattern_state = false
+  -- Re-evaluate EVERY active track's free-run play gate against the FINAL restored
+  -- state. The params:set() loop above fires each track's machine action in
+  -- pairs()-arbitrary order, and the transport param's own action (set_engine_play)
+  -- only ever (re)starts TRACK 1 -- so a loop on track 2-8 could land with the wrong
+  -- `playing` and stay silent on load until the track was next touched/selected.
+  -- One explicit pass here, after the whole pattern (and the restored transport
+  -- state) has landed, gives every loop track the correct playing state. Cheap
+  -- (<=8 sends) and idempotent -- setting play to its current value is a no-op.
+  if elasticat.push_track_play_state ~= nil then
+    for track = 1, elasticat.active_track_count() do
+      elasticat.push_track_play_state(track)
+    end
+  end
   -- A/B scene crossfader (PRD §6.6 requirement 3): the params:set() loop above
   -- just overwrote every per-pattern param -- including any that are also morph
   -- targets -- with this pattern's raw saved values, wiping out whatever blend
@@ -1672,9 +1708,276 @@ elasticat.razor_editor_items = function()
     ParamItem.item("sample_slot", "SLOT", {lockable = true, min = 1, max = 128, step = 1, snaps = {1, 2, 4, 8, 16, 32, 64, 128}}),
     ParamItem.item(string.format("razor_%02d_start", sel), "STRT", {lockable = false, min = 0, max = 128, step = 0.5, razor_point = "start", razor_slice = sel}),
     ParamItem.item(string.format("razor_%02d_end", sel), "END", {lockable = false, min = 0, max = 128, step = 0.5, razor_point = "end", razor_slice = sel}),
-    ParamItem.item("slice_snap", "SNAP", {lockable = false, options = 3}),
+    ParamItem.item("slice_snap", "SNAP", {lockable = false, options = 5}),
     ParamItem.item("slice_choke", "CHOK", {pseudo = "slice_choke", lockable = false, min = 0, max = 8, step = 1})
   }
+end
+
+-- Redistribute the first slice_count razor slices as EQUAL divisions of the
+-- whole sample (source settings action row). By slice_count, unlike the fixed
+-- 32-slice razor_reset trigger. Only razor machines read these points.
+elasticat.razor_redistribute = function()
+  local count = util.clamp(math.floor((param_value_or("slice_count", 16)) + 0.5), 1, 32)
+  local width = 128 / count
+  for i = 1, count do
+    params:set(id(string.format("razor_%02d_start", i)), (i - 1) * width)
+    params:set(id(string.format("razor_%02d_end", i)), i * width)
+  end
+  show_message(string.format("Razor: %d even slices", count))
+  request_redraw()
+end
+
+-- Auto-Chop: lay one razor slice per detected transient (MPC style) and set the
+-- track's slice_count to match. Slice i runs from onset i to onset i+1 (the last
+-- to the end); the pre-first-onset head is left out (adjust slice 1's Start to
+-- reclaim it). Uses the transients cached at sample load.
+elasticat.razor_autochop = function()
+  local slot = elasticat.ui_sample_slot ~= nil and elasticat.ui_sample_slot() or 1
+  local list = elasticat.slot_transients(slot)
+  if #list == 0 then
+    show_message("Auto-Chop: no transients")
+    return
+  end
+  local count = math.min(#list, 32)
+  for i = 1, count do
+    local start_point = util.clamp(list[i], 0, 128)
+    local end_point = (i < count) and util.clamp(list[i + 1], 0, 128) or 128
+    if end_point <= start_point then
+      end_point = math.min(128, start_point + 0.01)
+    end
+    params:set(id(string.format("razor_%02d_start", i)), start_point)
+    params:set(id(string.format("razor_%02d_end", i)), end_point)
+  end
+  params:set(ui_id("slice_count"), count)
+  show_message(string.format("Auto-Chop: %d slices", count))
+  request_redraw()
+end
+
+-- FN + PLAY on the razor source page runs a chop action WITHOUT a dedicated param
+-- (owner). Interaction:
+--   * hold FN, DON'T turn -> the PLAY cell shows the normal play mode.
+--   * hold FN, turn: the FIRST detent ARMS the selector at "FUNC" (does nothing);
+--     then turn RIGHT -> "REDIST" -> "A.CHOP", or LEFT (from FUNC) -> "EXIT".
+--   * release FN -> commit: REDIST/A.CHOP run; FUNC/EXIT do nothing.
+--   * no FN, turn -> normal play-mode edit.
+-- Only razor machines (4/6). Module-table state (200-local ceiling). Every FN
+-- DOWN (K1 or grid) re-arms (starts inactive), so a missed commit can't stick it.
+elasticat.razor_action_active = false
+elasticat.razor_action_sel = 0   -- -1 EXIT, 0 FUNC (neutral), 1 REDIST, 2 A.CHOP
+elasticat.RAZOR_ACTION_LABELS = { [-1] = "EXIT", [0] = "FUNC", [1] = "REDIST", [2] = "A.CHOP" }
+-- Called on FN DOWN: start each hold fresh (inactive) so holding FN alone shows
+-- the play mode, and un-stick anything a missed FN-release commit left behind.
+elasticat.razor_action_arm = function()
+  elasticat.razor_action_active = false
+  elasticat.razor_action_sel = 0
+end
+elasticat.razor_action_select = function(delta)
+  local machine = param_value_or("machine", 1)
+  if machine ~= 4 and machine ~= 6 then
+    return false   -- not a razor machine: PLAY edits normally
+  end
+  if not elasticat.razor_action_active then
+    -- First turn under FN ARMS at FUNC (does nothing); turn again to pick an action.
+    elasticat.razor_action_active = true
+    elasticat.razor_action_sel = 0
+  else
+    elasticat.razor_action_sel = util.clamp(
+      elasticat.razor_action_sel + (delta >= 0 and 1 or -1), -1, 2)
+  end
+  show_message("Chop: " .. elasticat.RAZOR_ACTION_LABELS[elasticat.razor_action_sel])
+  request_redraw()
+  return true
+end
+-- The PLAY cell's label while a chop action is being selected (nil = show the
+-- normal play mode -- i.e. FN held but not yet turned, or not active).
+elasticat.razor_action_short = function()
+  if not elasticat.razor_action_active then
+    return nil
+  end
+  return elasticat.RAZOR_ACTION_LABELS[elasticat.razor_action_sel]
+end
+-- FN release: run the selected action (FUNC/EXIT = cancel), then reset.
+elasticat.razor_action_commit = function()
+  if not elasticat.razor_action_active then
+    return
+  end
+  local sel = elasticat.razor_action_sel
+  elasticat.razor_action_active = false
+  elasticat.razor_action_sel = 0
+  if sel == 1 then
+    elasticat.razor_redistribute()
+  elseif sel == 2 then
+    elasticat.razor_autochop()
+  end
+  request_redraw()
+end
+
+-- The transient positions (0-128, ascending) for a pool slot at the CURRENT chop
+-- sensitivity, picked from the cached onset envelope (so the sensitivity knob
+-- re-picks live, no re-read). {} when the slot has no cached onsets.
+elasticat.slot_transients = function(slot)
+  slot = math.floor((tonumber(slot) or 1) + 0.5)
+  local onsets = elasticat.sample_onsets
+  onsets = (onsets ~= nil) and onsets[slot] or nil
+  if onsets == nil then
+    return {}
+  end
+  return WavReader.pick_transients(onsets, (param_value_or("slice_chop_sense", 50) or 50) / 100)
+end
+
+-- Snap a 0-128 position to the nearest zero crossing of the slot's sample (an
+-- on-demand signed-window read -- crossings are everywhere, so caching them is
+-- pointless). Returns the position unchanged when the slot has no readable file.
+elasticat.snap_zero_cross = function(slot, pos)
+  local path = elasticat.pool_path ~= nil and elasticat.pool_path(slot) or nil
+  if path == nil or path == "" or path == "-" or path:sub(-1) == "/" then
+    return pos
+  end
+  return WavReader.nearest_zero_cross(path, pos, 0.01)
+end
+
+-- The prev/next cached transient relative to `current` (delta's sign chooses the
+-- direction), or nil when there is none that way -- the caller then fine-nudges.
+elasticat.snap_transient = function(slot, current, delta)
+  local list = elasticat.slot_transients(slot)
+  if #list == 0 then
+    return nil
+  end
+  if delta >= 0 then
+    for _, p in ipairs(list) do
+      if p > current + 0.05 then
+        return p
+      end
+    end
+    return nil
+  end
+  for i = #list, 1, -1 do
+    if list[i] < current - 0.05 then
+      return list[i]
+    end
+  end
+  return nil
+end
+
+-- Edit ONE razor point (start/end of `slice`) from source page 1, honoring the
+-- SNAP mode. FN held picks the snap behaviour; without FN it is a plain detent.
+--   grid      FN -> snap to the nearest 128/slice_count division
+--   zoom      FN -> fine nudge (precise)
+--   zero-x    FN -> nearest zero crossing        (DSP, Increment B: fine for now)
+--   transient FN -> prev/next detected onset     (DSP, Increment B: fine for now)
+--   friends   FN -> fine; ALSO drags the touching neighbour (prev end / next
+--             start) in EVERY case, then the neighbour's own clamp keeps end>start
+-- On the module table -- the coordinator is at LuaJIT's 200-local ceiling, so
+-- the two detents (0.5 plain, 0.1 FN-fine) are inlined below rather than kept as
+-- file-scope locals (two more locals overflow the chunk).
+elasticat.razor_point_edit = function(slice, point, delta, fn_held)
+  slice = math.floor((tonumber(slice) or 1) + 0.5)
+  if slice < 1 or slice > 32 then
+    return
+  end
+  point = (point == "end") and "end" or "start"
+  local pid = id(string.format("razor_%02d_%s", slice, point))
+  if not elasticat.param_exists(pid) then
+    return
+  end
+  local mode = math.floor((param_value_or("slice_snap", 1)) + 0.5)   -- 1..5
+  local count = util.clamp(math.floor((param_value_or("slice_count", 16)) + 0.5), 1, 32)
+  local slot = elasticat.ui_sample_slot ~= nil and elasticat.ui_sample_slot() or 1
+  local current = params:get(pid)
+  local target
+  if fn_held and mode == 1 then
+    -- Grid: step to the next 128/count division in the delta's direction.
+    local mult = 128 / count
+    if delta >= 0 then
+      target = (math.floor(current / mult + 1e-6) + 1) * mult
+    else
+      target = (math.ceil(current / mult - 1e-6) - 1) * mult
+    end
+  elseif fn_held and mode == 3 then
+    -- zero-x: move one detent, then land on the nearest zero crossing.
+    target = elasticat.snap_zero_cross(slot, util.clamp(current + (delta * 0.5), 0, 128))
+  elseif fn_held and mode == 4 then
+    -- Transient: jump to the prev/next detected onset (fine nudge if none).
+    target = elasticat.snap_transient(slot, current, delta) or (current + (delta * 0.001))
+  elseif fn_held and mode == 2 then
+    -- Zoom: match the sample-editor trim FEEL -- one detent = ~1ms of the sample
+    -- (0.128/duration in 0-128 units), not a fixed 0.001. So under the same ~10%
+    -- visual zoom the marker moves the same visible amount per detent as the trim
+    -- editor, regardless of sample length (0.001 was ~32x too fine on a 4s file).
+    local dur = elasticat.pool_meta ~= nil and (elasticat.pool_meta(slot).duration or 0) or 0
+    target = current + (delta * ((dur > 0) and (0.128 / dur) or 0.03))
+  elseif fn_held then
+    -- Friends: ultra-fine 0.001 nudge (sample-accurate under the zoom).
+    target = current + (delta * 0.001)
+  else
+    target = current + (delta * 0.5)   -- plain detent
+  end
+  params:set(pid, util.clamp(target, 0, 128))   -- the param action keeps end>start
+  -- Remember the point just edited (0-128) so the source page can centre the
+  -- Razor-Zoom magnification on it.
+  elasticat.razor_focus_pos = params:get(pid)
+
+  -- Friends: dragging a start also drags the PREVIOUS slice's end; dragging an
+  -- end also drags the NEXT slice's start (except the outermost, which have no
+  -- neighbour on that side). Use the value we actually landed on after clamping.
+  if mode == 5 then
+    local landed = params:get(pid)
+    if point == "start" and slice > 1 then
+      params:set(id(string.format("razor_%02d_end", slice - 1)), landed)
+    elseif point == "end" and slice < count then
+      params:set(id(string.format("razor_%02d_start", slice + 1)), landed)
+    end
+  end
+  request_redraw()
+end
+
+-- Edit ONE trim endpoint (Trim Start/End on the sample editor) honoring the TRIM
+-- snap mode -- the seconds-domain parallel of razor_point_edit. Without FN both
+-- edges move in 0.01s detents; FN drives the snap. The point is placed
+-- INDEPENDENTLY via the facade (snapping start never drags end). Module-table
+-- function (coordinator is at the 200-local ceiling); zero-x/transient reuse the
+-- razor 0-128 snap helpers via a seconds<->128 conversion.
+--   grid      -> the sample's step grid (one 16th at its BPM)
+--   zoom      -> fine 0.001s nudge (+ the visual waveform zoom)
+--   zero-x    -> nearest zero crossing
+--   transient -> prev/next detected onset (fine nudge if none that way)
+elasticat.trim_point_edit = function(point, delta, fn_held)
+  point = (point == "end") and "end" or "start"
+  if elasticat.set_trim_point == nil then
+    return
+  end
+  local slot = elasticat.file_edit_slot ~= nil and elasticat.file_edit_slot() or 1
+  local meta = elasticat.pool_meta(slot)
+  local duration = (meta and meta.duration) or 0
+  local pid = id(point == "end" and "trim_end" or "trim_start")
+  if duration <= 0 or not elasticat.param_exists(pid) then
+    return
+  end
+  local current = params:get(pid)   -- seconds
+  local mode = math.floor((param_value_or("trim_snap", 2)) + 0.5)   -- 1 grid 2 zoom 3 zero-x 4 transient
+  local target
+  if not fn_held then
+    target = current + (delta * 0.01)                        -- plain 0.01s detent
+  elseif mode == 1 then
+    local bpm = math.max(1, (meta and meta.bpm) or 120)
+    local step = 60 / (bpm * 4)                              -- one 16th, seconds
+    if delta >= 0 then
+      target = (math.floor(current / step + 1e-6) + 1) * step
+    else
+      target = (math.ceil(current / step - 1e-6) - 1) * step
+    end
+  elseif mode == 3 then
+    local nudged = util.clamp(current + (delta * 0.005), 0, duration)
+    local snapped = elasticat.snap_zero_cross(slot, (nudged / duration) * 128)
+    target = (snapped / 128) * duration
+  elseif mode == 4 then
+    local snapped = elasticat.snap_transient(slot, (current / duration) * 128, delta)
+    target = snapped ~= nil and ((snapped / 128) * duration) or (current + (delta * 0.001))
+  else
+    target = current + (delta * 0.001)                       -- zoom: fine
+  end
+  elasticat.set_trim_point(point, target)
+  request_redraw()
 end
 
 local function source_machine_items()
@@ -1690,7 +1993,7 @@ local function source_warp_items()
   -- encoder edit while the transport runs; `fn_to_edit` requires FN held to
   -- change it at all, so the knob can't flip the warp engine by accident (owner).
   table.insert(items, 1, ParamItem.item("mode", "WARP",
-    {lockable = false, no_edit_playing = true, fn_to_edit = true, options = 6}))
+    {lockable = false, no_edit_playing = true, fn_to_edit = true, options = #elasticat.modes}))
   return items
 end
 
@@ -2001,6 +2304,13 @@ param_values = ParamValues.new({
   param_value_or = param_value_or,
   get_grid_ui = function() return grid_ui end,
   get_alt = fn_active,
+  -- Razor slice-point editor: Start/End edits route here so the coordinator can
+  -- apply the SNAP mode + friends coupling (razor_point_edit, module table).
+  razor_edit = function(slice, point, delta, fn) elasticat.razor_point_edit(slice, point, delta, fn) end,
+  trim_edit = function(point, delta, fn) elasticat.trim_point_edit(point, delta, fn) end,
+  -- FN + PLAY on the razor page selects/commits a chop action (no dedicated param).
+  razor_action_select = function(delta) return elasticat.razor_action_select(delta) end,
+  razor_action_short = function() return elasticat.razor_action_short() end,
   -- A/B scene p-locks (PRD §6.6): while an anchor is held, params locked in
   -- that scene display the SCENE's value with the lock visuals, exactly like
   -- a held step's p-locks.
@@ -2104,8 +2414,8 @@ local function settings_delta_value(delta)
   -- confirming an action row is K3's job (see key(n,z)'s settings-layer
   -- branch). Falling through to item_raw_value below would error: those rows
   -- have no `.id`, so `params:lookup_param` would be handed a nil suffix.
-  if param_item.project_row ~= nil then
-    return
+  if param_item.project_row ~= nil or param_item.razor_action ~= nil then
+    return   -- action rows (Load/Save, Redistribute/Auto-Chop): no value to edit
   end
   local current = param_values:item_raw_value(param_item)
   elasticat.undo_record_param(param_item)
@@ -2372,7 +2682,11 @@ local source_page = SourcePage.new({
   -- The slice the Razor editor is editing, so the waveform marks its Start/End.
   selected_slice = function()
     return grid_ui ~= nil and grid_ui.get_selected_slice ~= nil and grid_ui:get_selected_slice() or 1
-  end
+  end,
+  -- Razor Zoom mode: the last-edited razor point (0-128) to centre the FN
+  -- magnification on, and the current SNAP mode (only Zoom/friends zoom).
+  get_razor_focus = function() return elasticat.razor_focus_pos end,
+  get_slice_snap = function() return math.floor((param_value_or("slice_snap", 1)) + 0.5) end
 })
 
 -- ---- MIX overview page (master category, page 2) ---------------------------
@@ -2522,10 +2836,54 @@ local function project_settings_row_value(param_item)
     end
     local name = project_store:current_name() or "untitled"
     return project_store:is_unsaved() and (name .. " *") or name
-  elseif param_item.project_row ~= nil then
+  elseif param_item.project_row ~= nil or param_item.razor_action ~= nil then
     return "[ ]"  -- clickable: press YES / B3 / Right arrow to activate
   end
   return param_values:item_display_value(param_item)
+end
+
+-- Action buttons (the "[ ]" rows: razor redistribute/auto-chop/recalc, project
+-- load/save/new) flash a filled checkbox for ~1s when they run, so a one-shot
+-- function gives clear "it executed" feedback (owner). Keyed by the action name.
+-- On the module table (not file locals) -- the coordinator is at LuaJIT's
+-- 200-local ceiling. See [[elasticat-luajit-limits-and-param-guard]].
+elasticat.action_flash = {}
+elasticat.flash_action = function(param_item)
+  local key = param_item ~= nil and (param_item.razor_action or param_item.project_row) or nil
+  if key == nil then
+    return
+  end
+  elasticat.action_flash[key] = util.time() + 1
+  request_redraw()
+  -- The settings page is not on the playback redraw loop, so schedule the clear.
+  if clock ~= nil and clock.run ~= nil then
+    clock.run(function() clock.sleep(1.05); request_redraw() end)
+  end
+end
+elasticat.action_flashing = function(param_item)
+  local key = param_item ~= nil and (param_item.razor_action or param_item.project_row) or nil
+  return key ~= nil and (elasticat.action_flash[key] or 0) > util.time()
+end
+
+-- The action-button checkbox at the right of a settings row: a 6x5 hollow box,
+-- filled with a small 2x1 centre mark (separated from the border) for ~1s after
+-- it executes -- the visual confirmation of a one-shot function.
+elasticat.draw_action_checkbox = function(param_item, y, level)
+  local bx, by = 121, y - 6
+  screen.level(level or 5)
+  screen.rect(bx, by, 6, 1)
+  screen.fill()
+  screen.rect(bx, by + 4, 6, 1)
+  screen.fill()
+  screen.rect(bx, by, 1, 5)
+  screen.fill()
+  screen.rect(bx + 5, by, 1, 5)
+  screen.fill()
+  if elasticat.action_flashing(param_item) then
+    screen.level(15)
+    screen.rect(bx + 2, by + 2, 2, 1)
+    screen.fill()
+  end
 end
 
 -- K3 on a selected PROJECT action row invokes the matching do_project_*()
@@ -2535,7 +2893,26 @@ end
 -- for every other item, including the status row (informational only) and
 -- ordinary settings items (whose K3 stays "move selection down", unchanged).
 local function invoke_project_settings_action(param_item)
-  if param_item == nil or param_item.project_row == nil then
+  if param_item == nil then
+    return false
+  end
+  -- Source-settings razor action rows (Increment B): Redistribute / Auto-Chop.
+  if param_item.razor_action == "redistribute" then
+    elasticat.razor_redistribute()
+    elasticat.flash_action(param_item)
+    return true
+  elseif param_item.razor_action == "autochop" then
+    elasticat.razor_autochop()
+    elasticat.flash_action(param_item)
+    return true
+  elseif param_item.razor_action == "recalc" then
+    -- File-page RECALC button: recompute BPM + the trimmed-portion step count.
+    elasticat.recalc_bpm_steps()
+    show_message("Recalc BPM/steps")
+    elasticat.flash_action(param_item)
+    return true
+  end
+  if param_item.project_row == nil then
     return false
   end
   if param_item.project_row == "load" then
@@ -2550,6 +2927,9 @@ local function invoke_project_settings_action(param_item)
     do_project_rename()  -- the name row: YES/Right opens the rename dialog
   else
     return false
+  end
+  if param_item.project_row ~= "status" then
+    elasticat.flash_action(param_item)
   end
   return true
 end
@@ -2657,13 +3037,17 @@ local function draw_settings_page()
         -- width -- a "PROJECT" label collided with long names.
         screen.text_trim(project_settings_row_value(param_item), 118)
       else
-        -- Action rows show only a small "[ ]" on the right, so their label
-        -- gets the wide column (fits "NEW PROJECT"); ordinary rows keep room
-        -- for their value.
-        local action_row = param_item.project_row ~= nil
+        -- Action rows show a graphical checkbox on the right (fills for ~1s when
+        -- run); their label gets the wide column (fits "NEW PROJECT"). Ordinary
+        -- rows keep room for their value.
+        local action_row = param_item.project_row ~= nil or param_item.razor_action ~= nil
         screen.text_trim(param_item.short or param_item.id, action_row and 100 or 42)
-        screen.move(128, y)
-        screen.text_right(project_settings_row_value(param_item))
+        if action_row then
+          elasticat.draw_action_checkbox(param_item, y, index == selected and 15 or 5)
+        else
+          screen.move(128, y)
+          screen.text_right(project_settings_row_value(param_item))
+        end
       end
     end
   end
@@ -2779,6 +3163,10 @@ elasticat.seq_apply_locks = function(track, locks)
   -- definition track_id(selected, suffix).
   if track == (elasticat.selected_track or 1) and param_values ~= nil then
     param_values:apply_step_param_locks(locks)
+    -- Send the just-applied step p-locks (esp. filter cutoff) to the engine NOW,
+    -- so they land BEFORE this step's slice/loop trigger instead of ~80ms later
+    -- (the coalesced queue) -- which made each slice "bloop" to its new cutoff.
+    elasticat.flush_engine_sends()
     return
   end
   locks = locks or {}
@@ -2807,6 +3195,8 @@ elasticat.seq_apply_locks = function(track, locks)
       end
     end
   end
+  -- Background track: same reason -- send the p-locks before the trigger.
+  elasticat.flush_engine_sends()
 end
 
 elasticat.seq_selected = function(track)
@@ -2884,8 +3274,23 @@ elasticat.seq_trigger_slice = function(track, slice, start_point, end_point, opt
   -- background branch that used to live here sent raw points (see
   -- seq_set_loop_region above). options.choke is the slice's per-slice choke
   -- group (MPC mute group), resolved per slice by the caller.
-  elasticat.trigger_slice(slice, start_point, end_point, mode, reverse,
-    options.velocity, options.length_seconds, options.pitch, track, options.choke, mono)
+  local ratchet = math.max(1, math.min(8, math.floor((tonumber(options.ratchet) or 1) + 0.5)))
+  if ratchet > 1 and (tonumber(options.step_seconds) or 0) > 0 then
+    -- Ratchet: fire the slice `ratchet` times evenly across the step slot. A Lua
+    -- clock (no engine change) so each hit is a fresh voice/attack -- mono steals
+    -- the previous (a machine-gun retrigger), poly stacks.
+    local interval = options.step_seconds / ratchet
+    clock.run(function()
+      for r = 1, ratchet do
+        elasticat.trigger_slice(slice, start_point, end_point, mode, reverse,
+          options.velocity, options.length_seconds, options.pitch, track, options.choke, mono)
+        if r < ratchet then clock.sleep(interval) end
+      end
+    end)
+  else
+    elasticat.trigger_slice(slice, start_point, end_point, mode, reverse,
+      options.velocity, options.length_seconds, options.pitch, track, options.choke, mono)
+  end
 end
 
 elasticat.seq_trigger_region = function(track, start_point, end_point, options)
@@ -2917,6 +3322,23 @@ elasticat.seq_slice_range = function(track, slice)
   local loop_end = elasticat.track_param_value(track, "loop_end") or 128
   local width = (loop_end - loop_start) / count
   return loop_start + ((slice - 1) * width), loop_start + (slice * width)
+end
+
+-- Write a slice's start/end points, for the slice copy/paste "All" gesture. Only
+-- Razor / Razor Poly (4/6) have per-slice points (the shared razor split table);
+-- Grid divisions are derived from loop_start/end + slice_count, so pasting a
+-- region there is a no-op. Returns whether points were written.
+elasticat.seq_set_slice_range = function(track, slice, start_point, end_point)
+  local machine = elasticat.track_param_value(track, "machine") or 1
+  if machine ~= 4 and machine ~= 6 then
+    return false
+  end
+  if end_point <= start_point then
+    end_point = math.min(start_point + 0.01, 128)
+  end
+  params:set(id(string.format("razor_%02d_start", slice)), util.clamp(start_point, 0, 128))
+  params:set(id(string.format("razor_%02d_end", slice)), util.clamp(end_point, 0, 128))
+  return true
 end
 
 local function load_file(path)
@@ -3042,6 +3464,22 @@ local function start_redraw_metro()
   redraw_metro = metro.init(function()
     -- Un-stick FN if the user just exited the norns menu with K1 (see above).
     elasticat.sync_menu_fn_state()
+    -- Lazy waveform cache (flagged by active_waveform when a viewed sample isn't
+    -- cached and we're stopped): show "Loading..." this tick, do the blocking WAV
+    -- read the NEXT tick -- so the message covers the freeze. Runs every tick,
+    -- before the intro/visualizer early-returns, so it never starves.
+    local wp = elasticat.waveform_pending
+    if wp ~= nil and not playing then
+      if not wp.shown then
+        wp.shown = true
+        show_message("Loading...")
+        redraw_pending = true
+      else
+        elasticat.waveform_pending = nil
+        cache_sample_waveform(wp.slot, wp.path)
+        redraw_pending = true
+      end
+    end
     -- Play the launch intro (screen logo + grid sweep) before the normal UI.
     if intro_active then
       local elapsed = util.time() - intro_start
@@ -3104,8 +3542,12 @@ function init()
     name = "elasticat",
     clock_sync = false,
     on_pool_change = function(snapshot, slot, path)
-      if path ~= nil then
-        cache_sample_waveform(slot, path)
+      -- Lazy caching (owner): DON'T read the WAV here -- that froze startup while
+      -- a project's whole pool was read. Just invalidate this slot's cache so the
+      -- (new or removed) sample re-reads lazily on first view (active_waveform).
+      sample_waveforms[slot] = nil
+      if elasticat.sample_onsets ~= nil then
+        elasticat.sample_onsets[slot] = nil
       end
       if not param_values.applying_step_locks then
         script_state:save_sample_pool_state(snapshot)
@@ -3113,9 +3555,8 @@ function init()
       request_redraw()
     end,
     on_sample_slot = function(slot, path)
-      if path ~= nil and sample_waveforms[slot] == nil and (not playing or not param_values.applying_step_locks) then
-        cache_sample_waveform(slot, path)
-      end
+      -- Lazy caching: no WAV read here either -- the waveform for a track's slot
+      -- is read on first view, not on every slot switch.
       if not param_values.applying_step_locks then
         script_state:save_sample_pool_state()
       end
@@ -3285,8 +3726,26 @@ function init()
     release_slice = elasticat.seq_release_slice,
     release_all_slices = elasticat.seq_release_all_slices,
     kill_all_slices = elasticat.kill_all_slices,
+    -- Grid FN mirrors K1 for the razor chop action (arm on press / commit on
+    -- release); the grid FN key handler calls these.
+    razor_action_arm = elasticat.razor_action_arm,
+    razor_action_commit = elasticat.razor_action_commit,
+    -- Double-stop (panic) recovery for a wedged/leaked norns clock (owner): free
+    -- EVERY clock coroutine -- including any leaked fiber a script reload didn't
+    -- reclaim -- then re-establish our clock-sync fiber. The clock SOURCE
+    -- (tempo/beats) and the sequencer metro are untouched, so timing survives.
+    -- If double-stop recovers a dead clock, the wedge is a Lua fiber-pool leak
+    -- (vs a scsynth/system wedge, which this can't fix).
+    reset_clock = function()
+      if clock ~= nil and clock.cleanup ~= nil then
+        clock.cleanup()
+      end
+      elasticat.start_clock_sync()
+      show_message("Clock reset")
+    end,
     apply_step_param_locks = elasticat.seq_apply_locks,
     get_track_slice_range = elasticat.seq_slice_range,
+    set_track_slice_range = elasticat.seq_set_slice_range,
     -- Macro key LEDs read the live macro value (0-127) for their brightness.
     get_macro_value = function(macro)
       local vid = id("macro" .. macro .. "_value")
@@ -3426,8 +3885,12 @@ function init()
       return params:get(id("step_preview")) == 1
     end,
     get_playhead_return = function()
-      -- Per-track since Phase 2; follow the selected track (see above).
-      return params:get(ui_id("playhead_return"))
+      -- The live-loop-key release mode is NOT a separate param anymore: it reads
+      -- the SELECTED track's trig_release (the RLSE param on the Machine page), so
+      -- one setting governs both trigs and live loop keys. A step p-lock on
+      -- trig_release overrides it for that trig (resolved in the sequencer);
+      -- there is no step for a live-key release, so it uses the track value.
+      return params:get(ui_id("trig_release"))
     end,
     get_loop_rate = function(start_point, end_point, track)
       return loop_phase_rate(start_point, end_point, track)
@@ -3860,6 +4323,12 @@ function key(n, z)
   -- fn_active() OR's this with the grid FN. Modals never see K1.
   if n == 1 then
     alt = z == 1
+    -- FN (K1): arm a fresh razor chop selection on press; commit it on release.
+    if z == 1 then
+      elasticat.razor_action_arm()
+    else
+      elasticat.razor_action_commit()
+    end
     request_redraw()
     return
   end
@@ -3875,6 +4344,19 @@ end
 
 function enc(n, d)
   if text_entry ~= nil and text_entry:enc(n, d) then
+    request_redraw()
+    return
+  end
+  -- The ONE place the GRID FN differs from the norns FN (owner): norns FN + E1
+  -- toggles main<->settings (for grid-less use), but with a grid you navigate
+  -- another way, so GRID FN + E1 changes TEMPO instead. Intercepted here, before
+  -- the router (whose settings_delta binding keys on fn_active() = either FN), so
+  -- grid FN + E1 never opens settings. norns FN + E1 still falls through.
+  if n == 1 and grid_ui ~= nil and grid_ui.fn_down == true
+    and elasticat.param_exists(id("target_bpm")) then
+    local next_bpm = util.clamp((params:get(id("target_bpm")) or 120) + d, 20, 300)
+    params:set(id("target_bpm"), next_bpm)
+    show_message("Tempo " .. math.floor(next_bpm + 0.5))
     request_redraw()
     return
   end

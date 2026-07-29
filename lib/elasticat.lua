@@ -40,7 +40,11 @@ elasticat.modes = {
   "chopped",
   "granular",
   "random_ola",
-  "pitch_corrected"
+  "pitch_corrected",
+  "harmonizer",
+  "wavetable",
+  "spectral_freeze",
+  "formant"
 }
 
 local sync_thread = nil
@@ -1215,6 +1219,43 @@ local function load_sample_slot(slot, path)
   end
 end
 
+-- The "number of steps" param (sample_steps) now means how many steps the
+-- TRIMMED portion should span (owner) -- so a trim can warp to a clean bar. The
+-- engine still derives loopBeats/derivedSourceBpm against the WHOLE buffer
+-- (region = trim_fraction * range_fraction), so scale by 1/trim_fraction here:
+-- a trim that is `frac` of the sample needs steps/frac WHOLE-sample steps for
+-- the trim itself to span `steps`. This resolves in the engine to
+-- loopBeats = (steps/4)*range_fraction and derivedSourceBpm = the trim's native
+-- tempo, with NO engine change. Full-sample trims (frac 1) are unchanged.
+-- Pure (no globals) so it is unit-testable; guards a zero/absent duration.
+function elasticat.trim_scaled_steps(steps, trim_duration, whole_duration)
+  steps = tonumber(steps)
+  if steps == nil then
+    return nil
+  end
+  whole_duration = tonumber(whole_duration) or 0
+  trim_duration = tonumber(trim_duration) or 0
+  if whole_duration <= 0 or trim_duration <= 0 then
+    return steps
+  end
+  local frac = trim_duration / whole_duration
+  if frac <= 0 then
+    return steps
+  end
+  return steps / frac
+end
+
+-- The WHOLE-sample step count to send the engine for a pool slot: the stored
+-- (trim-relative) step count scaled up by 1/trim_fraction (see above).
+local function engine_sample_steps(slot)
+  local steps = sample_pool.steps[slot]
+  if steps == nil then
+    return nil
+  end
+  local trim_start, trim_end, duration = trim_bounds(slot)
+  return elasticat.trim_scaled_steps(steps, trim_end - trim_start, duration)
+end
+
 -- Push the pool metadata of the slot a track PLAYS (source BPM + steps) to that
 -- track's chain. The engine derives each track's loopBeats from its own
 -- sampleSteps, so a track never told its slot's step count free-runs at the
@@ -1231,8 +1272,9 @@ elasticat.sync_track_slot_metadata = function(track)
   if sample_pool.bpms[slot] ~= nil then
     tr_call(track, "sourceBpm", sample_pool.bpms[slot])
   end
-  if sample_pool.steps[slot] ~= nil then
-    tr_call(track, "setSampleSteps", sample_pool.steps[slot])
+  local eng_steps = engine_sample_steps(slot)
+  if eng_steps ~= nil then
+    tr_call(track, "setSampleSteps", eng_steps)
   end
 end
 
@@ -1618,6 +1660,14 @@ flush_engine_sends = function()
   end
 end
 
+-- Public: force the coalesced engine-send queue out NOW. Used by the sequencer
+-- to send a firing step's p-locks (notably filter cutoff) BEFORE the slice/loop
+-- voice triggers -- otherwise the queued (12Hz-coalesced) cutoff lands ~80ms
+-- after the immediate trigger and the voice audibly "bloops" to the new cutoff.
+elasticat.flush_engine_sends = function()
+  flush_engine_sends()
+end
+
 local function reset_clock_origin()
   clock_origin = clock.get_beats()
   clock_sequence = 0
@@ -1638,23 +1688,22 @@ local function set_engine_play(x)
 end
 
 local function send_clock_observation()
-  if ids.target_bpm == nil or ids.sample_steps == nil then
+  if ids.target_bpm == nil then
     return
   end
 
   local tempo = clock.get_tempo()
-  local beats = clock.get_beats()
-  local start_point = params:get(ids.loop_start) or 0
-  local end_point = params:get(ids.loop_end) or 128
-  local region = math.max(0.01, end_point - start_point) / 128
-  local loop_beats = math.max(0.25, (params:get(ids.sample_steps) * region) / 4)
-  local expected_phase = ((beats - clock_origin) / loop_beats) % 1
+  -- Beats since play-start = the shared clock position. The engine locks EVERY
+  -- playing loop track to its OWN expected phase from this plus that track's own
+  -- loopBeats, so a loop on any track stays in sync (not just track 1's). The old
+  -- track-1 expected_phase computation moved into the engine, per track.
+  local beats_since_origin = clock.get_beats() - clock_origin
 
   clock_sequence = clock_sequence + 1
   params:set(ids.target_bpm, tempo, true)
 
   if engine.syncClock ~= nil then
-    engine.syncClock(expected_phase, tempo, clock_sequence)
+    engine.syncClock(beats_since_origin, tempo, clock_sequence)
   elseif engine.targetBpm ~= nil then
     engine.targetBpm(tempo)
   end
@@ -1683,7 +1732,15 @@ function elasticat.start_clock_sync()
     while true do
       clock.sync(1 / 4)
       if params:get(ids.clock_sync) == 1 then
-        send_clock_observation()
+        -- pcall so a transient error (a nil engine command mid-reload, a bad
+        -- param read) can NEVER terminate this coroutine. A dead sync thread
+        -- silently stops every clock observation -> loops stop re-syncing and
+        -- the transport looks "stuck" until a double-stop restarts it. Keep
+        -- the loop alive and just log the fault instead.
+        local ok, err = pcall(send_clock_observation)
+        if not ok then
+          print("elasticat: clock observation error (sync loop kept alive): " .. tostring(err))
+        end
       end
     end
   end)
@@ -2056,23 +2113,43 @@ end
 -- timestretch / pitch / warp -- through its own preview synth (engine
 -- previewSlot), using the slot's trim window and gain. Only while master
 -- transport is stopped so it never fights sequenced playback.
+-- Live preview state: whether the File-page audition is currently running, so
+-- trim/gain scrubbing can push a live region update (update_preview_region).
+local preview_playing = false
+
+-- 0..1 start/end + gain of a slot's current trim window (what the preview plays).
+local function preview_region_for(slot)
+  local trim_start, trim_end, duration = trim_bounds(slot)
+  local start_frac, end_frac = 0, 1
+  if duration > 0 then
+    start_frac = util.clamp(trim_start / duration, 0, 0.999)
+    end_frac = util.clamp(trim_end / duration, start_frac + 0.001, 1)
+  end
+  return start_frac, end_frac, sample_pool.gains[slot] or 1
+end
+
+-- Push the file-edit slot's CURRENT trim + gain to the RUNNING preview synth so
+-- scrubbing trim (or gain) while auditioning follows in real time -- no re-trigger
+-- (the engine Lags the region so it glides). No-op unless the preview is running.
+function elasticat.update_preview_region()
+  if not preview_playing then return end
+  local start_frac, end_frac, gain = preview_region_for(file_edit_slot)
+  engine_call("setPreviewRegion", start_frac, end_frac, gain)
+end
+
 function elasticat.preview_trim(on)
   if on then
     if ids.play ~= nil and params:get(ids.play) == 1 then
+      preview_playing = false
       return
     end
-    local slot = file_edit_slot
-    local trim_start, trim_end, duration = trim_bounds(slot)
-    local start_frac, end_frac = 0, 1
-    if duration > 0 then
-      start_frac = util.clamp(trim_start / duration, 0, 0.999)
-      end_frac = util.clamp(trim_end / duration, start_frac + 0.001, 1)
-    end
-    local gain = sample_pool.gains[slot] or 1
+    local start_frac, end_frac, gain = preview_region_for(file_edit_slot)
     flush_engine_sends()
-    engine_call("previewSlot", slot, start_frac, end_frac, gain, 1)
+    engine_call("previewSlot", file_edit_slot, start_frac, end_frac, gain, 1)
+    preview_playing = true
   else
     engine_call("previewSlot", 0, 0, 1, 1, 0)
+    preview_playing = false
   end
 end
 
@@ -2164,7 +2241,17 @@ function elasticat.recalc_bpm_steps()
   end
   local duration = samples / rate
   local bpm = bpm_from_filename(path) or sample_pool.bpms[slot] or 120
-  local steps = quantize_steps(duration * bpm / 60 * 4)
+  -- Steps now describe the TRIMMED portion (owner): grab the whole-sample step
+  -- count at this BPM, scale by the trim's fraction of the sample, and store
+  -- that. Reduces to trim_seconds * bpm/60 * 4. A zero/absent trim falls back to
+  -- the whole sample so recalc still does something useful before any trimming.
+  local trim_start, trim_end = trim_bounds(slot)
+  local trim_dur = trim_end - trim_start
+  if trim_dur <= 0 then
+    trim_dur = duration
+  end
+  local multiplier = duration > 0 and (trim_dur / duration) or 1
+  local steps = quantize_steps((duration * bpm / 60 * 4) * multiplier)
   sample_pool.bpms[slot] = bpm
   sample_pool.steps[slot] = steps
   -- Silent: update the display params (which track the file-edit slot) without
@@ -2455,6 +2542,16 @@ function elasticat.params(options)
     elseif mode == 6 then
       push("pv_window", "pvWindow")
       push("pv_dispersion", "pvDispersion")
+    elseif mode == 7 then
+      push("harm_interval", "harmInterval")
+    elseif mode == 8 then
+      push("wt_window", "wtWindow")
+    elseif mode == 9 then
+      push("freeze_amount", "freezeAmount")
+      push("spectral_blur", "spectralBlur")
+    elseif mode == 10 then
+      push("formant_shift", "formantShift")
+      push("freeze_amount", "freezeAmount")
     end
   end
 
@@ -2663,6 +2760,9 @@ function elasticat.params(options)
       if file_edits_active() then
         update_engine_loop_points()
       end
+      -- The engine step count is trim-relative now, so a trim change re-scales
+      -- it -- re-push (coalesced) to every track playing this slot's warp rate.
+      queue_engine_send(ids.sample_steps, elasticat.sync_track_slot_metadata)
       mark_pool_dirty(slot)
     end,
     function(param) return string.format("%.3f s", param:get()) end)
@@ -2680,19 +2780,56 @@ function elasticat.params(options)
       if file_edits_active() then
         update_engine_loop_points()
       end
+      -- Trim-relative steps: re-scale to the engine on a trim-end change too.
+      queue_engine_send(ids.sample_steps, elasticat.sync_track_slot_metadata)
       mark_pool_dirty(slot)
     end,
     function(param) return string.format("%.3f s", param:get()) end)
+
+  -- Set ONE trim endpoint (in seconds) INDEPENDENTLY -- unlike the trim_start
+  -- knob action, moving the start here does NOT drag the end. Used by the trim
+  -- SNAP editor (FN + knob), where the point is being placed precisely on a
+  -- transient / zero-crossing / grid line and the other edge must stay put.
+  -- Commits to the pool + display param (silent) + engine like the knob actions.
+  elasticat.set_trim_point = function(point, seconds)
+    local slot = file_edit_slot
+    local ts, te, duration = trim_bounds(slot)
+    if duration <= 0 then
+      return
+    end
+    local target
+    if point == "end" then
+      target = util.clamp(seconds, math.min(duration, ts + 0.001), duration)
+      sample_pool.trim_ends[slot] = target
+      params:set(ids.trim_end, target, true)
+    else
+      target = util.clamp(seconds, 0, math.max(0, te - 0.001))
+      sample_pool.trim_starts[slot] = target
+      params:set(ids.trim_start, target, true)
+    end
+    if file_edits_active() then
+      update_engine_loop_points()
+    end
+    queue_engine_send(ids.sample_steps, elasticat.sync_track_slot_metadata)
+    mark_pool_dirty(slot)
+    elasticat.update_preview_region()  -- scrubbing trim follows the audition live
+    return target
+  end
 
   add_control(ids.gain, "sample gain",
     cs.new(0, 4, "lin", 0.01, 1, "x", 0.005),
     function(x)
       local slot = file_edit_slot
       sample_pool.gains[slot] = x
-      if file_edits_active() then
-        send_effective_amp()
-      end
+      -- Push to EVERY track live, not only when the edited slot is the selected
+      -- track's active slot. send_effective_amp reads each track's own slot gain,
+      -- so tracks on other slots re-send an unchanged amp (harmless) and any
+      -- track playing THIS slot picks the new gain up immediately. The old
+      -- file_edits_active() gate made a gain edit silently do nothing whenever
+      -- the edited slot was not the currently-active one (owner bug).
+      send_effective_amp()
       mark_pool_dirty(slot)
+      elasticat.update_preview_region()  -- gain scrub follows the audition live
     end,
     function(param) return string.format("%.2fx", param:get()) end)
 
@@ -2940,7 +3077,7 @@ function elasticat.params(options)
     lofi_rate = ids.master_lofi_rate
   }, "master", "master fx")
 
-  params:add_group(param_id(prefix, "group_engine_modes"), "engine algorithms", 12)
+  params:add_group(param_id(prefix, "group_engine_modes"), "engine algorithms", 17)
 
   add_control(param_id(prefix, "chop_steps"), "chop steps",
     cs.new(0.05, 16, "lin", 0.05, 1, "steps", 0.05 / 15.95),
@@ -2997,7 +3134,31 @@ function elasticat.params(options)
     cs.new(0, 1, "lin", 0.001, 0, "", 0.001),
     function(x) elasticat.tr_queue(param_id(prefix, "pv_dispersion"), 1, "pvDispersion", x) end)
 
-  params:add_group(param_id(prefix, "group_slices"), "slice machines", 12)
+  -- New warp modes (7 harmonizer, 8 wavetable, 9 spectral_freeze, 10 formant).
+  -- Track 1's warp params are hand-registered here (params_spec only registers
+  -- t1-flagged entries for track 1); tracks 2-8 get these from ParamsSpec.SPEC.
+  -- Without this, selecting one of these modes on track 1 hit "invalid parameter".
+  add_control(param_id(prefix, "harm_interval"), "harmony interval",
+    cs.new(-24, 24, "lin", 1, 7, "st", 1 / 48),
+    function(x) elasticat.tr_queue(param_id(prefix, "harm_interval"), 1, "harmInterval", x) end)
+
+  add_control(param_id(prefix, "wt_window"), "wavetable window",
+    cs.new(16, 8192, "exp", 1, 512, "smp", 1 / 8176),
+    function(x) elasticat.tr_queue(param_id(prefix, "wt_window"), 1, "wtWindow", x) end)
+
+  add_control(param_id(prefix, "freeze_amount"), "spectral freeze",
+    cs.new(0, 1, "lin", 0.01, 0, "", 0.01),
+    function(x) elasticat.tr_queue(param_id(prefix, "freeze_amount"), 1, "freezeAmount", x) end)
+
+  add_control(param_id(prefix, "spectral_blur"), "spectral blur",
+    cs.new(0, 1, "lin", 0.01, 0, "", 0.01),
+    function(x) elasticat.tr_queue(param_id(prefix, "spectral_blur"), 1, "spectralBlur", x) end)
+
+  add_control(param_id(prefix, "formant_shift"), "formant shift",
+    cs.new(-24, 24, "lin", 1, 0, "st", 1 / 48),
+    function(x) elasticat.tr_queue(param_id(prefix, "formant_shift"), 1, "formantShift", x) end)
+
+  params:add_group(param_id(prefix, "group_slices"), "slice machines", 13)
 
   add_control(param_id(prefix, "slice_count"), "slice count",
     cs.new(1, 32, "lin", 1, 16, "", 1 / 31),
@@ -3009,7 +3170,7 @@ function elasticat.params(options)
     function(_) end,
     function(param) return tostring(math.floor(param:get() + 0.5)) end)
 
-  params:add_option(param_id(prefix, "slice_play_mode"), "slice play mode", {"1 shot", "hold", "loop", "continue", "ping-pong", "cont loop"}, 1)
+  params:add_option(param_id(prefix, "slice_play_mode"), "slice play mode", {"1shot", "hold", "loop", "cont", "pong", "cloop"}, 1)
   params:set_action(param_id(prefix, "slice_play_mode"), function(_) end)
 
   params:add_binary(param_id(prefix, "slice_reverse"), "slice reverse", "toggle", 0)
@@ -3025,6 +3186,14 @@ function elasticat.params(options)
     function(x) queue_engine_call(param_id(prefix, "slice_rate"), "setSliceRate", x) end,
     function(param) return string.format("%.2fx", param:get()) end)
 
+  -- Ratchet is Lua-scheduled (no engine cmd). Track 1 is hand-registered here;
+  -- tracks 2-8 get it from ParamsSpec.SPEC. Without this, the Machine page's RTCH
+  -- cell crashed track 1 with "invalid parameter" (esp. on Razor/Slice Poly).
+  add_control(param_id(prefix, "slice_ratchet"), "slice ratchet",
+    cs.new(1, 4, "lin", 1, 1, "x", 1 / 3),
+    function(_) end,
+    function(param) return tostring(math.floor(param:get() + 0.5)) .. "x" end)
+
   -- Default MONO (owner): one slice voice at a time keeps the slice machine
   -- cheap. Poly is opt-in. The engine's sliceMono default matches (mono) so a
   -- fresh boot agrees without needing an init push.
@@ -3037,11 +3206,37 @@ function elasticat.params(options)
   params:set_action(param_id(prefix, "slice_hold_to_step"), function(_) end)
 
   -- Razor slice-point editor snap (owner). Off = free; Zero-X snaps edited (and
-  -- auto-chopped) slice points to the nearest zero crossing; Transient auto-chops
-  -- at detected onsets. The engine analysis is wired separately -- this is the
-  -- toggle. Global (like the razor points), registered once.
-  params:add_option(param_id(prefix, "slice_snap"), "slice snap", {"off", "zero-x", "transient"}, 1)
+  -- Razor SNAP mode: what FN + the Start/End knobs do in the razor slice-point
+  -- editor (source page 1). Grid = snap to 128/slice_count divisions; Zoom = fine
+  -- precise nudge; zero-x = snap to the nearest zero crossing; Transient = snap to
+  -- the prev/next detected onset; Friends = fine nudge that also drags the
+  -- touching neighbour point (prev slice's end / next slice's start). Global (like
+  -- the razor points), registered once. zero-x/transient DSP lands in Increment B.
+  params:add_option(param_id(prefix, "slice_snap"), "razor snap",
+    {"grid", "zoom", "zero-x", "transient", "friends"}, 1)
   params:set_action(param_id(prefix, "slice_snap"), function(_) end)
+
+  -- Sample-editor TRIM snap (owner): what FN + the Trim Start/End knobs do, the
+  -- trim-window parallel of razor snap. Grid = snap to the sample's step grid;
+  -- Zoom = fine 0.001s nudge + the visual waveform zoom; zero-x = nearest zero
+  -- crossing; transient = prev/next detected onset. No "friends" -- a trim has no
+  -- neighbour slice. Without FN both knobs move in 0.01s detents (unchanged).
+  -- Global, registered once. Default Zoom (the fine-adjust workhorse).
+  params:add_option(param_id(prefix, "trim_snap"), "trim snap",
+    {"grid", "zoom", "zero-x", "transient"}, 2)
+  params:set_action(param_id(prefix, "trim_snap"), function(_) end)
+
+  -- Auto-Chop / Transient-snap sensitivity (%). Higher = more onsets detected.
+  -- Applied live over the cached onset envelope (slot_transients), so the owner
+  -- can dial it on-device and re-run Auto-Chop without reloading the sample.
+  -- No-op action: `request_redraw` is a COORDINATOR global, not visible in this
+  -- facade module -- calling it here crashed init when a stored value banged
+  -- (temp-project load). The on-device knob turn already redraws via the
+  -- coordinator's encoder handler; the overlay also refreshes on the redraw
+  -- metro, so the transient overlay stays in sync without forcing it here.
+  add_control(param_id(prefix, "slice_chop_sense"), "chop sensitivity",
+    cs.new(0, 100, "lin", 1, 50, "%", 1 / 100),
+    function(_) end)
 
   add_control(param_id(prefix, "slice_attack"), "slice attack",
     cs.new(0.0001, 0.2, "lin", 0.0001, 0.002, "", 0.0005 / 0.1999),
@@ -3081,29 +3276,26 @@ function elasticat.params(options)
     razor_start_values[i] = default_start
 
     add_control(start_id, string.format("razor %02d start", i),
-      cs.new(0, 128, "lin", 0.01, default_start, "", 1 / 128),
+      cs.new(0, 128, "lin", 0.001, default_start, "", 1 / 128),
       function(x)
+        -- Independent start/end (razor slice-point editor): the START sets only
+        -- its own point; it no longer drags the whole slice. It just keeps end >
+        -- start -- if the start crosses the end, the end is bumped to start+0.01
+        -- (the owner's clamp). Friends coupling lives in razor_point_edit.
+        razor_start_values[i] = x
         if razor_adjusting then
-          razor_start_values[i] = x
           return
         end
-        local previous = razor_start_values[i] or default_start
-        local delta = x - previous
-        razor_start_values[i] = x
-        if math.abs(delta) > 0 then
-          local current_end = params:get(end_id)
-          local next_end = util.clamp(current_end + delta, 0, 128)
-          if next_end <= x then
-            next_end = util.clamp(x + 0.01, 0.01, 128)
-          end
+        local current_end = params:get(end_id)
+        if current_end <= x then
           razor_adjusting = true
-          params:set(end_id, next_end)
+          params:set(end_id, util.clamp(x + 0.01, 0.01, 128))
           razor_adjusting = false
         end
       end)
 
     add_control(end_id, string.format("razor %02d end", i),
-      cs.new(0, 128, "lin", 0.01, default_end, "", 1 / 128),
+      cs.new(0, 128, "lin", 0.001, default_end, "", 1 / 128),
       function(x)
         if razor_adjusting then
           return

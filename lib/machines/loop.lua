@@ -20,7 +20,11 @@ end
 function Machine.machine_items(Item)
   return {
     Item.item("loop_reverse", "LREV", {lockable = true, binary = true, min = 0, max = 1, step = 1}),
-    Item.item("xfade", "XFAD", {lockable = true, min = 0, max = 0.25, step = 0.001, snaps = {0, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25}})
+    Item.item("xfade", "XFAD", {lockable = true, min = 0, max = 0.25, step = 0.001, snaps = {0, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25}}),
+    -- Playhead return mode when a step trig releases (return / boomerang / reset).
+    -- P-lockable per step, so trigs with different Start points can each choose
+    -- whether to snap back to the synced position (return) or hold where they land.
+    Item.item("trig_release", "RLSE", {lockable = true, options = 3})
   }
 end
 
