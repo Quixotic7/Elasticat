@@ -83,7 +83,6 @@ Engine_Elasticat : CroneEngine {
 	var <targetBpm = 120;
 	var <modeSwitchFade = 0.05;
 	var <correction = 0;
-	var loopXfade = 0.005;
 	var maxCorrection = 0.02;
 	var hardThreshold = 0.125;
 	var modeSwitchCount = 0;
@@ -188,7 +187,12 @@ Engine_Elasticat : CroneEngine {
 			\elasticatHarmonizer,
 			\elasticatWavetable,
 			\elasticatSpectral,
-			\elasticatSpectral
+			\elasticatSpectral,
+			\elasticatTapeXF,
+			\elasticatReaderUGen,
+			\elasticatGStretch,
+			\elasticatGStretch2,
+			\elasticatRubberBand
 		];
 		modeNames = [
 			"tape",
@@ -200,7 +204,12 @@ Engine_Elasticat : CroneEngine {
 			"harmonizer",
 			"wavetable",
 			"spectral_freeze",
-			"formant"
+			"formant",
+			"tape_xf",
+			"tape_ugen",
+			"gstretch",
+			"gstretch2",
+			"rubberband"
 		];
 		filterSynthNames = [
 			\elasticatFilterClassic,
@@ -591,8 +600,102 @@ Engine_Elasticat : CroneEngine {
 			Out.ar(out, LeakDC.ar(sig));
 		}).add;
 
-		this.addDirectReaderDef(\elasticatTape, 0);
-		this.addDirectReaderDef(\elasticatTempoVarispeed, 1);
+		// The DEFAULT tape mode IS the compiled click-free reader now (softcut model):
+		// absolute-frame reads + one queued 2-head crossfade, so a region relock / the
+		// trig-release return-jump / the loop seam never pop. Guarded -- falls back to
+		// the SC-graph direct reader if the .so is missing. tempo_varispeed (transport-
+		// synced) keeps its own XFade2 declick until the phase-following reader lands.
+		this.addUGenReaderDef(\elasticatTape, 0);
+		// tempo_varispeed is now the click-free ElasticatReader too, at the tempo-synced
+		// rate (grid-locked; pitch a byproduct of the stretch). Guarded fallback = the
+		// SC-graph tempo direct reader.
+		this.addUGenReaderDef(\elasticatTempoVarispeed, 1, true);
+
+		// --- WARP MODE 10: Tape XF (two-voice crossfade tape) ---------------------
+		// Owner's ping-pong. A position JUMP (resetTrig) does NOT reset one reader
+		// into a discontinuity -- the jump target lands on the OTHER of two full
+		// reader voices while the first keeps playing its OWN region/position, and we
+		// equal-power crossfade to it over loopXfade; the next jump ping-pongs back.
+		// Each voice is a continuous trajectory with consistent params, so the fade
+		// blends two clean streams (softcut-style) -- no click, even when loop start/
+		// end change AT the jump (the region-change-on-jump click the single reader
+		// can't dodge). The ACTIVE voice follows the LIVE region (live scrubbing still
+		// works); the handed-off voice freezes its region at the PRE-change value
+		// (Delay1.kr = the previous control block, before the same-block change).
+		SynthDef(\elasticatTapeXF, {
+			arg out=0, phaseBus=0, bufL=0, bufR=0, modeAmp=1, fadeTime=0.05,
+			playing=0, resetTrig=0, resetPos=0,
+			amp=0.8, pan=0, pitch=0, speed=1, direction=1,
+			targetBpm=120, derivedSourceBpm=120, loopBeats=4, startPoint=0, endPoint=128,
+			envMode=1, envAttack=0.002, envDecay=0.15, envSustain=0.8, envRelease=0.15,
+			envHold=0.35, envTrig=0, envGateSeconds=0.5, portamento=0, envReleaseTrig=0,
+			pitchModBus=0, warpRate=1, loopXfade=0.01, trackIndex=1;
+			var frames, pitchRatio, wRate, resetEdge, sel, trigA, trigB, xf;
+			var prevStart, prevEnd;
+			var startA, endA, startNormA, rangeA, incA, resetPosA, phaseA, srcA, posA;
+			var startB, endB, startNormB, rangeB, incB, resetPosB, phaseB, srcB, posB;
+			var sig, modeGain, playGate, ampEnv, activePhase;
+			frames = BufFrames.kr(bufL).max(4);
+			pitchRatio = (Lag.kr(pitch, 0.03) + (In.kr(pitchModBus, 1).clip(-1, 1) * 12)).midiratio.clip(0.03125, 32);
+			wRate = Lag.kr(warpRate.max(0.001), 0.02);
+			// Ping-pong selector: 0 = voice A live, 1 = voice B live. Flips every jump.
+			resetEdge = Changed.kr(resetTrig);
+			sel = PulseCount.kr(resetEdge) % 2;
+			trigA = resetEdge * (sel < 0.5);
+			trigB = resetEdge * (sel > 0.5);
+			// Pre-change region (previous control block): the new region arrives in the
+			// SAME block as the reset, so the live value is already new -- Delay1 is old.
+			prevStart = Delay1.kr(startPoint);
+			prevEnd = Delay1.kr(endPoint);
+			// Voice A: live region while active; frozen pre-change region once handed
+			// off to B (trigB); resets to resetPos when it takes over (trigA).
+			startA = Select.kr(sel < 0.5, [Latch.kr(prevStart, trigB), startPoint]);
+			endA = Select.kr(sel < 0.5, [Latch.kr(prevEnd, trigB), endPoint]);
+			startNormA = Lag.kr(startA.clip(0, 127.99) / 128, 0.002);
+			rangeA = Lag.kr(((endA.clip(startA + 0.01, 128) - startA.clip(0, 127.99)) / 128).clip(0.0001, 1), 0.002);
+			incA = (BufRateScale.kr(bufL) * speed.max(0.03125) * pitchRatio * wRate) / (frames * rangeA).max(1);
+			resetPosA = Latch.kr(resetPos, trigA);
+			phaseA = Phasor.ar(trigA, incA * playing.clip(0, 1), 0, 1, resetPosA.clip(0, 0.999999));
+			srcA = Select.ar(direction >= 0, [1 - phaseA, phaseA]).wrap(0, 1);
+			posA = (startNormA + (srcA * rangeA)).clip(0, 0.999999) * (frames - 1);
+			// Voice B: the mirror.
+			startB = Select.kr(sel > 0.5, [Latch.kr(prevStart, trigA), startPoint]);
+			endB = Select.kr(sel > 0.5, [Latch.kr(prevEnd, trigA), endPoint]);
+			startNormB = Lag.kr(startB.clip(0, 127.99) / 128, 0.002);
+			rangeB = Lag.kr(((endB.clip(startB + 0.01, 128) - startB.clip(0, 127.99)) / 128).clip(0.0001, 1), 0.002);
+			incB = (BufRateScale.kr(bufL) * speed.max(0.03125) * pitchRatio * wRate) / (frames * rangeB).max(1);
+			resetPosB = Latch.kr(resetPos, trigB);
+			phaseB = Phasor.ar(trigB, incB * playing.clip(0, 1), 0, 1, resetPosB.clip(0, 0.999999));
+			srcB = Select.ar(direction >= 0, [1 - phaseB, phaseB]).wrap(0, 1);
+			posB = (startNormB + (srcB * rangeB)).clip(0, 0.999999) * (frames - 1);
+			// Equal-power crossfade to the active voice over loopXfade. The pan MUST
+			// be audio-rate: a kr Lag stairsteps the coefficient once per control
+			// block, inaudible under the low envelope at a step's ONSET but a loud
+			// buzz/click under the full envelope at its RELEASE (owner). Slew.ar is a
+			// smooth linear ramp (-1 = voice A .. +1 = voice B, traversing 2 over
+			// loopXfade); XFade2 applies the equal-power law to it.
+			xf = Slew.ar(K2A.ar((sel * 2) - 1), 2 / loopXfade.clip(0.0005, 0.25), 2 / loopXfade.clip(0.0005, 0.25));
+			sig = [
+				XFade2.ar(BufRd.ar(1, bufL, posA, loop: 1, interpolation: 4), BufRd.ar(1, bufL, posB, loop: 1, interpolation: 4), xf),
+				XFade2.ar(BufRd.ar(1, bufR, posA, loop: 1, interpolation: 4), BufRd.ar(1, bufR, posB, loop: 1, interpolation: 4), xf)
+			];
+			playGate = Lag.kr(playing.clip(0, 1), 0.01);
+			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
+			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento, envReleaseTrig);
+			sig = [sig[0], sig[1]] * (modeGain * playGate * ampEnv);
+			sig = LeakDC.ar(sig);
+			activePhase = Select.ar(sel > 0.5, [phaseA, phaseB]);
+			SendReply.kr(Impulse.kr(15), cmdName: '/elasticat/statusRaw', values: [
+				10, activePhase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
+			], replyID: trackIndex);
+			Out.ar(out, sig);
+		}).add;
+
+		// --- WARP MODE 11: Tape UGEN (compiled ElasticatReader) -------------------
+		// tape_ugen shares the SAME click-free reader as the default tape mode (both
+		// built by addUGenReaderDef, below) -- kept as a separate mode only for A/B.
+		// The status mode-id (11) keeps it distinct from tape (0) in the UI feed.
+		this.addUGenReaderDef(\elasticatReaderUGen, 11);
 
 		SynthDef(\elasticatChopped, {
 			arg out=0, phaseBus=0, bufL=0, bufR=0, modeAmp=1, fadeTime=0.05,
@@ -601,7 +704,7 @@ Engine_Elasticat : CroneEngine {
 			startPoint=0, endPoint=128, chopBeats=0.25, chopMode=0, chopAttack=0.002, chopHold=0.04, chopRelease=0.01,
 			envMode=1, envAttack=0.002, envDecay=0.15, envSustain=0.8, envRelease=0.15,
 			envHold=0.35, envTrig=0, envGateSeconds=0.5, portamento=0, envReleaseTrig=0,
-			pitchModBus=0, warpRate=1, trackIndex=1;
+			pitchModBus=0, warpRate=1, loopXfade=0.01, trackIndex=1;
 			var ampEnv;
 			var phase, frames, pos, trig, beatDur, duty, env, sig, modeGain, playGate, startNorm, range, readPhase;
 			var pitchSmooth, sliceWidth, sliceStart, localPhase, forwardStop, loopForward, pingPong, pingPongPhase, stepRate, stopGate;
@@ -653,37 +756,205 @@ Engine_Elasticat : CroneEngine {
 			startPoint=0, endPoint=128, grainSize=0.08, grainOverlap=8, grainJitter=0.0, grainSpray=0.0,
 			envMode=1, envAttack=0.002, envDecay=0.15, envSustain=0.8, envRelease=0.15,
 			envHold=0.35, envTrig=0, envGateSeconds=0.5, portamento=0, envReleaseTrig=0,
-			pitchModBus=0, warpRate=1, trackIndex=1;
+			pitchModBus=0, warpRate=1, loopXfade=0.01, grainSpeed=1, grainSpeedRand=0, grainDirection=1, direction=1, trackIndex=1;
 			var ampEnv;
-			var phase, frames, pos, dur, randomness, direct, wet, sig, modeGain, playGate, gainNorm, startNorm, range, readPhase, stepDur, overlap, overlapControl;
-			phase = In.ar(phaseBus, 1);
+			var phase, frames, sig, modeGain, playGate, gainNorm, startNorm, range, readPhase, pitchRatio, scanCps, emitInc, emitPh, grainRate, density, cycleMs, spread;
 			frames = BufFrames.kr(bufL).max(4);
 			startNorm = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.002);
 			range = Lag.kr(((endPoint.clip(startPoint + 0.01, 128) - startPoint.clip(0, 127.99)) / 128).clip(0.0001, 1), 0.002);
-			readPhase = (startNorm + (phase * range)).clip(0, 0.999999);
-			pos = readPhase * (frames - 1);
-			dur = Lag.kr(grainSize.clip(0.02, 0.5), 0.05);
-			stepDur = 15 / targetBpm.max(1);
-			overlapControl = Lag.kr(grainOverlap.clip(1, 64), 0.05);
-			overlap = ((overlapControl * dur) / stepDur).clip(2, 32);
-			randomness = Lag.kr((grainJitter + grainSpray + (macro * 0.03)).clip(0, 0.25), 0.05);
-			direct = [
-				BufRd.ar(1, bufL, pos, loop: 1, interpolation: 4),
-				BufRd.ar(1, bufR, pos, loop: 1, interpolation: 4)
-			];
-			wet = [
-				Warp1.ar(1, bufL, readPhase, (Lag.kr(pitch, 0.03) + (In.kr(pitchModBus, 1).clip(-1, 1) * 12)).midiratio, dur, -1, overlap, randomness, 4),
-				Warp1.ar(1, bufR, readPhase, (Lag.kr(pitch, 0.03) + (In.kr(pitchModBus, 1).clip(-1, 1) * 12)).midiratio, dur, -1, overlap, randomness, 4)
-			];
-			sig = XFade2.ar(direct, wet, macro.linlin(0, 1, -0.75, 0.25));
-			gainNorm = overlap.sqrt.reciprocal * 2.5 * (1 + (macro.clip(0, 1) * 0.25));
+			// PARTICLE GRANULAR (ElasticatGrains) with INDEPENDENT pitch + time.
+			// TIME: the emit cursor is a Phasor scanning the range at grainSpeed x the
+			// tempo -- 1 = realtime, <1 = time-stretch, 0 = frozen (pitched drone), and
+			// DIRECTION reverses the scan (reverse moves the playhead backward). Fenced to
+			// the range; resetTrig re-anchors it (loop/step). Gated by playing.
+			pitchRatio = (Lag.kr(pitch, 0.03) + (In.kr(pitchModBus, 1).clip(-1, 1) * 12)).midiratio;
+			scanCps = (targetBpm.max(1) / 60 / loopBeats.max(0.03125)) * Lag.kr(warpRate.max(0.001), 0.02);
+			emitInc = scanCps * Lag.kr(grainSpeed.clip(0, 4), 0.05) * playing.clip(0, 1) * direction / SampleRate.ir;
+			emitPh = Phasor.ar(TDelay.kr(Changed.kr(resetTrig), 0.003), emitInc, 0, 1, resetPos.clip(0, 0.999999));
+			readPhase = (startNorm + (emitPh * range)).clip(0, 0.999999);
+			// Report the EMIT scan (0..1 over range) as the playhead so the UI follows the
+			// grains -- slowed by grainSpeed and moving BACKWARD on reverse (not the transport).
+			phase = emitPh;
+			// PITCH: each grain reads at the pitch ratio, native-referenced -- INDEPENDENT
+			// of grain speed (that's the decoupling: slowing the scan no longer drops pitch).
+			grainRate = BufRateScale.kr(bufL) * pitchRatio;
+			density = grainOverlap.clip(1, 64);
+			cycleMs = Lag.kr(grainSize.clip(0.002, 0.5), 0.05) * 1000;
+			spread = Lag.kr((grainJitter + grainSpray).clip(0, 1), 0.05);
+			sig = if(\ElasticatGrains.asClass.notNil, {
+				ElasticatGrains.ar(bufL, bufR, readPhase, density, cycleMs, spread, grainRate, grainSpeedRand.clip(0, 1), grainDirection.clip(0, 1))
+			}, {
+				// Fallback (plugin absent): the old Warp1 cloud around the emit cursor.
+				[
+					Warp1.ar(1, bufL, readPhase, pitchRatio, Lag.kr(grainSize.clip(0.02, 0.5), 0.05), -1, density.clip(2, 32), spread.clip(0, 0.25), 4),
+					Warp1.ar(1, bufR, readPhase, pitchRatio, Lag.kr(grainSize.clip(0.02, 0.5), 0.05), -1, density.clip(2, 32), spread.clip(0, 0.25), 4)
+				]
+			});
+			gainNorm = density.max(1).sqrt.reciprocal * 3;
 			playGate = Lag.kr(playing.clip(0, 1), 0.01);
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
 			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento, envReleaseTrig);
-			sig = [sig[0], sig[1]] * (modeGain * gainNorm * playGate * ampEnv * readerDeclick.value(resetTrig));
+			sig = [sig[0], sig[1]] * (modeGain * gainNorm * playGate * ampEnv);
 			sig = LeakDC.ar(sig);
 			SendReply.kr(Impulse.kr(15), cmdName: '/elasticat/statusRaw', values: [
 				3, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
+			], replyID: trackIndex);
+			Out.ar(out, sig);
+		}).add;
+
+		// --- GStretch (mode 12): stretch-focused clone of GText ------------------
+		// A STANDALONE copy of the GText particle engine so it can be tuned for clean
+		// pitch-preserving time-stretch WITHOUT touching the locked GText. Same DSP
+		// today; the Lua side exposes a simpler stretch surface (STRETCH/GSIZ/SMTH).
+		SynthDef(\elasticatGStretch, {
+			arg out=0, phaseBus=0, bufL=0, bufR=0, modeAmp=1, fadeTime=0.05,
+			playing=0, resetTrig=0, resetPos=0,
+			amp=0.8, pan=0, pitch=0, targetBpm=120, loopBeats=4, macro=0,
+			startPoint=0, endPoint=128, grainSize=0.08, grainOverlap=8, grainJitter=0.0, grainSpray=0.0,
+			envMode=1, envAttack=0.002, envDecay=0.15, envSustain=0.8, envRelease=0.15,
+			envHold=0.35, envTrig=0, envGateSeconds=0.5, portamento=0, envReleaseTrig=0,
+			pitchModBus=0, warpRate=1, loopXfade=0.01, grainSpeed=1, grainSpeedRand=0, grainDirection=1, direction=1, trackIndex=1;
+			var ampEnv;
+			var phase, frames, sig, src, modeGain, playGate, pitchRatio, strch, loopStartF, loopEndF, readerRate, resetFrame, shiftRatio, win, smth;
+			frames = BufFrames.kr(bufL).max(4);
+			pitchRatio = (Lag.kr(pitch, 0.03) + (In.kr(pitchModBus, 1).clip(-1, 1) * 12)).midiratio;
+			// STRETCH = a VARISPEED read (owner's idea): read the buffer slower to time-
+			// stretch (pitched down), then a real-time PITCH-SHIFTER restores the pitch, so
+			// pitch is held independent of stretch. The read reuses the click-free
+			// ElasticatReader so loop jumps / region scrub / seam stay clean; the shifter
+			// runs at time-ratio 1 (no buffering). SC PitchShift now; RubberBand can drop in
+			// as the shifter for studio quality.
+			strch = Lag.kr(grainSpeed.clip(0.0625, 4), 0.05);
+			loopStartF = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.002) * frames;
+			loopEndF = Lag.kr(endPoint.clip(0.01, 128) / 128, 0.002) * frames;
+			readerRate = BufRateScale.kr(bufL) * strch * Lag.kr(warpRate.max(0.001), 0.02) * playing.clip(0, 1) * direction;
+			resetFrame = loopStartF + (resetPos.clip(0, 1) * (loopEndF - loopStartF));
+			src = if(\ElasticatReader.asClass.notNil, {
+				var rd = ElasticatReader.ar(bufL, bufR, loopStartF, loopEndF, readerRate, resetTrig, resetFrame, loopXfade.clip(0.0005, 0.25), 1);
+				phase = rd[2];
+				[rd[0], rd[1]]
+			}, {
+				// Fallback (plugin absent): plain varispeed Phasor read (not click-free).
+				var ph = Phasor.ar(TDelay.kr(Changed.kr(resetTrig), 0.003), readerRate, loopStartF, loopEndF, resetFrame);
+				phase = ((ph - loopStartF) / (loopEndF - loopStartF).max(1)).clip(0, 1);
+				[BufRd.ar(1, bufL, ph, 1, 4), BufRd.ar(1, bufR, ph, 1, 4)]
+			});
+			// PITCH-CORRECT: the read is pitched by (strch * warpRate); shift by the inverse
+			// times the pitch knob so final pitch = pitchRatio, independent of stretch.
+			shiftRatio = (pitchRatio / (strch * Lag.kr(warpRate.max(0.001), 0.02))).clip(0.25, 4);
+			win = Lag.kr(grainSize.clip(0.02, 0.5), 0.05);
+			// SMTH: PitchShift time dispersion (same mapping as GStretch2 -- these two modes
+			// are identical apart from GStretch2's clock-lock). Default grain_density 8 keeps
+			// dispersion low, ~the fixed value GStretch used before.
+			smth = Lag.kr(((grainOverlap.clip(1, 64) - 1) / 63), 0.05);
+			sig = PitchShift.ar(src, win, shiftRatio, 0, smth * win);
+			playGate = Lag.kr(playing.clip(0, 1), 0.01);
+			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
+			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento, envReleaseTrig);
+			sig = [sig[0], sig[1]] * (modeGain * playGate * ampEnv);
+			sig = LeakDC.ar(sig);
+			SendReply.kr(Impulse.kr(15), cmdName: '/elasticat/statusRaw', values: [
+				12, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
+			], replyID: trackIndex);
+			Out.ar(out, sig);
+		}).add;
+
+		// --- GStretch2 (mode 13): BPM/clock-synced stretch -----------------------
+		// Like GStretch (varispeed reader + pitch-correct) but the read rate is TEMPO-
+		// derived: the region traverses once per loop (loopBeats), so a 16-step sample
+		// loops every 16 steps at STRCH=warp=1. STRCH + warpRate deviate from the grid;
+		// pitch is HELD (the shift corrects the grid-sync speed back to native). SMTH =
+		// pitch-shifter time dispersion (higher = smoother / less metallic).
+		SynthDef(\elasticatGStretch2, {
+			arg out=0, phaseBus=0, bufL=0, bufR=0, modeAmp=1, fadeTime=0.05,
+			playing=0, resetTrig=0, resetPos=0,
+			amp=0.8, pan=0, pitch=0, targetBpm=120, loopBeats=4, macro=0,
+			startPoint=0, endPoint=128, grainSize=0.08, grainOverlap=8, grainJitter=0.0, grainSpray=0.0,
+			envMode=1, envAttack=0.002, envDecay=0.15, envSustain=0.8, envRelease=0.15,
+			envHold=0.35, envTrig=0, envGateSeconds=0.5, portamento=0, envReleaseTrig=0,
+			pitchModBus=0, warpRate=1, loopXfade=0.01, grainSpeed=1, grainSpeedRand=0, grainDirection=1, direction=1, trackIndex=1;
+			var ampEnv;
+			var phase, frames, sig, src, modeGain, playGate, pitchRatio, strch, loopStartF, loopEndF, cps, readerRateBase, readerRate, resetFrame, shiftRatio, win, smth;
+			frames = BufFrames.kr(bufL).max(4);
+			pitchRatio = (Lag.kr(pitch, 0.03) + (In.kr(pitchModBus, 1).clip(-1, 1) * 12)).midiratio;
+			strch = Lag.kr(grainSpeed.clip(0.0625, 4), 0.05);
+			loopStartF = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.002) * frames;
+			loopEndF = Lag.kr(endPoint.clip(0.01, 128) / 128, 0.002) * frames;
+			// TEMPO-SYNCED read: region traverses once per loop at STRCH=warp=1 (grid-lock).
+			cps = (targetBpm.max(1) / 60 / loopBeats.max(0.03125)) * Lag.kr(warpRate.max(0.001), 0.02);
+			readerRateBase = (loopEndF - loopStartF) * cps / SampleRate.ir * strch;
+			readerRate = readerRateBase * playing.clip(0, 1) * direction;
+			resetFrame = loopStartF + (resetPos.clip(0, 1) * (loopEndF - loopStartF));
+			src = if(\ElasticatReader.asClass.notNil, {
+				var rd = ElasticatReader.ar(bufL, bufR, loopStartF, loopEndF, readerRate, resetTrig, resetFrame, loopXfade.clip(0.0005, 0.25), 1);
+				phase = rd[2];
+				[rd[0], rd[1]]
+			}, {
+				var ph = Phasor.ar(TDelay.kr(Changed.kr(resetTrig), 0.003), readerRate, loopStartF, loopEndF, resetFrame);
+				phase = ((ph - loopStartF) / (loopEndF - loopStartF).max(1)).clip(0, 1);
+				[BufRd.ar(1, bufL, ph, 1, 4), BufRd.ar(1, bufR, ph, 1, 4)]
+			});
+			// PITCH-CORRECT to native: shift = native / readBase * pitch knob, so grid-sync
+			// (or STRCH) changes SPEED but not pitch. SMTH -> PitchShift time dispersion.
+			shiftRatio = (pitchRatio * BufRateScale.kr(bufL) / readerRateBase.max(0.0001)).clip(0.25, 4);
+			win = Lag.kr(grainSize.clip(0.02, 0.5), 0.05);
+			smth = Lag.kr(((grainOverlap.clip(1, 64) - 1) / 63), 0.05);
+			sig = PitchShift.ar(src, win, shiftRatio, 0, smth * win);
+			playGate = Lag.kr(playing.clip(0, 1), 0.01);
+			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
+			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento, envReleaseTrig);
+			sig = [sig[0], sig[1]] * (modeGain * playGate * ampEnv);
+			sig = LeakDC.ar(sig);
+			SendReply.kr(Impulse.kr(15), cmdName: '/elasticat/statusRaw', values: [
+				13, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
+			], replyID: trackIndex);
+			Out.ar(out, sig);
+		}).add;
+
+		// --- RubberBand (mode 14): studio-grade stretch via the RubberBand UGen ------
+		// TWO mono RubberBand.ar instances (bufL/bufR) -- a real-time buffer player with
+		// INDEPENDENT rate (time) + pitchShift (pitch). STRCH = rate (0.5 = 2x stretch),
+		// the pitch knob = pitchShift (1 = held). resetTrig (a counter) is pulsed via
+		// Changed.kr into RubberBand's 0->+ trigger to re-seek the region start. Forward
+		// only (a phase vocoder can't reverse). GPL lib (ugens/build-rubberband.sh);
+		// guarded -> plain varispeed read if the .so is absent (test host).
+		SynthDef(\elasticatRubberBand, {
+			arg out=0, phaseBus=0, bufL=0, bufR=0, modeAmp=1, fadeTime=0.05,
+			playing=0, resetTrig=0, resetPos=0,
+			amp=0.8, pan=0, pitch=0, targetBpm=120, loopBeats=4, macro=0,
+			startPoint=0, endPoint=128, grainSize=0.08, grainOverlap=8, grainJitter=0.0, grainSpray=0.0,
+			envMode=1, envAttack=0.002, envDecay=0.15, envSustain=0.8, envRelease=0.15,
+			envHold=0.35, envTrig=0, envGateSeconds=0.5, portamento=0, envReleaseTrig=0,
+			pitchModBus=0, warpRate=1, loopXfade=0.01, grainSpeed=1, grainSpeedRand=0, grainDirection=1, direction=1, trackIndex=1;
+			var ampEnv;
+			var phase, frames, sig, modeGain, playGate, pitchRatio, strch, rate, loopStartF, rbTrig;
+			frames = BufFrames.kr(bufL).max(4);
+			pitchRatio = (Lag.kr(pitch, 0.03) + (In.kr(pitchModBus, 1).clip(-1, 1) * 12)).midiratio;
+			strch = Lag.kr(grainSpeed.clip(0.0625, 4), 0.05);
+			// TEMPO-SYNCED rate (grid-lock like GStretch2): rate 1 plays the buffer once per
+			// its native duration; scaling by BufDur*targetBpm/(loopBeats*60) makes the buffer
+			// loop every loopBeats at the project tempo (pitch held). STRCH + warp deviate.
+			rate = (BufDur.kr(bufL) * targetBpm.max(1) / (loopBeats.max(0.03125) * 60)
+				* strch * Lag.kr(warpRate.max(0.001), 0.02)).max(0.001);
+			loopStartF = startPoint.clip(0, 127.99) / 128 * frames;
+			// Re-seek ONLY on play-start, NOT on every loop/step resetTrig -- pulsing
+			// RubberBand's reset each loop re-primes the vocoder (latency) => garbage.
+			rbTrig = Trig1.kr(playing.clip(0, 1), 0.01);
+			sig = if(\RubberBand.asClass.notNil, {
+				[RubberBand.ar(1, bufL, rate, pitchRatio, rbTrig, loopStartF, 1),
+				 RubberBand.ar(1, bufR, rate, pitchRatio, rbTrig, loopStartF, 1)].flatten
+			}, {
+				var ph = Phasor.ar(TDelay.kr(Changed.kr(resetTrig), 0.003), BufRateScale.kr(bufL) * rate, loopStartF, frames, loopStartF);
+				[BufRd.ar(1, bufL, ph, 1, 4), BufRd.ar(1, bufR, ph, 1, 4)]
+			});
+			phase = In.ar(phaseBus, 1);
+			playGate = Lag.kr(playing.clip(0, 1), 0.01);
+			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
+			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento, envReleaseTrig);
+			sig = [sig[0], sig[1]] * (modeGain * playGate * ampEnv);
+			sig = LeakDC.ar(sig);
+			SendReply.kr(Impulse.kr(15), cmdName: '/elasticat/statusRaw', values: [
+				14, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
 			], replyID: trackIndex);
 			Out.ar(out, sig);
 		}).add;
@@ -695,7 +966,7 @@ Engine_Elasticat : CroneEngine {
 			startPoint=0, endPoint=128, grainSize=0.1, grainOverlap=6, wander=0.03, timingJitter=0.0,
 			envMode=1, envAttack=0.002, envDecay=0.15, envSustain=0.8, envRelease=0.15,
 			envHold=0.35, envTrig=0, envGateSeconds=0.5, portamento=0, envReleaseTrig=0,
-			pitchModBus=0, warpRate=1, trackIndex=1;
+			pitchModBus=0, warpRate=1, loopXfade=0.01, trackIndex=1;
 			var ampEnv;
 			var phase, frames, trig, dur, rate, chaos, pos, offset, direct, wet, sig, modeGain, playGate, gainNorm, startNorm, range, readPhase, stepDur, overlapControl, wanderControl;
 			phase = In.ar(phaseBus, 1);
@@ -740,27 +1011,35 @@ Engine_Elasticat : CroneEngine {
 			startPoint=0, endPoint=128, pvWindow=0.2, pvDispersion=0, pvTimeDispersion=0, macro=0,
 			envMode=1, envAttack=0.002, envDecay=0.15, envSustain=0.8, envRelease=0.15,
 			envHold=0.35, envTrig=0, envGateSeconds=0.5, portamento=0, envReleaseTrig=0,
-			pitchModBus=0, warpRate=1, trackIndex=1;
+			pitchModBus=0, warpRate=1, loopXfade=0.01, trackIndex=1;
 			var ampEnv;
-			var phase, frames, pos, raw, shifted, ratio, sig, modeGain, playGate, window, startNorm, range, readPhase;
-			phase = In.ar(phaseBus, 1);
+			var phase, frames, raw, shifted, ratio, sig, modeGain, playGate, window, loopStartF, loopEndF, cps, readerRate, resetFrame, pitchRatio;
 			frames = BufFrames.kr(bufL).max(4);
-			startNorm = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.002);
-			range = Lag.kr(((endPoint.clip(startPoint + 0.01, 128) - startPoint.clip(0, 127.99)) / 128).clip(0.0001, 1), 0.002);
-			readPhase = (startNorm + (phase * range)).clip(0, 0.999999);
-			pos = readPhase * (frames - 1);
-			raw = [
-				BufRd.ar(1, bufL, pos, loop: 1, interpolation: 4),
-				BufRd.ar(1, bufR, pos, loop: 1, interpolation: 4)
-			];
-			ratio = (derivedSourceBpm.max(1) / targetBpm.max(1) * (Lag.kr(pitch, 0.03) + (In.kr(pitchModBus, 1).clip(-1, 1) * 12)).midiratio).clip(0.5, 2);
+			pitchRatio = (Lag.kr(pitch, 0.03) + (In.kr(pitchModBus, 1).clip(-1, 1) * 12)).midiratio;
+			loopStartF = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.002) * frames;
+			loopEndF = Lag.kr(endPoint.clip(0.01, 128) / 128, 0.002) * frames;
+			// Click-free tempo-synced READ (ElasticatReader) -> pitch-CORRECT by
+			// derivedSourceBpm/targetBpm so the loop locks to tempo at the source pitch.
+			cps = (targetBpm.max(1) / 60 / loopBeats.max(0.03125)) * Lag.kr(warpRate.max(0.001), 0.02);
+			readerRate = (loopEndF - loopStartF) * cps / SampleRate.ir * playing.clip(0, 1);
+			resetFrame = loopStartF + (resetPos.clip(0, 1) * (loopEndF - loopStartF));
+			raw = if(\ElasticatReader.asClass.notNil, {
+				var rd = ElasticatReader.ar(bufL, bufR, loopStartF, loopEndF, readerRate, resetTrig, resetFrame, loopXfade.clip(0.0005, 0.25), 1);
+				phase = rd[2];
+				[rd[0], rd[1]]
+			}, {
+				var ph = Phasor.ar(TDelay.kr(Changed.kr(resetTrig), 0.003), readerRate, loopStartF, loopEndF, resetFrame);
+				phase = ((ph - loopStartF) / (loopEndF - loopStartF).max(1)).clip(0, 1);
+				[BufRd.ar(1, bufL, ph, loop: 1, interpolation: 4), BufRd.ar(1, bufR, ph, loop: 1, interpolation: 4)]
+			});
+			ratio = (derivedSourceBpm.max(1) / targetBpm.max(1) * pitchRatio).clip(0.5, 2);
 			window = Lag.kr(pvWindow.clip(0.005, 2), 0.05) * (1 + macro.clip(0, 1));
 			shifted = PitchShift.ar(raw, window, ratio, Lag.kr(pvDispersion.clip(0, 1), 0.05), Lag.kr(pvTimeDispersion.clip(0, 1), 0.05));
 			sig = shifted;
 			playGate = Lag.kr(playing.clip(0, 1), 0.01);
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
 			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento, envReleaseTrig);
-			sig = [sig[0], sig[1]] * (modeGain * playGate * ampEnv * readerDeclick.value(resetTrig));
+			sig = [sig[0], sig[1]] * (modeGain * playGate * ampEnv);
 			sig = LeakDC.ar(sig);
 			SendReply.kr(Impulse.kr(15), cmdName: '/elasticat/statusRaw', values: [
 				5, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
@@ -779,18 +1058,24 @@ Engine_Elasticat : CroneEngine {
 			startPoint=0, endPoint=128, harmInterval=7, harmInterval2=0, harmInterval3=0,
 			envMode=1, envAttack=0.002, envDecay=0.15, envSustain=0.8, envRelease=0.15,
 			envHold=0.35, envTrig=0, envGateSeconds=0.5, portamento=0, envReleaseTrig=0,
-			pitchModBus=0, warpRate=1, trackIndex=1;
-			var ampEnv, phase, frames, startNorm, range, readPhase, pos, dry, harmRatio, harmRatio2, harmRatio3, g1, g2, g3, wetL, wetR, sig, modeGain, playGate, mix;
-			phase = In.ar(phaseBus, 1);
+			pitchModBus=0, warpRate=1, loopXfade=0.01, trackIndex=1;
+			var ampEnv, phase, frames, loopStartF, loopEndF, cps, readerRate, resetFrame, dry, harmRatio, harmRatio2, harmRatio3, g1, g2, g3, wetL, wetR, sig, modeGain, playGate, mix;
 			frames = BufFrames.kr(bufL).max(4);
-			startNorm = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.002);
-			range = Lag.kr(((endPoint.clip(startPoint + 0.01, 128) - startPoint.clip(0, 127.99)) / 128).clip(0.0001, 1), 0.002);
-			readPhase = (startNorm + (phase * range)).clip(0, 0.999999);
-			pos = readPhase * (frames - 1);
-			dry = [
-				BufRd.ar(1, bufL, pos, loop: 1, interpolation: 4),
-				BufRd.ar(1, bufR, pos, loop: 1, interpolation: 4)
-			];
+			loopStartF = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.002) * frames;
+			loopEndF = Lag.kr(endPoint.clip(0.01, 128) / 128, 0.002) * frames;
+			// Click-free tempo-synced dry READ (ElasticatReader); the harmonies shift it.
+			cps = (targetBpm.max(1) / 60 / loopBeats.max(0.03125)) * Lag.kr(warpRate.max(0.001), 0.02);
+			readerRate = (loopEndF - loopStartF) * cps / SampleRate.ir * playing.clip(0, 1);
+			resetFrame = loopStartF + (resetPos.clip(0, 1) * (loopEndF - loopStartF));
+			dry = if(\ElasticatReader.asClass.notNil, {
+				var rd = ElasticatReader.ar(bufL, bufR, loopStartF, loopEndF, readerRate, resetTrig, resetFrame, loopXfade.clip(0.0005, 0.25), 1);
+				phase = rd[2];
+				[rd[0], rd[1]]
+			}, {
+				var ph = Phasor.ar(TDelay.kr(Changed.kr(resetTrig), 0.003), readerRate, loopStartF, loopEndF, resetFrame);
+				phase = ((ph - loopStartF) / (loopEndF - loopStartF).max(1)).clip(0, 1);
+				[BufRd.ar(1, bufL, ph, loop: 1, interpolation: 4), BufRd.ar(1, bufR, ph, loop: 1, interpolation: 4)]
+			});
 			// Three stacked harmony voices -- an interval of 0 turns that voice OFF
 			// (owner); the lagged gate glides a voice in/out of the chord (no click).
 			harmRatio = (Lag.kr(harmInterval, 0.05) + (In.kr(pitchModBus, 1).clip(-1, 1) * 12)).midiratio.clip(0.25, 4);
@@ -806,7 +1091,7 @@ Engine_Elasticat : CroneEngine {
 			playGate = Lag.kr(playing.clip(0, 1), 0.01);
 			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
 			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento, envReleaseTrig);
-			sig = [sig[0], sig[1]] * (modeGain * playGate * ampEnv * readerDeclick.value(resetTrig));
+			sig = [sig[0], sig[1]] * (modeGain * playGate * ampEnv);
 			sig = LeakDC.ar(sig);
 			SendReply.kr(Impulse.kr(15), cmdName: '/elasticat/statusRaw', values: [
 				6, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
@@ -829,10 +1114,10 @@ Engine_Elasticat : CroneEngine {
 			playing=0, resetTrig=0, resetPos=0,
 			amp=0.8, pan=0, pitch=0, targetBpm=120, loopBeats=4, macro=0,
 			startPoint=0, endPoint=128, wtWindow=8, wtCycle=600,
-			wtLfoRate=0, wtLfoDepth=0, wtLfoShape=0,
+			wtLfoRate=0, wtLfoDepth=64, wtLfoShape=0,
 			envMode=1, envAttack=0.002, envDecay=0.15, envSustain=0.8, envRelease=0.15,
 			envHold=0.35, envTrig=0, envGateSeconds=0.5, portamento=0, envReleaseTrig=0,
-			pitchModBus=0, warpRate=1, trackIndex=1;
+			pitchModBus=0, warpRate=1, loopXfade=0.01, trackIndex=1;
 			var ampEnv, frames, startNorm, range, rangeStart, rangeLen, slices, cycleLen, step, lfo, morphPos, sliceF, si, frac, startA, startB, freq, wtPhase, p2, w1, w2, aL, aR, bL, bR, tapL, tapR, scanPhase, sig, modeGain, playGate;
 			frames = BufFrames.kr(bufL).max(4);
 			startNorm = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.01);
@@ -846,14 +1131,16 @@ Engine_Elasticat : CroneEngine {
 			// between slice starts (0 if the cycle is as wide as the range).
 			cycleLen = Lag.kr(wtCycle.clip(16, 8192), 0.05).min(rangeLen);
 			step = (rangeLen - cycleLen).max(0) / (slices - 1).max(1);
-			// Auto-scan LFO: unipolar 0..1 from the shape, scaled by depth, ADDED to
-			// the MORF base -- MORF sets the scan start, depth the span, rate the speed.
+			// Auto-scan LFO. The shape is made UNIPOLAR (0..1); depth is a SIGNED
+			// 0-128 control (owner): 64 = off, 128 sweeps MORF fully UP toward 1.0, 0
+			// sweeps it fully DOWN toward 0.0. So morphPos = MORF + unipolarLFO *
+			// ((depth-64)/64). S&H = LFNoise0 (stepped), rand = LFNoise1 (smooth).
 			lfo = Select.kr(wtLfoShape.clip(0, 4), [
 				SinOsc.kr(wtLfoRate.max(0)), LFTri.kr(wtLfoRate.max(0)),
 				LFSaw.kr(wtLfoRate.max(0)), LFNoise0.kr(wtLfoRate.max(0)), LFNoise1.kr(wtLfoRate.max(0))
 			]);
 			lfo = (lfo + 1) * 0.5;
-			morphPos = (Lag.kr(macro.clip(0, 1), 0.02) + (lfo * Lag.kr(wtLfoDepth.clip(0, 1), 0.05))).clip(0, 1);
+			morphPos = (Lag.kr(macro.clip(0, 1), 0.02) + (lfo * Lag.kr(((wtLfoDepth - 64) / 64).clip(-1, 1), 0.05))).clip(0, 1);
 			scanPhase = morphPos;
 			// Which two adjacent slice cycles to crossfade, and by how much. At an
 			// integer boundary startA(new) == startB(old), so the crossfade is
@@ -903,7 +1190,7 @@ Engine_Elasticat : CroneEngine {
 			startPoint=0, endPoint=128, freezeAmount=0, spectralBlur=0, formantShift=0,
 			envMode=1, envAttack=0.002, envDecay=0.15, envSustain=0.8, envRelease=0.15,
 			envHold=0.35, envTrig=0, envGateSeconds=0.5, portamento=0, envReleaseTrig=0,
-			pitchModBus=0, warpRate=1, trackIndex=1;
+			pitchModBus=0, warpRate=1, loopXfade=0.01, trackIndex=1;
 			var ampEnv, phase, frames, startNorm, range, readPhase, pos, mono, sigMono, freezeGate, blur, fShift, pitchRatio, chain, sig, modeGain, playGate;
 			phase = In.ar(phaseBus, 1);
 			frames = BufFrames.kr(bufL).max(4);
@@ -1513,7 +1800,7 @@ Engine_Elasticat : CroneEngine {
 			targetBpm=120, derivedSourceBpm=120, loopBeats=4, startPoint=0, endPoint=128,
 			envMode=1, envAttack=0.002, envDecay=0.15, envSustain=0.8, envRelease=0.15,
 			envHold=0.35, envTrig=0, envGateSeconds=0.5, portamento=0, envReleaseTrig=0,
-			pitchModBus=0, warpRate=1, trackIndex=1;
+			pitchModBus=0, warpRate=1, loopXfade=0.01, trackIndex=1;
 			var phase, frames, sourcePhase, pos, sig, modeGain, playGate, pitchRatio, startNorm, range, nativeIncrement;
 			var ampEnv;
 			// --- Task 2 (PRD S8): tempo_varispeed pitch -- extra vars for the
@@ -1561,7 +1848,7 @@ Engine_Elasticat : CroneEngine {
 			// on a jump snaps to 0 (all-OLD, = the continuous pre-jump signal) then
 			// ramps back to 1 over 6ms. NOT [0,1] -- that would rest at 0 and play
 			// the OLD Sweep path at spawn instead of the real phase.
-			xfade = EnvGen.ar(Env.new([1, 0, 1], [0, 0.006], \sin), resetAt);
+			xfade = EnvGen.ar(Env.new([1, 0, 1], [0, loopXfade.clip(0.0005, 0.25)], \sin), resetAt);
 			srcNew = Select.ar(direction >= 0, [1 - phase, phase]).wrap(0, 1);
 			srcOld = Select.ar(direction >= 0, [1 - oldPhase, oldPhase]).wrap(0, 1);
 			posNew = (startNorm + (srcNew * range)).clip(0, 0.999999) * (frames - 1);
@@ -1581,6 +1868,56 @@ Engine_Elasticat : CroneEngine {
 			], replyID: trackIndex);
 			Out.ar(out, sig);
 		}).add;
+	}
+
+	// Build a warp-mode reader from the compiled click-free ElasticatReader (softcut
+	// model): absolute-frame reads + one queued 2-head crossfade (position jumps AND
+	// the loop seam). statusModeId is echoed in /statusRaw so several modes can share
+	// this reader yet stay distinct in the UI. Guarded -- falls back to the SC-graph
+	// native tape reader if the .so is not installed (build via ugens/build-ugens.sh).
+	addUGenReaderDef { arg synthName, statusModeId, tempoSync = false;
+		if(\ElasticatReader.asClass.notNil, {
+		SynthDef(synthName, {
+			arg out=0, phaseBus=0, bufL=0, bufR=0, modeAmp=1, fadeTime=0.05,
+			playing=0, resetTrig=0, resetPos=0,
+			amp=0.8, pan=0, pitch=0, speed=1, direction=1,
+			targetBpm=120, derivedSourceBpm=120, loopBeats=4, startPoint=0, endPoint=128,
+			envMode=1, envAttack=0.002, envDecay=0.15, envSustain=0.8, envRelease=0.15,
+			envHold=0.35, envTrig=0, envGateSeconds=0.5, portamento=0, envReleaseTrig=0,
+			pitchModBus=0, warpRate=1, loopXfade=0.01, trackIndex=1;
+			var frames, pitchRatio, loopStartF, loopEndF, rate, resetFrame, rd, sig, modeGain, playGate, ampEnv, phase, cps;
+			frames = BufFrames.kr(bufL).max(4);
+			pitchRatio = (Lag.kr(pitch, 0.03) + (In.kr(pitchModBus, 1).clip(-1, 1) * 12)).midiratio.clip(0.03125, 32);
+			// Absolute-frame loop fences (softcut model): moving these never remaps the
+			// read position, so a region relock on a step -- or on its RELEASE return-
+			// jump -- doesn't teleport the read (the pop tape_xf couldn't dodge).
+			loopStartF = Lag.kr(startPoint.clip(0, 127.99) / 128, 0.002) * frames;
+			loopEndF = Lag.kr(endPoint.clip(0.01, 128) / 128, 0.002) * frames;
+			// rate is FRAMES per sample, signed by direction, gated by playing. tempoSync
+			// (tempo_varispeed): the region traverses once per loop (grid-locked, pitch a
+			// byproduct of the stretch). NATIVE (tape): speed * pitch.
+			rate = if(tempoSync, {
+				cps = (targetBpm.max(1) / 60 / loopBeats.max(0.03125)) * Lag.kr(warpRate.max(0.001), 0.02);
+				(loopEndF - loopStartF) * cps / SampleRate.ir * direction * playing.clip(0, 1)
+			}, {
+				BufRateScale.kr(bufL) * speed.max(0.03125) * pitchRatio * Lag.kr(warpRate.max(0.001), 0.02) * direction * playing.clip(0, 1)
+			});
+			resetFrame = loopStartF + (resetPos.clip(0, 1) * (loopEndF - loopStartF));
+			rd = ElasticatReader.ar(bufL, bufR, loopStartF, loopEndF, rate, resetTrig, resetFrame, loopXfade.clip(0.0005, 0.25), 1);
+			phase = rd[2];
+			modeGain = Lag.kr(modeAmp.clip(0, 1), fadeTime).sqrt;
+			playGate = Lag.kr(playing.clip(0, 1), 0.01);
+			ampEnv = readerAmpEnv.value(envMode, envAttack, envDecay, envSustain, envRelease, envHold, envTrig, envGateSeconds, portamento, envReleaseTrig);
+			sig = [rd[0], rd[1]] * (modeGain * playGate * ampEnv);
+			sig = LeakDC.ar(sig);
+			SendReply.kr(Impulse.kr(15), cmdName: '/elasticat/statusRaw', values: [
+				statusModeId, phase, frames, Amplitude.kr(sig[0]), Amplitude.kr(sig[1])
+			], replyID: trackIndex);
+			Out.ar(out, sig);
+		}).add;
+		}, {
+			this.addDirectReaderDef(synthName, if(tempoSync, 1, 0));
+		});
 	}
 
 	// =======================================================================
@@ -1781,7 +2118,6 @@ Engine_Elasticat : CroneEngine {
 		this.addCommand(\trSetSliceMono, "ii", { arg msg; sliceMono = msg[2].asInteger.clip(0, 1); });
 		this.addCommand(\trSetSliceSyncToClock, "ii", { arg msg; sliceSyncToClock = msg[2].asInteger.clip(0, 1); });
 		this.addCommand(\trSetSliceRate, "if", { arg msg; sliceRate = msg[2].clip(0.03125, 16); });
-		this.addCommand(\trXfade, "if", { arg msg; loopXfade = msg[2].clip(0, 0.25); });
 
 		// --- Genuinely global commands --------------------------------------
 		this.addCommand(\activeTrackCount, "i", { arg msg; this.setActiveTrackCount(msg[1]); });
@@ -1828,7 +2164,6 @@ Engine_Elasticat : CroneEngine {
 		this.addCommand(\commitLoop, "ff", { arg msg;
 			scriptAddress.sendBundle(0, ["/elasticat/commitLoopPending", msg[1].clip(0, 1), msg[2].clip(0, 1)]);
 		});
-		this.addCommand(\xfade, "f", { arg msg; loopXfade = msg[1].clip(0, 0.25); });
 		this.addCommand(\requestStatus, "", { this.sendStatus; });
 		this.addCommand(\setDebug, "i", { arg msg; debugLevel = msg[1].asInteger.clip(0, 3); });
 		this.addCommand(\sliceAttack, "f", { arg msg; sliceAttack = msg[1].clip(0.0001, 0.2); });
@@ -2545,19 +2880,25 @@ ElasticatTrack {
 	var <chopBeats = 0.25, <chopMode = 0;
 	var <chopAttack = 0.002, <chopHold = 0.04, <chopRelease = 0.01;
 	var <grainSize = 0.08, <grainOverlap = 8, <grainJitter = 0;
+	var <grainSpeed = 1, <grainSpeedRand = 0, <grainDirection = 1;
 	var <wsolaWindow = 0.1, <wsolaSearch = 0.03;
 	var <pvWindow = 0.2, <pvDispersion = 0;
 	var <harmInterval = 7, <harmInterval2 = 0, <harmInterval3 = 0;
 	// Wavetable Scan: wtWindow is a SLICE COUNT (how many cycles are spread across
 	// the range); wtCycle is each cycle's WIDTH in samples (the single-cycle len);
 	// wtLfo* auto-scan MORF. See the \elasticatWavetable def.
-	var <wtWindow = 8, <wtCycle = 600, <wtLfoRate = 0, <wtLfoDepth = 0, <wtLfoShape = 0;
+	var <wtWindow = 8, <wtCycle = 600, <wtLfoRate = 0, <wtLfoDepth = 64, <wtLfoShape = 0;
 	var <freezeAmount = 0, <spectralBlur = 0, <formantShift = 0;
 	// Synced rate multiplier (warp-page slot 8, every mode). 1 = normal; 0.5 =
 	// half-speed loop; 2 = double. Scales the transport phasor for bus-following
 	// modes and the tape reader's native Phasor. syncClock reads it so clock-lock
 	// uses the effective loop length.
 	var <warpRate = 1;
+	// Playhead-JUMP crossfade time (source-page "loop xfade"). The direct reader
+	// (tape / tempo_varispeed) reads old + new trajectories and equal-power fades
+	// between them over this; longer = a softer tape-splice, shorter = a tight
+	// declick. Only the direct reader uses it today.
+	var <xfade = 0.01;
 
 	// --- filter + filter envelope -------------------------------------------
 	var <filterMachine = 0, <filterType = 0, <filterCutoff = 20000;
@@ -2628,6 +2969,9 @@ ElasticatTrack {
 			\grainSize    -> (arg: \grainSize,    synth: \reader, lo: 0.002, hi: 0.5),
 			\grainOverlap -> (arg: \grainOverlap, synth: \reader, lo: 1, hi: 64),
 			\grainJitter  -> (arg: [\grainJitter, \grainSpray], synth: \reader, lo: 0, hi: 0.25),
+			\grainSpeed     -> (arg: \grainSpeed,     synth: \reader, lo: 0, hi: 4),
+			\grainSpeedRand -> (arg: \grainSpeedRand, synth: \reader, lo: 0, hi: 1),
+			\grainDirection -> (arg: \grainDirection, synth: \reader, lo: 0, hi: 1),
 			\wsolaWindow  -> (arg: \grainSize,    synth: \reader, lo: 0.005, hi: 0.5),
 			\wsolaSearch  -> (arg: \wander,       synth: \reader, lo: 0, hi: 0.1),
 			\pvWindow     -> (arg: \pvWindow,     synth: \reader, lo: 0.005, hi: 2),
@@ -2638,7 +2982,7 @@ ElasticatTrack {
 			\wtWindow     -> (arg: \wtWindow,     synth: \reader, lo: 2, hi: 64, int: true),
 			\wtCycle      -> (arg: \wtCycle,      synth: \reader, lo: 16, hi: 8192, int: true),
 			\wtLfoRate    -> (arg: \wtLfoRate,    synth: \reader, lo: 0, hi: 20),
-			\wtLfoDepth   -> (arg: \wtLfoDepth,   synth: \reader, lo: 0, hi: 1),
+			\wtLfoDepth   -> (arg: \wtLfoDepth,   synth: \reader, lo: 0, hi: 128),
 			\wtLfoShape   -> (arg: \wtLfoShape,   synth: \reader, lo: 0, hi: 4, int: true),
 			\freezeAmount -> (arg: \freezeAmount, synth: \reader, lo: 0, hi: 1),
 			\spectralBlur -> (arg: \spectralBlur, synth: \reader, lo: 0, hi: 1),
@@ -2646,6 +2990,8 @@ ElasticatTrack {
 			// warpRate pushes to the READER (tape's native Phasor); set() also fans it
 			// to the transport synth (bus-following modes). syncClock reads tr.warpRate.
 			\warpRate     -> (arg: \warpRate, synth: \reader, lo: 0.03125, hi: 8),
+			// Playhead-jump crossfade time -> the direct reader's \loopXfade arg.
+			\xfade        -> (arg: \loopXfade, synth: \reader, lo: 0.0005, hi: 0.25),
 			// filter stage (also the amp/pan output stage -- see setAmp)
 			\pan              -> (arg: \pan,        synth: \filter, lo: -1, hi: 1),
 			\filterType       -> (arg: \filterType, synth: \filter, lo: 0, hi: 3, int: true),
@@ -3191,6 +3537,7 @@ ElasticatTrack {
 			\portamento, portamento,
 			\pitchModBus, modBusPitch.index,
 			\warpRate, warpRate,
+			\loopXfade, xfade,
 			\trackIndex, index
 		] ++ this.warpArgs;
 	}
@@ -3210,6 +3557,9 @@ ElasticatTrack {
 			\grainOverlap, grainOverlap,
 			\grainJitter, grainJitter,
 			\grainSpray, grainJitter,
+			\grainSpeed, grainSpeed,
+			\grainSpeedRand, grainSpeedRand,
+			\grainDirection, grainDirection,
 			\pvWindow, pvWindow,
 			\pvDispersion, pvDispersion,
 			\harmInterval, harmInterval,
@@ -3362,9 +3712,10 @@ ElasticatTrack {
 		var defName;
 		if(group.isNil, { ^nil });
 		defName = engine.modeSynthNames.wrapAt(machine.asInteger);
-		// Spectral modes (freeze / formant, machine 8+) run an FFT chain -- one is
+		// Spectral modes (freeze = 8 / formant = 9) run an FFT chain -- one is
 		// affordable, 8 are not. Track-1-only: fall back to tape on any other track.
-		if((machine.asInteger >= 8) and: { index != 1 }, { defName = \elasticatTape; });
+		// (Named explicitly, not >=8, so tape_xf (10) still runs on every track.)
+		if(((machine.asInteger == 8) or: { machine.asInteger == 9 }) and: { index != 1 }, { defName = \elasticatTape; });
 		^Synth.after(transportSynth, defName, this.commonArgs(startAmp));
 	}
 
@@ -3582,6 +3933,9 @@ ElasticatTrack {
 			\grainSize, grainSize,
 			\grainOverlap, grainOverlap,
 			\grainJitter, grainJitter,
+			\grainSpeed, grainSpeed,
+			\grainSpeedRand, grainSpeedRand,
+			\grainDirection, grainDirection,
 			\wsolaWindow, wsolaWindow,
 			\wsolaSearch, wsolaSearch,
 			\pvWindow, pvWindow,

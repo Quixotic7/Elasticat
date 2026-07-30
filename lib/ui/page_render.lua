@@ -70,7 +70,8 @@ local CENTERED = {
   filter_env_depth = true,
   lfo1_depth = true,
   lfo2_depth = true,
-  menv_depth = true
+  menv_depth = true,
+  wt_lfo_depth = true  -- signed 0-128, 64 = off (fills from centre)
 }
 
 function PageRender.new(opts)

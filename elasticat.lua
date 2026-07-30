@@ -524,6 +524,15 @@ elasticat.osc_report = function(path, args)
     -- keeps equal to the selected track, so an un-routed echo re-anchors the
     -- selected track. A <track> <phase> form is honored too, for when the
     -- engine starts tagging these.
+    -- BUT: a playhead-INDEPENDENT reader (Wavetable's MORF scan) reports its own
+    -- phase via the 15Hz /status feed; a sequence position-jump still moves the
+    -- transport and echoes /reset with the TRANSPORT phase, which would stomp the
+    -- scan phase and flicker the playhead to 0. Same fix as /transport: when
+    -- track 1's reader feed is live, /status is the authority -- drop the echo.
+    local reset_track = #args >= 2 and elasticat.osc_track(args[1]) or 1
+    if reset_track == 1 and (util.time() - (status.amp_time[1] or 0)) < 0.2 then
+      return true
+    end
     if #args >= 2 then
       set_visual_phase(args[2], elasticat.osc_track(args[1]))
     else

@@ -88,7 +88,7 @@ ParamsSpec.SPEC = {
   {suffix = "range_end", name = "range end", spec = {0, 128, "lin", 0.01, 128, "", 1 / 128},
     action = "range_end", t1 = true},
   {suffix = "loop_reverse", name = "loop reverse", kind = "binary", default = 0, cmd = "setReverse"},
-  {suffix = "xfade", name = "loop xfade", spec = {0, 0.25, "lin", 0.001, 0.005, "", 0.004}, cmd = "xfade", queue = true},
+  {suffix = "xfade", name = "loop xfade", spec = {0, 0.25, "lin", 0.001, 0.010, "s", 0.004}, cmd = "xfade", queue = true},
   -- warp
   {suffix = "mode", name = "warp mode", kind = "option", options = "modes", default = 1, cmd = "setMode", offset = -1},
   {suffix = "chop_steps", name = "chop steps", spec = {0.05, 16, "lin", 0.05, 1, "steps", 0.05 / 15.95}, cmd = "chopSteps"},
@@ -114,7 +114,7 @@ ParamsSpec.SPEC = {
   {suffix = "wt_window", name = "wavetable slices", spec = {2, 64, "lin", 1, 8, "", 1 / 62}, cmd = "wtWindow", queue = true},
   {suffix = "wt_cycle", name = "wavetable cycle width", spec = {16, 8192, "exp", 1, 600, "smp", 1 / 8176}, cmd = "wtCycle", queue = true},
   {suffix = "wt_lfo_rate", name = "wavetable LFO rate", spec = {0, 20, "lin", 0.01, 0, "Hz", 0.01 / 20}, cmd = "wtLfoRate", queue = true},
-  {suffix = "wt_lfo_depth", name = "wavetable LFO depth", spec = {0, 1, "lin", 0.01, 0, "", 0.01}, cmd = "wtLfoDepth", queue = true},
+  {suffix = "wt_lfo_depth", name = "wavetable LFO depth", spec = {0, 128, "lin", 1, 64, "", 1 / 128}, cmd = "wtLfoDepth", fmt = "integer", queue = true},
   {suffix = "wt_lfo_shape", name = "wavetable LFO shape", kind = "option",
     options = {"sine", "tri", "saw", "s&h", "rand"}, default = 1, cmd = "wtLfoShape", offset = -1, queue = true},
   -- Spectral Freeze (mode 9) + Formant (mode 10) share one FFT reader; both

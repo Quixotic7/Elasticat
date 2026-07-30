@@ -158,7 +158,8 @@ local ID_FORMATTERS = {
   wt_window = fmt_round,
   wt_cycle = fmt_round,
   wt_lfo_rate = fmt_2dp,
-  wt_lfo_depth = fmt_2dp,
+  wt_lfo_depth = fmt_round,
+  xfade = fmt_milli,
   pv_dispersion = fmt_2dp,
   chop_steps = fmt_chop_steps,
   grain_size = fmt_milli,
@@ -427,11 +428,21 @@ function ParamValues:format_item_value(param_item, value)
     if mode == "tempo_varispeed" then
       return "tempo"
     elseif mode == "granular" then
-      return "grain"
+      return "GText"
     elseif mode == "pitch_corrected" then
       return "pc"
     elseif mode == "random_ola" then
       return "ola"
+    elseif mode == "tape_xf" then
+      return "tapeX"
+    elseif mode == "tape_ugen" then
+      return "tapeU"
+    elseif mode == "gstretch" then
+      return "GStrch"
+    elseif mode == "gstretch2" then
+      return "GStr2"
+    elseif mode == "rubberband" then
+      return "RBand"
     end
     return mode
   elseif param_item.pseudo == "pattern_rate" then

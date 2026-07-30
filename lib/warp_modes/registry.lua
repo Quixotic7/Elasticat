@@ -10,7 +10,12 @@ local modes = {
   [7] = include("lib/warp_modes/harmonizer"),
   [8] = include("lib/warp_modes/wavetable"),
   [9] = include("lib/warp_modes/spectral_freeze"),
-  [10] = include("lib/warp_modes/formant")
+  [10] = include("lib/warp_modes/formant"),
+  [11] = include("lib/warp_modes/tape_xf"),
+  [12] = include("lib/warp_modes/tape_ugen"),
+  [13] = include("lib/warp_modes/gstretch"),
+  [14] = include("lib/warp_modes/gstretch2"),
+  [15] = include("lib/warp_modes/rubberband")
 }
 
 function Registry.get(mode_id)

@@ -44,7 +44,12 @@ elasticat.modes = {
   "harmonizer",
   "wavetable",
   "spectral_freeze",
-  "formant"
+  "formant",
+  "tape_xf",
+  "tape_ugen",
+  "gstretch",
+  "gstretch2",
+  "rubberband"
 }
 
 local sync_thread = nil
@@ -2566,7 +2571,8 @@ function elasticat.params(options)
     local function push(suffix, cmd, offset)
       tr_call(1, cmd, params:get(param_id(prefix, suffix)) + (offset or 0))
     end
-    if mode == 1 or mode == 2 then
+    if mode == 1 or mode == 2 or mode == 11 or mode == 12 then
+      -- tape / tempo_varispeed / tape_xf / tape_ugen: region-only readers.
       tr_call(1, "loopStart", map_trim_point(params:get(ids.loop_start), 1))
       tr_call(1, "loopEnd", map_trim_point(params:get(ids.loop_end), 1))
     elseif mode == 3 then
@@ -2579,6 +2585,23 @@ function elasticat.params(options)
       push("grain_size", "grainSize")
       push("grain_density", "grainDensity")
       push("grain_jitter", "grainJitter")
+      push("grain_speed", "grainSpeed")
+      push("grain_speed_rand", "grainSpeedRand")
+      push("grain_direction", "grainDirection")
+    elseif mode == 13 then
+      -- GStretch (varispeed reader + pitch-correct): STRCH = grain_speed, PWIN =
+      -- grain_size (window), SMTH = grain_density (shift dispersion).
+      push("grain_speed", "grainSpeed")
+      push("grain_size", "grainSize")
+      push("grain_density", "grainDensity")
+    elseif mode == 14 then
+      -- GStretch2 (clock-synced): STRCH + PWIN + SMTH (grain_density = shift dispersion).
+      push("grain_speed", "grainSpeed")
+      push("grain_size", "grainSize")
+      push("grain_density", "grainDensity")
+    elseif mode == 15 then
+      -- RubberBand: STRCH = grain_speed (rate); pitch held via the pitch knob.
+      push("grain_speed", "grainSpeed")
     elseif mode == 5 then
       push("wsola_window", "wsolaWindow")
       push("wsola_search", "wsolaSearch")
@@ -3004,9 +3027,12 @@ function elasticat.params(options)
     elasticat.preview_trim(x == 1)
   end)
 
+  -- Playhead-jump crossfade time (tape / tempo_varispeed). Per-track now: routed
+  -- through trXfade (generated from the ParamsSpec \xfade row), not the old global
+  -- \xfade command. Default 10ms.
   add_control(param_id(prefix, "xfade"), "loop xfade",
-    cs.new(0, 0.25, "lin", 0.001, 0.005, "", 0.004),
-    function(x) queue_engine_call(param_id(prefix, "xfade"), "xfade", x) end,
+    cs.new(0, 0.25, "lin", 0.001, 0.010, "s", 0.004),
+    function(x) elasticat.tr_queue(param_id(prefix, "xfade"), 1, "xfade", x) end,
     format_ms)
 
   add_control(param_id(prefix, "pitch"), "pitch",
@@ -3167,6 +3193,20 @@ function elasticat.params(options)
     function(x) elasticat.tr_queue(param_id(prefix, "grain_jitter"), 1, "grainJitter", x) end,
     format_ms)
 
+  -- Particle grain engine: grain speed (x playhead scan), speed randomness, and the
+  -- forward<->backward morph (0 = all back, 0.5 = 50/50, 1 = all forward).
+  add_control(param_id(prefix, "grain_speed"), "grain speed",
+    cs.new(0, 4, "lin", 0.01, 1, "x", 0.01 / 4),
+    function(x) elasticat.tr_queue(param_id(prefix, "grain_speed"), 1, "grainSpeed", x) end)
+
+  add_control(param_id(prefix, "grain_speed_rand"), "grain speed rand",
+    cs.new(0, 1, "lin", 0.01, 0, "", 0.01),
+    function(x) elasticat.tr_queue(param_id(prefix, "grain_speed_rand"), 1, "grainSpeedRand", x) end)
+
+  add_control(param_id(prefix, "grain_direction"), "grain direction",
+    cs.new(0, 1, "lin", 0.01, 1, "", 0.01),
+    function(x) elasticat.tr_queue(param_id(prefix, "grain_direction"), 1, "grainDirection", x) end)
+
   add_control(param_id(prefix, "wsola_window"), "OLA window",
     cs.new(0.005, 0.5, "lin", 0.001, 0.08, "s", 0.001 / 0.495),
     function(x) elasticat.tr_queue(param_id(prefix, "wsola_window"), 1, "wsolaWindow", x) end,
@@ -3217,9 +3257,11 @@ function elasticat.params(options)
     cs.new(0, 20, "lin", 0.01, 0, "Hz", 0.01 / 20),
     function(x) elasticat.tr_queue(param_id(prefix, "wt_lfo_rate"), 1, "wtLfoRate", x) end)
 
+  -- Signed 0-128 depth (64 = off): 128 sweeps MORF up to 1.0, 0 sweeps it to 0.0.
   add_control(param_id(prefix, "wt_lfo_depth"), "wavetable LFO depth",
-    cs.new(0, 1, "lin", 0.01, 0, "", 0.01),
-    function(x) elasticat.tr_queue(param_id(prefix, "wt_lfo_depth"), 1, "wtLfoDepth", x) end)
+    cs.new(0, 128, "lin", 1, 64, "", 1 / 128),
+    function(x) elasticat.tr_queue(param_id(prefix, "wt_lfo_depth"), 1, "wtLfoDepth", x) end,
+    function(param) return tostring(math.floor(param:get() + 0.5)) end)
 
   params:add_option(param_id(prefix, "wt_lfo_shape"), "wavetable LFO shape", {"sine", "tri", "saw", "s&h", "rand"}, 1)
   params:set_action(param_id(prefix, "wt_lfo_shape"), function(x) tr_call(1, "wtLfoShape", x - 1) end)
