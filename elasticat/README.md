@@ -10,13 +10,6 @@ the script.
 This is a single-track instrument today (a multi-track version is planned).
 Everything below describes the current, shipped behavior.
 
-## Warning
-
-Engines now use custom C++ UGens to improve performance and reduce clicks with playhead jumps. As of now you will need to build and install these UGens yourself from SSH using the build script. 
-
-build-ugens.sh
-
-
 ## Requirements
 
 - A monome norns (or norns shield/fates running the norns OS).

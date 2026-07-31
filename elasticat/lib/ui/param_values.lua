@@ -60,6 +60,16 @@ local function fmt_chop_steps(value)
   return string.format("%.2f", n)
 end
 
+-- Wavetable LFO rate spans 0.001Hz .. 8kHz on an exponential knob, so the readout
+-- needs more decimals when tiny (3dp sub-1Hz), fewer as it climbs (owner: fine LFO
+-- rates under 1Hz), and a plain integer at audio rates.
+local function fmt_lfo_rate(value)
+  local n = value or 0
+  if n < 1 then return string.format("%.3f", n) end
+  if n < 100 then return string.format("%.2f", n) end
+  return tostring(math.floor(n + 0.5))
+end
+
 -- warp RATE: when the value sits on one of the FN-snap fractions, show the
 -- musical ratio ("1/2", "3/4", or "2" for wholes) so a snap is visible; off a
 -- ratio, show the raw multiplier ("1.23x"). The clean ratio (no "x") vs the
@@ -157,7 +167,7 @@ local ID_FORMATTERS = {
   warp_rate = fmt_warp_rate,
   wt_window = fmt_round,
   wt_cycle = fmt_round,
-  wt_lfo_rate = fmt_2dp,
+  wt_lfo_rate = fmt_lfo_rate,
   wt_lfo_depth = fmt_round,
   xfade = fmt_milli,
   pv_dispersion = fmt_2dp,
@@ -597,6 +607,15 @@ function ParamValues:adjusted_value(param_item, current, delta, snap)
     step = duration > 0 and (duration / 128) or (param_item.step or 1)
   else
     step = param_item.step or 1
+    -- Exponential knob granularity: the step GROWS along an exponential curve with
+    -- the value -- fine near 0, coarser toward the top, capped -- so one control
+    -- covers sub-audio LFO rates AND audio rates on a smooth curve (no hard step
+    -- boundaries). exp_step = {min, max, tau}: step = min * e^(|value|/tau), <= max.
+    -- (owner: wavetable LFO rate feels like ~0.5 / 1 / 8.)
+    local es = param_item.exp_step
+    if es ~= nil then
+      step = math.min(es.max, es.min * math.exp(math.abs(current) / es.tau))
+    end
   end
   return util.clamp(current + (delta * step), param_item.min or current, param_item.max or current)
 end
@@ -823,12 +842,28 @@ function ParamValues:delta_item(param_item, delta)
     elseif lock_id == "range_end" then
       local start_ref = grid_ui:held_param_lock("range_start") or self.param_value_or("range_start", 0)
       grid_ui:set_held_param_lock(lock_id, util.clamp(next_value, math.min(128, start_ref + 1), 128))
+    elseif lock_id == "loop_start" then
+      -- Track start/end get the same mutual clamp as range: the locked start can
+      -- never reach the locked (or track) end, so a step P-lock can't put start
+      -- past end (owner: "should not be able to move start beyond the end").
+      local end_ref = grid_ui:held_param_lock("loop_end") or self.param_value_or("loop_end", 128)
+      grid_ui:set_held_param_lock(lock_id, util.clamp(next_value, 0, math.max(0, end_ref - 1)))
+    elseif lock_id == "loop_end" then
+      local start_ref = grid_ui:held_param_lock("loop_start") or self.param_value_or("loop_start", 0)
+      grid_ui:set_held_param_lock(lock_id, util.clamp(next_value, math.min(128, start_ref + 1), 128))
     else
       grid_ui:set_held_param_lock(lock_id, next_value)
     end
     self:flash_item_value(param_item)
     self.show_message(self:item_long_name(param_item) .. " lock " .. self:format_item_value(param_item, next_value))
   else
+    -- Track knob: same start<end clamp as the step p-lock above, so turning the
+    -- Sample Start knob can never drag it past Sample End (and vice versa).
+    if lock_id == "loop_start" then
+      next_value = util.clamp(next_value, 0, math.max(0, self.param_value_or("loop_end", 128) - 1))
+    elseif lock_id == "loop_end" then
+      next_value = util.clamp(next_value, math.min(128, self.param_value_or("loop_start", 0) + 1), 128)
+    end
     self:apply_item_value(param_item, next_value)
     self:flash_item_value(param_item)
     self.show_message(self:item_long_name(param_item) .. " " .. self:item_display_value(param_item))

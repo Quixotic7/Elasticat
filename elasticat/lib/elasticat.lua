@@ -966,6 +966,36 @@ elasticat.push_loop_points = function(track, queued)
     tr_call(track, "loopStart", lo)
     tr_call(track, "loopEnd", hi)
   end
+  elasticat.push_chop_regions(track, params:get(sid), params:get(eid), queued)
+end
+
+-- CHOPPED "domino" model (owner): the chopped synth needs TWO regions the shared
+-- loop-folded region can't express -- the RANGE as the slice AREA (the audio, cut
+-- into SLCS slices) and the raw TRACK loop as the PLAYHEAD WINDOW (which of those
+-- slices fire). loop_start_raw/loop_end_raw are the track loop in 0-128 (the window
+-- /128); the slice area is map_trim_point(0/128) -- exactly where the full Range
+-- lands in the buffer. Only pushed for a chopped track (mode 3), so no other mode
+-- pays the extra sends. Called from every loop/range/scrub funnel + mode switch.
+elasticat.push_chop_regions = function(track, loop_start_raw, loop_end_raw, queued)
+  track = track or engine_track
+  if elasticat.track_param_value(track, "mode") ~= 3 then
+    return
+  end
+  local play_lo = util.clamp(loop_start_raw or 0, 0, 128) / 128
+  local play_hi = util.clamp(loop_end_raw or 128, 0, 128) / 128
+  local range_start = map_trim_point(0, track)
+  local range_end = map_trim_point(128, track)
+  if queued then
+    elasticat.tr_queue("chopPlayLo:" .. track, track, "chopPlayLo", play_lo)
+    elasticat.tr_queue("chopPlayHi:" .. track, track, "chopPlayHi", play_hi)
+    elasticat.tr_queue("chopRangeStart:" .. track, track, "chopRangeStart", range_start)
+    elasticat.tr_queue("chopRangeEnd:" .. track, track, "chopRangeEnd", range_end)
+  else
+    tr_call(track, "chopPlayLo", play_lo)
+    tr_call(track, "chopPlayHi", play_hi)
+    tr_call(track, "chopRangeStart", range_start)
+    tr_call(track, "chopRangeEnd", range_end)
+  end
 end
 
 -- Per-track E-SNC (Range End Sync) state: the range_start value BEFORE the
@@ -2137,6 +2167,10 @@ function elasticat.set_loop_region(start_point, end_point, reset_playhead, track
   flush_engine_sends()
   local engine_start = map_trim_point(start_point, track)
   local engine_end = map_trim_point(end_point, track)
+  -- Chopped domino: the scrubbed/locked TRACK loop is the playhead window; refresh
+  -- it (and the range slice area) alongside the shared region send. No-op unless
+  -- this track is chopped.
+  elasticat.push_chop_regions(track, start_point, end_point, false)
   -- nil = leave the playhead; a number = that phase; any other truthy = 0.
   -- `false` must mean "leave it" -- `reset_playhead ~= nil` would have warped
   -- to 0 on an explicit false.
@@ -2577,10 +2611,15 @@ function elasticat.params(options)
       tr_call(1, "loopEnd", map_trim_point(params:get(ids.loop_end), 1))
     elseif mode == 3 then
       push("chop_steps", "chopSteps")
+      push("chop_slice_len", "chopSliceLen")
       push("chop_loop_mode", "chopLoopMode", -1)
       push("chop_attack", "chopAttack")
       push("chop_hold", "chopHold")
       push("chop_release", "chopRelease")
+      -- Domino model: the slice area (Range) + playhead window (raw Track loop). The
+      -- new chopped synth starts on defaults (full range, full window), so push the
+      -- real regions or it slices the whole buffer with an all-slices playhead.
+      elasticat.push_chop_regions(1, params:get(ids.loop_start), params:get(ids.loop_end), false)
     elseif mode == 4 then
       push("grain_size", "grainSize")
       push("grain_density", "grainDensity")
@@ -3157,11 +3196,21 @@ function elasticat.params(options)
 
   params:add_group(param_id(prefix, "group_engine_modes"), "engine algorithms", 24)
 
-  add_control(param_id(prefix, "chop_steps"), "chop steps",
-    cs.new(0.05, 16, "lin", 0.05, 1, "steps", 0.05 / 15.95),
+  add_control(param_id(prefix, "chop_steps"), "chop slices",
+    cs.new(1, 64, "lin", 1, 16, "slices", 1 / 63),
     function(x) elasticat.tr_queue(param_id(prefix, "chop_steps"), 1, "chopSteps", x) end)
 
-  params:add_option(param_id(prefix, "chop_loop_mode"), "chop loop mode", {"forward stop", "loop forward", "ping pong"}, 1)
+  -- SLEN: how many steps (a step = a 16th) each slice plays before advancing to the
+  -- next. With LOOP=loop the slice loops-to-fill its slot -> clean beat-repeat. This
+  -- is independent of chop_steps (which sets how finely the region is cut).
+  add_control(param_id(prefix, "chop_slice_len"), "chop slice length",
+    cs.new(0.05, 32, "lin", 0.05, 1, "steps", 0.05 / 31.95),
+    function(x) elasticat.tr_queue(param_id(prefix, "chop_slice_len"), 1, "chopSliceLen", x) end)
+
+  -- 8 loop modes = the 4 base modes x forward/reverse SLICE READ. The engine
+  -- decodes: loopMode = floor(index/2), sliceReverse = index%2 (see \elasticatChopped).
+  params:add_option(param_id(prefix, "chop_loop_mode"), "chop loop mode",
+    {"chop", "chop rev", "loop", "loop rev", "ping pong", "ping pong rev", "runaway", "runaway rev"}, 3)
   params:set_action(param_id(prefix, "chop_loop_mode"), function(x) tr_call(1, "chopLoopMode", x - 1) end)
 
   add_control(param_id(prefix, "chop_attack"), "chop attack",
@@ -3169,10 +3218,9 @@ function elasticat.params(options)
     function(x) elasticat.tr_queue(param_id(prefix, "chop_attack"), 1, "chopAttack", x) end,
     format_ms)
 
-  add_control(param_id(prefix, "chop_hold"), "chop hold",
-    cs.new(0, 0.5, "lin", 0.001, 0.04, "s", 0.001 / 0.5),
-    function(x) elasticat.tr_queue(param_id(prefix, "chop_hold"), 1, "chopHold", x) end,
-    format_ms)
+  add_control(param_id(prefix, "chop_hold"), "chop gate",
+    cs.new(0, 1, "lin", 0.01, 0.9, "", 0.01),
+    function(x) elasticat.tr_queue(param_id(prefix, "chop_hold"), 1, "chopHold", x) end)
 
   add_control(param_id(prefix, "chop_release"), "chop release",
     cs.new(0.0001, 0.2, "lin", 0.0001, 0.01, "s", 0.0005 / 0.1999),
@@ -3253,8 +3301,11 @@ function elasticat.params(options)
     cs.new(16, 8192, "exp", 1, 600, "smp", 1 / 8176),
     function(x) elasticat.tr_queue(param_id(prefix, "wt_cycle"), 1, "wtCycle", x) end)
 
+  -- LFO rate reaches AUDIO rates (up to 8 kHz) so the morph LFO can FM/AM the
+  -- wavetable. Raw knob sweeps coarsely (fun for audio-rate sweeps); FN snaps to
+  -- musical LFO + audio rates for precision.
   add_control(param_id(prefix, "wt_lfo_rate"), "wavetable LFO rate",
-    cs.new(0, 20, "lin", 0.01, 0, "Hz", 0.01 / 20),
+    cs.new(0, 8000, "lin", 0.001, 0, "Hz", 0.001 / 8000),
     function(x) elasticat.tr_queue(param_id(prefix, "wt_lfo_rate"), 1, "wtLfoRate", x) end)
 
   -- Signed 0-128 depth (64 = off): 128 sweeps MORF up to 1.0, 0 sweeps it to 0.0.

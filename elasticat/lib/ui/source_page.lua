@@ -28,6 +28,7 @@ function SourcePage.new(opts)
     draw_page_header = opts.draw_page_header,
     active_waveform = opts.active_waveform,
     active_region = opts.active_region,
+    active_region_override = opts.active_region_override,
     active_range = opts.active_range,
     get_playing = opts.get_playing,
     display_phase = opts.display_phase,
@@ -269,16 +270,26 @@ function SourcePage:draw_waveform(opts)
     active_hi = math.min(1, active_lo + 0.001)
   end
 
+  -- The ACTIVE LOOP region (loop_start/loop_end, resolved: base track / a held loop-
+  -- key area / the firing step's p-lock). 0-128 spans the range VIEW exactly like the
+  -- markers (draw_waveform_marker), so it maps through [active_lo, active_hi]. On the
+  -- loop machine page this is SHADED bright inside the range view (below); the START/
+  -- END markers meanwhile stay at the stable loop_start/loop_end (they don't sweep).
+  local aloop_start, aloop_end = 0, 128
+  if self.active_region ~= nil then aloop_start, aloop_end = self.active_region() end
+
   local view_lo, view_hi
   if opts.sample_edit then
     view_lo, view_hi = 0, 1
   elseif opts.range_edit then
     view_lo, view_hi = trim_lo, trim_hi
   elseif opts.show_slices then
-    -- Slice machine: show the WHOLE trim window (all slices) at all times -- the
-    -- active slice is highlighted IN the waveform (below), so the view never
-    -- zooms to a single slice or sweeps markers around (owner).
-    view_lo, view_hi = trim_lo, trim_hi
+    -- Slice machines -- grid divisions AND razor points -- fold their 0-128 points
+    -- through the RANGE in the engine (trigger_slice -> map_trim_point), so the page
+    -- shows the SAME range window as the loop machine and the slices fill it: what
+    -- you see lines up with what each slice plays. Razor is identical, it just lets
+    -- you place the points by hand (a razor FN-zoom narrows this further, below).
+    view_lo, view_hi = active_lo, active_hi
   else
     -- Main view follows the Actual Range so the shown slice re-renders with a
     -- sequenced sweep.
@@ -311,11 +322,13 @@ function SourcePage:draw_waveform(opts)
     if (machine == 4 or machine == 6) and (snap == 2 or snap == 5) and focus_pos ~= nil then
       -- ~4x tighter than the File-page sample zoom (owner): a razor edit wants a
       -- close look at the transient, so target ~10% of the sample (min 1%) rather
-      -- than 40%. Short drum loops previously pinned at the 0.4 ceiling.
+      -- than 40%. Short drum loops previously pinned at the 0.4 ceiling. Focus and
+      -- bounds fold through the RANGE (same as point_to_col below), so the magnifier
+      -- stays inside the range window the page now shows.
       local zoom_span = util.clamp(1.0 / duration, 0.01, 0.1)
-      local focus_frac = range_to_frac(focus_pos)
-      view_lo = util.clamp(focus_frac - (zoom_span / 2), trim_lo, math.max(trim_lo, trim_hi - zoom_span))
-      view_hi = util.clamp(view_lo + zoom_span, view_lo + 0.001, trim_hi)
+      local focus_frac = active_lo + ((active_hi - active_lo) * (util.clamp(focus_pos, 0, 128) / 128))
+      view_lo = util.clamp(focus_frac - (zoom_span / 2), active_lo, math.max(active_lo, active_hi - zoom_span))
+      view_hi = util.clamp(view_lo + zoom_span, view_lo + 0.001, active_hi)
     end
   end
 
@@ -348,6 +361,23 @@ function SourcePage:draw_waveform(opts)
   local shade_lo, shade_hi = active_lo, active_hi
   if opts.sample_edit then
     shade_lo, shade_hi = trim_lo, trim_hi
+  elseif not opts.range_edit and not opts.show_slices then
+    -- Loop machine page: the whole view IS the range; shade only the loop region (a
+    -- sub-window of the range) bright, the rest of the range dim. DEFAULT = the LIVE
+    -- loop_start/loop_end (so it updates as you turn the knobs, matching the markers);
+    -- an active OVERRIDE -- a held loop-key or a firing step region -- shades
+    -- active_region() instead (base_region() lags the live knob, so it can't be the
+    -- default here). lo/hi are 0-128 of the view -> map through [active_lo, active_hi].
+    local lo = self.visual_param_value("loop_start", 0)
+    local hi = self.visual_param_value("loop_end", 128)
+    if (self.active_region_override ~= nil and self.active_region_override())
+      or (self.get_playing ~= nil and self.get_playing()) then
+      lo, hi = aloop_start, aloop_end
+    end
+    local span = active_hi - active_lo
+    shade_lo = active_lo + (span * (util.clamp(lo, 0, 128) / 128))
+    shade_hi = active_lo + (span * (util.clamp(hi, 0, 128) / 128))
+    if shade_hi <= shade_lo then shade_hi = math.min(1, shade_lo + 0.001) end
   end
 
   -- Slice machine: the ACTIVE slice's waveform is shaded bright (the highlight),
@@ -361,12 +391,12 @@ function SourcePage:draw_waveform(opts)
     local slice_active = self.active_slices ~= nil and self.active_slices() or {}
     slice_ranges = {}
     bright_col = {}
-    -- A slice boundary (0-128) -> screen column THROUGH the current view, so a
-    -- Razor-Zoom sub-window magnifies the boundaries with the waveform. Un-zoomed
-    -- (view = trim window) this is exactly (pos/128)*width, so the normal render
-    -- is byte-for-byte unchanged.
+    -- A slice boundary (0-128) -> screen column. Fold it through the RANGE, exactly
+    -- like the engine's map_trim_point folds the audio, so each drawn boundary sits
+    -- where the slice actually sounds (grid divisions AND razor points). With view =
+    -- the range this is pos/128 * width; a razor FN-zoom sub-window magnifies it.
     local function point_to_col(pos)
-      local frac = range_to_frac(pos)
+      local frac = active_lo + ((active_hi - active_lo) * (util.clamp(pos, 0, 128) / 128))
       return ((frac - view_lo) / math.max(1e-9, view_hi - view_lo)) * width
     end
     for s = 1, slice_count do
@@ -495,17 +525,13 @@ function SourcePage:draw_waveform(opts)
     self:draw_marker_pair(marker_range_lo, marker_range_hi, view_lo, view_hi, x0, y0, width, height)
   else
     screen.level(9)
-    -- Base-value model (docs/BASE_VALUE_RESOLVER.md): during playback the start/
-    -- end markers follow the RESOLVED active region (a firing step region p-lock,
-    -- or the live scrub) -- start_point/end_point are already what the playhead
-    -- rides -- so you see where the loop ACTUALLY is. Stopped (incl. a held-step
-    -- preview), visual_param_value shows the stored / held-lock points.
-    local mark_start, mark_end = visual_start, visual_end
-    if self.get_playing ~= nil and self.get_playing() then
-      mark_start, mark_end = start_point, end_point
-    end
-    self:draw_waveform_marker(mark_start, x0, y0, width, height, "start")
-    self:draw_waveform_marker(mark_end, x0, y0, width, height, "end")
+    -- Markers STAY at the track loop_start/loop_end (visual_param_value shows a
+    -- held-step lock while editing a step); they do NOT sweep during playback. The
+    -- moving active region (firing-step p-lock / held loop-key) is shown by the
+    -- bright SHADE within the range view instead (owner). start_point/end_point (the
+    -- resolved active region) still drives the playhead marker below.
+    self:draw_waveform_marker(visual_start, x0, y0, width, height, "start")
+    self:draw_waveform_marker(visual_end, x0, y0, width, height, "end")
 
     -- Only show the playhead while the transport is actually playing. While
     -- stopped (incl. a held-step preview) it would sit static and misleading.

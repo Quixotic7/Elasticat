@@ -16,9 +16,9 @@ function Machine.source_items(Item)
     -- row. CHOK is the per-slice choke group (MPC mute group, None = off), a
     -- pseudo that edits the held/selected slice -- not a track param.
     Item.item("slice_count", "CNT", {lockable = true, min = 1, max = 32, step = 1, snaps = {1, 2, 4, 8, 16, 32}}),
-    Item.item("slice_reverse", "REV", {lockable = true, binary = true, min = 0, max = 1, step = 1}),
     Item.item("slice_choke", "CHOK", {pseudo = "slice_choke", lockable = false, min = 0, max = 8, step = 1}),
-    Item.blank()
+    Item.blank(),
+    Item.item("slice_reverse", "REV", {lockable = true, binary = true, min = 0, max = 1, step = 1})
   }
 end
 

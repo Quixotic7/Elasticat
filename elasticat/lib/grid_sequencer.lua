@@ -1849,6 +1849,17 @@ function GridSequencer:active_region()
   return self:base_region()
 end
 
+-- True iff a HELD LOOP-KEY (manual_region) is overriding the base loop. The source-
+-- page waveform shade uses this to shade the held loop area; with no held loop-key
+-- (and not playing) the shade follows the LIVE loop_start/loop_end, matching the
+-- markers, so it updates as you turn the knobs. NOTE: current_region_start (the
+-- firing-step region) is deliberately NOT included -- it persists after the transport
+-- stops, which made a stopped edit keep shading the stale played region. The playback
+-- case is covered by get_playing() in the source page instead.
+function GridSequencer:region_is_override()
+  return self.manual_region ~= nil
+end
+
 function GridSequencer:handle_page_step(x)
   if self.page_mode == "select" then
     self.selected_page = x

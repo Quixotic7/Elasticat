@@ -90,6 +90,21 @@ local page_model = {
           {project_row = "new", short = "NEW PROJECT"},
           item("project_auto_name", "AUTO-NAME", {options = 3})
         }
+      },
+      {
+        -- Page 3: AUDIO INTERFACE (JACK buffer headroom). Action-button rows
+        -- (`audio_row` markers, mirroring PROJECT's `project_row`) that drive
+        -- lib/audio_buffer.lua via util/set-audio-buffer.sh: STATUS shows the
+        -- live/next buffer; DEFAULT/HEADROOM/MAX set -p 128/256/512 (reversible,
+        -- applied on the next SLEEP->wake). Handled in invoke_project_settings_
+        -- action() + draw_settings_page() + settings_delta_value() in elasticat.lua.
+        title = "AUDIO INTERFACE",
+        items = {
+          {audio_row = "status", short = "JACK BUFFER"},
+          {audio_row = "buf_128", short = "DEFAULT (128)"},
+          {audio_row = "buf_256", short = "HEADROOM (256)"},
+          {audio_row = "buf_512", short = "MAX (512)"}
+        }
       }
     }
   },

@@ -2453,8 +2453,8 @@ local function settings_delta_value(delta)
   -- confirming an action row is K3's job (see key(n,z)'s settings-layer
   -- branch). Falling through to item_raw_value below would error: those rows
   -- have no `.id`, so `params:lookup_param` would be handed a nil suffix.
-  if param_item.project_row ~= nil or param_item.razor_action ~= nil then
-    return   -- action rows (Load/Save, Redistribute/Auto-Chop): no value to edit
+  if param_item.project_row ~= nil or param_item.razor_action ~= nil or param_item.audio_row ~= nil then
+    return   -- action rows (Load/Save, Redistribute/Auto-Chop, audio buffer): no value to edit
   end
   local current = param_values:item_raw_value(param_item)
   elasticat.undo_record_param(param_item)
@@ -2699,6 +2699,11 @@ local source_page = SourcePage.new({
   draw_page_header = draw_page_header,
   active_waveform = active_waveform,
   active_region = active_region,
+  -- True while a held loop-key / firing-step region is OVERRIDING the base loop, so
+  -- the waveform shade knows when to follow active_region() vs the live loop knobs.
+  active_region_override = function()
+    return grid_ui ~= nil and grid_ui.region_is_override ~= nil and grid_ui:region_is_override()
+  end,
   active_range = function() return elasticat.active_range() end,
   get_playing = function() return playing end,
   display_phase = elasticat.display_phase,
@@ -2855,6 +2860,11 @@ local function draw_root_page()
   page_render:draw(nav:current_category(), page_index, items, nav:clamp_current_group())
 end
 
+-- JACK buffer control for the AUDIO INTERFACE settings page (master page 3).
+-- On the module table, not a file local (elasticat.lua is at LuaJIT's 200-local
+-- ceiling -- see [[elasticat-luajit-limits-and-param-guard]]).
+elasticat.AudioBuffer = include("lib/audio_buffer")
+
 -- ---- PROJECT settings page (master settings, page 2; PRD §7) --------------
 -- lib/pages/model.lua's master.settings page 2 rows carry a `project_row`
 -- marker (status / load / save / save_as / new) instead of a real param id,
@@ -2875,7 +2885,9 @@ local function project_settings_row_value(param_item)
     end
     local name = project_store:current_name() or "untitled"
     return project_store:is_unsaved() and (name .. " *") or name
-  elseif param_item.project_row ~= nil or param_item.razor_action ~= nil then
+  elseif param_item.audio_row == "status" then
+    return elasticat.AudioBuffer.status_label()
+  elseif param_item.audio_row ~= nil or param_item.project_row ~= nil or param_item.razor_action ~= nil then
     return "[ ]"  -- clickable: press YES / B3 / Right arrow to activate
   end
   return param_values:item_display_value(param_item)
@@ -2888,7 +2900,7 @@ end
 -- 200-local ceiling. See [[elasticat-luajit-limits-and-param-guard]].
 elasticat.action_flash = {}
 elasticat.flash_action = function(param_item)
-  local key = param_item ~= nil and (param_item.razor_action or param_item.project_row) or nil
+  local key = param_item ~= nil and (param_item.razor_action or param_item.project_row or param_item.audio_row) or nil
   if key == nil then
     return
   end
@@ -2900,7 +2912,7 @@ elasticat.flash_action = function(param_item)
   end
 end
 elasticat.action_flashing = function(param_item)
-  local key = param_item ~= nil and (param_item.razor_action or param_item.project_row) or nil
+  local key = param_item ~= nil and (param_item.razor_action or param_item.project_row or param_item.audio_row) or nil
   return key ~= nil and (elasticat.action_flash[key] or 0) > util.time()
 end
 
@@ -2918,7 +2930,13 @@ elasticat.draw_action_checkbox = function(param_item, y, level)
   screen.fill()
   screen.rect(bx + 5, by, 1, 5)
   screen.fill()
-  if elasticat.action_flashing(param_item) then
+  local marked = elasticat.action_flashing(param_item)
+  if not marked and param_item.audio_row ~= nil then
+    -- persistent fill on the buffer choice that boots next (the active target)
+    local period = tonumber((param_item.audio_row):match("buf_(%d+)"))
+    marked = period ~= nil and elasticat.AudioBuffer.is_target(period)
+  end
+  if marked then
     screen.level(15)
     screen.rect(bx + 2, by + 2, 2, 1)
     screen.fill()
@@ -2949,6 +2967,23 @@ local function invoke_project_settings_action(param_item)
     elasticat.recalc_bpm_steps()
     show_message("Recalc BPM/steps")
     elasticat.flash_action(param_item)
+    return true
+  end
+  -- AUDIO INTERFACE rows (master settings page 3): JACK buffer headroom. STATUS
+  -- re-reads + reports; DEFAULT/HEADROOM/MAX set -p 128/256/512 via the helper
+  -- (reversible, applies on the next SLEEP->wake).
+  if param_item.audio_row ~= nil then
+    if param_item.audio_row == "status" then
+      elasticat.AudioBuffer.refresh()
+      show_message("Buffer: " .. elasticat.AudioBuffer.status_label())
+    else
+      local period = tonumber((param_item.audio_row):match("buf_(%d+)"))
+      if period ~= nil then
+        local ok, msg = elasticat.AudioBuffer.apply(period)
+        show_message(ok and ("Buffer " .. msg) or ("Buffer: " .. msg))
+        if ok then elasticat.flash_action(param_item) end
+      end
+    end
     return true
   end
   if param_item.project_row == nil then
@@ -3071,15 +3106,16 @@ local function draw_settings_page()
       screen.move(0, y)
       screen.text(index == selected and ">" or " ")
       screen.move(10, y)
-      if param_item.project_row == "status" then
-        -- The name row shows ONLY the project name (+ unsaved "*"), full
-        -- width -- a "PROJECT" label collided with long names.
+      if param_item.project_row == "status" or param_item.audio_row == "status" then
+        -- The status row shows ONLY its summary (project name, or the live/next
+        -- JACK buffer), full width -- a short label collided with long values.
         screen.text_trim(project_settings_row_value(param_item), 118)
       else
         -- Action rows show a graphical checkbox on the right (fills for ~1s when
-        -- run); their label gets the wide column (fits "NEW PROJECT"). Ordinary
-        -- rows keep room for their value.
+        -- run, or persistently for the active audio-buffer choice); their label
+        -- gets the wide column. Ordinary rows keep room for their value.
         local action_row = param_item.project_row ~= nil or param_item.razor_action ~= nil
+          or param_item.audio_row ~= nil
         screen.text_trim(param_item.short or param_item.id, action_row and 100 or 42)
         if action_row then
           elasticat.draw_action_checkbox(param_item, y, index == selected and 15 or 5)
