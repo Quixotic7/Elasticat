@@ -1,0 +1,6 @@
+# UGen build artifacts. The DISTRIBUTED prebuilt binary (ElasticatUGens.so) IS
+# tracked so `;install` works on a stock norns without a compiler -- the first-run
+# installer (install.lua) copies it into the SuperCollider Extensions dir. Any
+# OTHER .so (a local/experimental build) stays ignored.
+*.so
+!ElasticatUGens.so

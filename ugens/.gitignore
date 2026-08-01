@@ -1,2 +1,0 @@
-# UGen build artifacts (compiled ON the norns, not in git)
-*.so
