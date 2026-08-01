@@ -117,16 +117,16 @@ y8      1    2    3    4    5    6    7    8    9   10   11   12   13   14   15 
 | PATN | `8,5` | **Pattern-load** overlay. Quick tap latches it open (tap again to close); a longer hold is momentary (closes on release). While open, the step row (`y=8`) shows the 16 pattern slots — press one to load it. The Right arrow (`14,7`) renames the current pattern. Hold FN and press this key instead to open the on-screen pattern-quantize menu. |
 | Scene A / Scene B | `9,5` / `16,5` | A/B crossfader scene anchors. Hold one and turn `E2`/`E3` to write that parameter's value into the held scene only (doesn't change what you hear). FN + press captures *every morphable parameter's* current value into that scene at once. |
 | Crossfader glide keys | `10,5` – `15,5` | Six positions spanning A (`10,5`) to B (`15,5`). Holding one eases the crossfade toward that position (~0.3s); tap for a nudge, hold to land there. Release freezes wherever it got to. |
-| Black keys (mini keyboard) | `2,6` `3,6` `5,6` `6,6` `7,6` | C#, D#, F#, G#, A# of the current octave. |
 | YES | `11,6` | Confirm in menus/dialogs (same as norns `K3`). On the FILE page, hold to preview the loaded sample's trim while stopped. |
-| Up arrow | `13,6` | Menu/settings navigation (up), or with PAGE held, selects "Page Select" mode. |
-| FILL | `16,6` | Hold for momentary Fill (drives Fill/!Fill trig conditions); FN + press latches Fill on/off. |
-| White keys (mini keyboard) | `1,7`-`8,7` | C D E F G A B C (one octave + the root of the next). |
 | NO | `11,7` | Cancel in menus/dialogs (same as norns `K2`). |
-| Left arrow | `12,7` | Menu/settings navigation (left/value down), or with PAGE held, selects "Pattern Rate" mode. |
+| Up arrow | `13,6` | Menu/settings navigation (up), or with PAGE held, selects "Page Select" mode. |
 | Down arrow | `13,7` | Menu/settings navigation (down), or with PAGE held, selects "Page Loop" mode. |
+| Left arrow | `12,7` | Menu/settings navigation (left/value down), or with PAGE held, selects "Pattern Rate" mode. |
 | Right arrow | `14,7` | Menu/settings navigation (right/value up/confirm on action rows); with PAGE held, back to "Page Select" mode. While the pattern-load overlay is open, **renames the current pattern**. |
+| FILL | `16,6` | Hold for momentary Fill (drives Fill/!Fill trig conditions); FN + press latches Fill on/off. |
 | PAGE | `16,7` | Hold down to turn the step row into a page-mode overlay: pick which param page plays (Page Select), which pages loop during playback (Page Loop), or the per-page playback rate (Pattern Rate) using the up/left/down arrows above, then tap a step-row key to apply. |
+| Black keys (mini keyboard) | `2,6` `3,6` `5,6` `6,6` `7,6` | C#, D#, F#, G#, A# of the current octave. |
+| White keys (mini keyboard) | `1,7`-`8,7` | C D E F G A B C (one octave + the root of the next). |
 | Step row | row `y=8` | The 16 steps of the current param page. Quick tap = toggle a trig on/off. FN + quick tap = toggle a **ghost** trig (carries state forward without re-triggering). Hold a step, then turn `E2`/`E3` (or press loop/pitch keys) to parameter-lock it. Hold a step + norns `K2`/`K3` clears one lock; hold FN(`K1`) + `K2`/`K3` clears that parameter's locks across the whole pattern. |
 
 ## Copy, clear, and paste
