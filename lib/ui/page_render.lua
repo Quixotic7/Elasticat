@@ -1,0 +1,1272 @@
+-- Elektron-style (Digitakt/Digitone) parameter page renderer for the generic
+-- K2/K3-pair param pages (master/pattern/trig/source-machine/warp/filter/amp/
+-- fx/mod). Replaces the old bare label+value cells with a structured 2x4 cell
+-- grid -- label on top (small/dim), value below (bright), a position bar under
+-- each numeric value -- plus per-category widgets in the unused cell space:
+--   FILTER p1  filter response curve (type/morph, cutoff, res, balance)
+--   FILTER p2  filter envelope sketch (AHR/ADSR, height scaled by DEPTH)
+--   AMP p1     amp envelope sketch (AHR/ADSR)
+--   FX p1      Insert 1 identity banner (active machine name, big type)
+--   FX p2      Send 1/2 identity rows (machine names + level bars)
+--
+-- Pure rendering: values are read through the injected param_values object
+-- (which already resolves held-step p-locks / scene locks / step-lock bases)
+-- and the `value` callback (param_value_or) for settings that aren't page
+-- items (env modes, machine selectors). No engine calls, no param writes.
+--
+-- PERFORMANCE LAW (this script has frozen before -- see draw_waveform's
+-- comment in source_page.lua): screen.level() is set once per *pass*, never
+-- per cell or per pixel. Cells are drawn in level-batched passes (all dim
+-- labels, then all bright labels, ...), and curves are short polylines
+-- (<= N_CURVE+1 points) drawn with move/line + one stroke.
+local LowProfile = include("lib/ui/low_profile")
+
+local PageRender = {}
+PageRender.__index = PageRender
+
+local CELL_W = 32
+local CELL_H = 25
+local ROW_Y = {12, 39}
+
+-- Filter page (owner redesign, elasticat-design-images/filterDesign.png): a
+-- low-profile param row (CUT/RES/MORPH-or-TYPE/DEPTH) over a 42-bar render.
+local FILTER_ROW_Y = 11        -- low-profile cells sit at y=11
+local FILTER_REND_Y = 23       -- bar render region top
+local FILTER_REND_H = 41       -- ... to y=63
+local FILTER_BARS = 42
+local FILTER_BAR_STEP = 3      -- 2px bar + 1px gap; bar i (1..42) at x = 3*i
+-- FILTER ENV page: low-profile params top AND bottom, envelope bars between,
+-- same bar grid/width as the filter render but shorter (y23..y51).
+local FENV_ROW_TOP_Y = 11
+local FENV_ROW_BOTTOM_Y = 53
+local FENV_REND_Y = 23
+local FENV_REND_H = 29
+
+-- FILTER MIX / Mode-Parameter page (owner redesign,
+-- elasticat-design-images/filter_add_page.png): two low-profile rows of 4
+-- compressed near the top, then an FX-style identity banner in the bottom-left.
+local FMIX_ROW_TOP_Y = 11      -- top low-profile row (cells for items 1-4)
+local FMIX_ROW_BOTTOM_Y = 23   -- second low-profile row (items 5-8)
+local FMIX_BANNER_Y = 37       -- Mode-Parameter banner sits below the two rows
+local FMIX_BANNER_W = 96       -- banner block width (owns cells 0-2; trailing = cell 3)
+local FMIX_TRAIL_CELL = 3      -- item 10 (K3 side, e.g. WARP's RATE): bottom-right cell
+local FMIX_TRAIL_Y = 52        -- ... along the very bottom, right of the banner
+
+-- FX slot pages (fx category pages 1/3/4/5): identity-banner label + the
+-- machine-selector param each page's widget reads. Page 2 (SENDS) has its own
+-- widget. Keep in sync with lib/pages/model.lua's fx pages / page_items_for.
+local FX_SLOT_PAGES = {
+  [1] = {label = "INSERT 1", machine = "fx_insert1_machine"},
+  [3] = {label = "SEND 1", machine = "send1_machine"},
+  [4] = {label = "SEND 2", machine = "send2_machine"},
+  [5] = {label = "MASTER", machine = "master_fx_machine"}
+}
+local BAR_W = 28
+local N_CURVE = 22
+
+local floor = math.floor
+local exp = math.exp
+local abs = math.abs
+local max = math.max
+local min = math.min
+
+-- Bipolar 0-128 params (64 = center): their position bar fills from the
+-- middle outward instead of from the left.
+local CENTERED = {
+  pan = true,
+  crossfade = true,
+  filter_morph = true,
+  filter_balance = true,
+  filter_env_depth = true,
+  lfo1_depth = true,
+  lfo2_depth = true,
+  menv_depth = true,
+  wt_lfo_depth = true  -- signed 0-128, 64 = off (fills from centre)
+}
+
+function PageRender.new(opts)
+  opts = opts or {}
+  return setmetatable({
+    param_values = opts.param_values,
+    value = opts.value, -- param_value_or(id, default)
+    -- resolved_value(id) -> the base-value switch output (a firing step p-lock /
+    -- crossfader morph overriding the track value), so the filter curve follows
+    -- what's actually sounding, not the stored track value. Optional -- self:resolved
+    -- falls back to self.value when it is absent (docs/BASE_VALUE_RESOLVER.md).
+    resolved_value = opts.resolved_value,
+    -- display_values(item, raw) -> base_raw, actual_raw, modulated. Splits the
+    -- low-profile cell's two bars (track value vs post-crossfade/macro/mod
+    -- value); defaults to "actual == base" when not injected.
+    display_values = opts.display_values,
+    -- FN held: low-profile cells show their VALUE in the name row (owner).
+    fn_held = opts.fn_held,
+    -- mod_offsets() -> cutoff_offset, res_offset (in param units) from the
+    -- engine's live modulation feed; drives the filter render during playback.
+    mod_offsets = opts.mod_offsets,
+    filter_names = opts.filter_names or {},
+    fx_names = opts.fx_names or {}
+  }, PageRender)
+end
+
+-- Cell index -> top-left corner. Indices past 8 clamp onto the bottom row,
+-- matching the old renderer's behavior for over-long item lists.
+local function cell_pos(i)
+  local col = (i - 1) % 4
+  local row = floor((i - 1) / 4)
+  if row > 1 then
+    row = 1
+  end
+  return col * CELL_W, ROW_Y[row + 1]
+end
+
+local function last_non_blank(items)
+  local last = 0
+  for i = 1, #items do
+    if not items[i].blank then
+      last = i
+    end
+  end
+  return last
+end
+
+-- Which trailing bottom-row cells a category widget occupies, if any.
+-- Returns first cell, last cell, method name.
+function PageRender:widget_span(category, page_index, items)
+  -- AMP p1 and FILTER p2 are drawn by draw_amp_page / draw_filter_env_page
+  -- (full low-profile envelope pages), so they never reach the generic cell
+  -- grid and need no widget span here.
+  if category == "filter" then
+    if page_index == 2 then
+      -- Same direct-editing treatment for the filter envelope; DPTH stays a
+      -- real cell in the bottom row.
+      return 1, 4, "draw_filter_env"
+    end
+    local start = max(last_non_blank(items) + 1, 5)
+    if start > 8 then
+      return nil
+    end
+    if page_index == 1 then
+      return start, 8, "draw_filter_curve"
+    end
+    return nil
+  elseif category == "fx" and FX_SLOT_PAGES[page_index] ~= nil then
+    -- Insert 1 / Send 1 / Send 2 / Master slot pages (fx pages 1/3/4/5) all
+    -- share the identity-banner widget, keyed per page below.
+    local start = max(last_non_blank(items) + 1, 5)
+    if start > 8 then
+      return nil
+    end
+    return start, 8, "draw_fx_slot"
+  elseif category == "fx" and page_index == 2 then
+    return 5, 8, "draw_fx_sends"
+  end
+  return nil
+end
+
+local function in_widget(i, wstart, wend)
+  return wstart ~= nil and i >= wstart and i <= wend
+end
+
+-- A cell is drawn when it has a real item and isn't covered by the widget.
+local function cell_visible(i, item, wstart, wend)
+  return item ~= nil and not item.blank and not in_widget(i, wstart, wend)
+end
+
+-- 0..1 position of an item's raw value inside its min/max range, or nil when
+-- the item has no numeric range to show (options/file items).
+local function item_frac(item, raw)
+  if type(raw) ~= "number" or item.min == nil or item.max == nil
+    or item.options ~= nil or item.max <= item.min then
+    return nil
+  end
+  local frac = (raw - item.min) / (item.max - item.min)
+  if frac < 0 then
+    return 0
+  elseif frac > 1 then
+    return 1
+  end
+  return frac
+end
+
+-- Which cells show a position bar: ranged params always, and LOCKABLE options too
+-- (owner: p-lockable options like the chop LOOP mode get a bar showing their index
+-- across the list). File / blank / non-lockable options get none.
+local function can_bar(item)
+  if item == nil or item.blank or item.file then
+    return false
+  end
+  if item.options ~= nil then
+    return item.lockable == true
+  end
+  return item.min ~= nil and item.max ~= nil
+end
+
+-- 0..1 bar position for a ranged param (value in min..max) OR a lockable option (its
+-- index across the option list). nil when the cell has no bar.
+local function bar_frac(item, raw)
+  if not can_bar(item) or type(raw) ~= "number" then
+    return nil
+  end
+  if item.options ~= nil then
+    local count = type(item.options) == "number" and item.options or #item.options
+    if count <= 1 then
+      return 0
+    end
+    local f = (raw - 1) / (count - 1)
+    return f < 0 and 0 or (f > 1 and 1 or f)
+  end
+  return item_frac(item, raw)
+end
+
+-- Resolve a param value for a widget: prefer the matching page item (so held
+-- p-locks / scene locks show live in the widget geometry), else fall back to
+-- the plain param value.
+function PageRender:item_value(items, id, default)
+  for i = 1, #items do
+    local it = items[i]
+    if it.id == id then
+      local raw = self.param_values:item_raw_value(it)
+      if type(raw) == "number" then
+        return raw
+      end
+      return default
+    end
+  end
+  return self.value(id, default)
+end
+
+-- The RESOLVED base of a selected-track param (docs/BASE_VALUE_RESOLVER.md): what
+-- a firing step p-lock / morph is actually sending. Falls back to the plain param
+-- value when the resolver is not wired (older callers, tests).
+function PageRender:resolved(id, default)
+  if self.resolved_value ~= nil then
+    local v = self.resolved_value(id)
+    if type(v) == "number" then
+      return v
+    end
+  end
+  return self.value(id, default)
+end
+
+-- Draw a cell value. Short strings go to screen.text() rather than
+-- screen.text_trim(): on hardware a 1-character value ("1", "2" -- the
+-- non-fractional pattern rates) rendered BLANK through text_trim while longer
+-- ones ("1/2", "11/6", "16") drew fine, so the trim path evidently eats a
+-- string it never needed to shorten. Anything this short cannot exceed BAR_W
+-- at the cell font, so trimming has nothing to do -- skipping it is free and
+-- removes the dependency on that behaviour. Longer values keep the trim.
+local VALUE_NO_TRIM_CHARS = 4
+
+local function draw_cell_value(text, w)
+  local s = tostring(text or "")
+  if s == "" then
+    return
+  end
+  if #s <= VALUE_NO_TRIM_CHARS then
+    screen.text(s)
+  else
+    screen.text_trim(s, w)
+  end
+end
+
+-- Faint Elektron-style cell frame: one horizontal divider between the rows,
+-- vertical dividers between columns. Bottom-row dividers inside the widget
+-- region are skipped so the widget gets an unbroken canvas.
+function PageRender:draw_cells(items, wstart, wend, sel_lo, sel_hi)
+  local pv = self.param_values
+
+  -- Pass 1: labels, unselected (dim).
+  screen.level(3)
+  for i = 1, #items do
+    local it = items[i]
+    if cell_visible(i, it, wstart, wend) and (i < sel_lo or i > sel_hi) then
+      local x, y = cell_pos(i)
+      screen.move(x + 2, y + 7)
+      screen.text(string.sub(it.short or it.id or "", 1, 6))
+    end
+  end
+
+  -- Pass 2: labels, selected pair (bright).
+  screen.level(10)
+  for i = sel_lo, sel_hi do
+    local it = items[i]
+    if cell_visible(i, it, wstart, wend) then
+      local x, y = cell_pos(i)
+      screen.move(x + 2, y + 7)
+      screen.text(string.sub(it.short or it.id or "", 1, 6))
+    end
+  end
+
+  -- Pass 3: values, unselected (mid).
+  screen.level(8)
+  for i = 1, #items do
+    local it = items[i]
+    if cell_visible(i, it, wstart, wend) and (i < sel_lo or i > sel_hi) then
+      local x, y = cell_pos(i)
+      screen.move(x + 2, y + 15)
+      draw_cell_value(pv:item_display_value(it), BAR_W)
+    end
+  end
+
+  -- Pass 4: values, selected pair (full bright).
+  screen.level(15)
+  for i = sel_lo, sel_hi do
+    local it = items[i]
+    if cell_visible(i, it, wstart, wend) then
+      local x, y = cell_pos(i)
+      screen.move(x + 2, y + 15)
+      draw_cell_value(pv:item_display_value(it), BAR_W)
+    end
+  end
+
+  -- Pass 5: position-bar tracks for every ranged item + lockable option.
+  screen.level(1)
+  for i = 1, #items do
+    local it = items[i]
+    if cell_visible(i, it, wstart, wend) and can_bar(it) then
+      local x, y = cell_pos(i)
+      screen.rect(x + 2, y + 19, BAR_W, 2)
+    end
+  end
+  screen.fill()
+
+  -- Passes 6/7: bar fills (unselected mid, selected bright). Centered params
+  -- fill from the middle outward, everything else from the left.
+  for pass = 1, 2 do
+    screen.level(pass == 1 and 6 or 15)
+    for i = 1, #items do
+      local it = items[i]
+      local selected = i >= sel_lo and i <= sel_hi
+      if cell_visible(i, it, wstart, wend)
+        and ((pass == 1 and not selected) or (pass == 2 and selected)) then
+        local frac = bar_frac(it, pv:item_raw_value(it))
+        if frac ~= nil then
+          local x, y = cell_pos(i)
+          if CENTERED[it.id] then
+            local xc = x + 2 + floor(BAR_W / 2)
+            local len = floor((frac - 0.5) * BAR_W + 0.5)
+            if len >= 0 then
+              screen.rect(xc, y + 19, max(len, 1), 2)
+            else
+              screen.rect(xc + len, y + 19, -len, 2)
+            end
+          elseif frac > 0 then
+            screen.rect(x + 2, y + 19, max(1, floor(frac * BAR_W + 0.5)), 2)
+          end
+        end
+      end
+    end
+    screen.fill()
+  end
+
+  -- Passes A/B: ACTUAL (post-mod) 1px bar directly under the value bar, for every
+  -- p-LOCKABLE cell -- ranged params AND lockable options (owner: the chop LOOP p-lock
+  -- must move this bar too). Shows the crossfade / macro / modulation / firing-step
+  -- value like the low-profile ACTUAL bar -- dim normally, bright when selected OR
+  -- actively moving. Non-lockable cells keep only the value bar. (For an option the
+  -- override is destructive, so base == actual and it rides the value bar; that's
+  -- fine -- it still visibly tracks the firing lock.) Two level-batched passes.
+  if self.display_values ~= nil then
+    for pass = 1, 2 do
+      screen.level(pass == 1 and 3 or 12)
+      for i = 1, #items do
+        local it = items[i]
+        if cell_visible(i, it, wstart, wend) and it.lockable == true and can_bar(it) then
+          local _, actual_raw, modulated = self.display_values(it, pv:item_raw_value(it))
+          local bright = (i >= sel_lo and i <= sel_hi) or modulated
+          if (pass == 1 and not bright) or (pass == 2 and bright) then
+            local frac = bar_frac(it, actual_raw)
+            if frac ~= nil then
+              local x, y = cell_pos(i)
+              if CENTERED[it.id] then
+                local xc = x + 2 + floor(BAR_W / 2)
+                local len = floor((frac - 0.5) * BAR_W + 0.5)
+                if len >= 0 then
+                  screen.rect(xc, y + 21, max(len, 1), 1)
+                else
+                  screen.rect(xc + len, y + 21, -len, 1)
+                end
+              elseif frac > 0 then
+                screen.rect(x + 2, y + 21, max(1, floor(frac * BAR_W + 0.5)), 1)
+              end
+            end
+          end
+        end
+      end
+      screen.fill()
+    end
+  end
+
+  -- Pass 8: held p-lock / scene-lock: invert the label chip (the same "this
+  -- param is locked" cue the old cells gave via a brighter label).
+  screen.level(12)
+  local any_locked = false
+  for i = 1, #items do
+    local it = items[i]
+    if cell_visible(i, it, wstart, wend) and pv:item_locked(it) then
+      local x, y = cell_pos(i)
+      screen.rect(x, y, CELL_W - 1, 9)
+      any_locked = true
+    end
+  end
+  if any_locked then
+    screen.fill()
+    screen.level(0)
+    for i = 1, #items do
+      local it = items[i]
+      if cell_visible(i, it, wstart, wend) and pv:item_locked(it) then
+        local x, y = cell_pos(i)
+        screen.move(x + 2, y + 7)
+        screen.text(string.sub(it.short or it.id or "", 1, 6))
+      end
+    end
+  end
+
+  -- Pass 9: momentary edit flash -- invert the value chip of the item that
+  -- just changed (refines the old flash, which only source pages surfaced).
+  screen.level(15)
+  local any_flash = false
+  for i = 1, #items do
+    local it = items[i]
+    if cell_visible(i, it, wstart, wend) and pv:item_value_flashing(it) then
+      local x, y = cell_pos(i)
+      screen.rect(x, y + 8, CELL_W - 1, 9)
+      any_flash = true
+    end
+  end
+  if any_flash then
+    screen.fill()
+    screen.level(0)
+    for i = 1, #items do
+      local it = items[i]
+      if cell_visible(i, it, wstart, wend) and pv:item_value_flashing(it) then
+        local x, y = cell_pos(i)
+        screen.move(x + 2, y + 15)
+        draw_cell_value(pv:item_display_value(it), BAR_W)
+      end
+    end
+  end
+end
+
+-- Mark the selected K2/K3 pair with upper-left and lower-right corner
+-- brackets (the original selection language of the script -- owner spec; no
+-- boxes). Dimmed when the pair holds nothing editable so the cursor position
+-- is still visible without shouting. A pair fully inside a widget draws no
+-- corners at all: the widget shows its own selection (envelope stage markers).
+function PageRender:draw_selection(items, sel_lo, wstart, wend)
+  local first = items[sel_lo]
+  local second = items[sel_lo + 1]
+  if first == nil and second == nil then
+    return
+  end
+  if in_widget(sel_lo, wstart, wend) and in_widget(sel_lo + 1, wstart, wend) then
+    return
+  end
+  local x, y = cell_pos(sel_lo)
+  local span = 1
+  if second ~= nil and not (in_widget(sel_lo + 1, wstart, wend) and not in_widget(sel_lo, wstart, wend)) then
+    span = 2
+  end
+  local editable = (first ~= nil and not first.blank and not in_widget(sel_lo, wstart, wend))
+    or (second ~= nil and not second.blank and not in_widget(sel_lo + 1, wstart, wend))
+  screen.level(editable and 10 or 3)
+  local x2 = x + (span * CELL_W) - 2
+  local y2 = y + CELL_H - 3
+  -- upper-left corner
+  screen.rect(x, y - 1, 4, 1)
+  screen.rect(x, y - 1, 1, 4)
+  -- lower-right corner
+  screen.rect(x2 - 3, y2, 4, 1)
+  screen.rect(x2, y2 - 3, 1, 4)
+  screen.fill()
+end
+
+-- ---- Widgets ---------------------------------------------------------------
+
+-- Shared envelope polyline. `ybase`/`ytop` may be inverted (ytop below ybase)
+-- to draw a negative-depth filter envelope hanging downward. AHR treats
+-- hold/release >= 128 as INF (flat to the end of the widget), matching the
+-- "INF" the value cells display. Returns a table of stage vertex positions
+-- ({attack/decay/sustain/hold/release} -> {x, y}) so the caller can mark the
+-- stage(s) the selected K2/K3 pair is editing (direct envelope editing).
+function PageRender:draw_env_shape(x0, w, mode, a, d, s, hd, r, ybase, ytop)
+  local xl = x0 + 3
+  local xr = x0 + w - 3
+  local span = xr - xl
+  local pts = {}
+  screen.level(10)
+  screen.move(xl, ybase)
+  if mode == 1 then -- ADSR
+    local wa = 2 + (a / 127) * span * 0.22
+    local wd = 2 + (d / 127) * span * 0.22
+    local ws = span * 0.2
+    local ys = ybase + (ytop - ybase) * (s / 127)
+    local x1 = xl + wa
+    screen.line(x1, ytop)
+    pts.attack = {x1, ytop}
+    -- one midpoint eases the decay/release into an exp-ish curve
+    screen.line(min(x1 + wd * 0.4, xr), ytop + (ys - ytop) * 0.7)
+    screen.line(min(x1 + wd, xr), ys)
+    pts.decay = {min(x1 + wd, xr), ys}
+    local x2 = min(x1 + wd + ws, xr - 2)
+    screen.line(x2, ys)
+    pts.sustain = {x2, ys}
+    if r >= 128 then
+      screen.line(xr, ys)
+      pts.release = {xr, ys}
+    else
+      local wr = 2 + (r / 127) * span * 0.22
+      screen.line(min(x2 + wr * 0.4, xr), ys + (ybase - ys) * 0.7)
+      screen.line(min(x2 + wr, xr), ybase)
+      pts.release = {min(x2 + wr, xr), ybase}
+      screen.line(xr, ybase)
+    end
+  else -- AHR
+    local wa = 2 + (a / 127) * span * 0.3
+    local x1 = xl + wa
+    screen.line(x1, ytop)
+    pts.attack = {x1, ytop}
+    if hd >= 128 then
+      screen.line(xr, ytop)
+      pts.hold = {xr, ytop}
+      pts.release = {xr, ytop}
+    else
+      local x2 = min(x1 + 1 + (hd / 128) * span * 0.3, xr - 1)
+      screen.line(x2, ytop)
+      pts.hold = {x2, ytop}
+      if r >= 128 then
+        screen.line(xr, ytop)
+        pts.release = {xr, ytop}
+      else
+        local wr = 2 + (r / 128) * span * 0.34
+        screen.line(min(x2 + wr * 0.4, xr), ytop + (ybase - ytop) * 0.75)
+        screen.line(min(x2 + wr, xr), ybase)
+        pts.release = {min(x2 + wr, xr), ybase}
+        screen.line(xr, ybase)
+      end
+    end
+  end
+  screen.stroke()
+  return pts
+end
+
+-- Direct envelope editing (owner spec): the env param cells are hidden -- the
+-- envelope drawing IS the page. Mark the stage vertex each selected param is
+-- editing: a dim vertical hairline down to the baseline plus a bright 3x3
+-- handle on the vertex. `id_to_stage` strips the param family prefix so one
+-- mapper serves both the amp env (env_*) and the filter env (filter_env_*).
+local ENV_STAGE = {attack = true, decay = true, sustain = true, hold = true, release = true}
+local function id_to_stage(id)
+  if id == nil then
+    return nil
+  end
+  local stage = id:gsub("^filter_env_", ""):gsub("^menv_", ""):gsub("^env_", "")
+  return ENV_STAGE[stage] and stage or nil
+end
+
+function PageRender:draw_env_stage_markers(pts, items, sel_lo, y0, h)
+  -- Dim handles on every stage vertex, so the grabbable points read as such.
+  screen.level(4)
+  for _, p in pairs(pts) do
+    screen.rect(p[1] - 1, p[2] - 1, 2, 2)
+  end
+  screen.fill()
+  -- Bright handles + hairlines on the stage(s) the selected pair edits.
+  for i = sel_lo, sel_lo + 1 do
+    local it = items[i]
+    local stage = it ~= nil and id_to_stage(it.id) or nil
+    local p = stage ~= nil and pts[stage] or nil
+    if p ~= nil then
+      screen.level(4)
+      screen.rect(p[1], y0 + 2, 1, h - 4)
+      screen.fill()
+      screen.level(15)
+      screen.rect(p[1] - 1, p[2] - 1, 3, 3)
+      screen.fill()
+    end
+  end
+end
+
+function PageRender:draw_amp_env(x0, y0, w, h, items, page_index, sel_lo)
+  local mode = floor(self.value("env_mode", 2) + 0.5)
+  local pts = self:draw_env_shape(x0, w, mode,
+    self:item_value(items, "env_attack", 0),
+    self:item_value(items, "env_decay", 0),
+    self:item_value(items, "env_sustain", 127),
+    self:item_value(items, "env_hold", 0),
+    self:item_value(items, "env_release", 0),
+    y0 + h - 3, y0 + 4)
+  self:draw_env_stage_markers(pts, items, sel_lo or 1, y0, h)
+  screen.level(3)
+  screen.move(x0 + w - 2, y0 + 7)
+  screen.text_right(mode == 1 and "ADSR" or "AHR")
+end
+
+function PageRender:draw_filter_env(x0, y0, w, h, items, page_index, sel_lo)
+  local mode = floor(self.value("filter_env_mode", 2) + 0.5)
+  local depth = (self:item_value(items, "filter_env_depth", 64) - 64) / 64
+  local amp = max(3, abs(depth) * (h - 9))
+  local ybase, ytop
+  if depth >= 0 then
+    ybase = y0 + h - 3
+    ytop = ybase - amp
+  else
+    -- negative depth: envelope hangs downward from a top baseline
+    ybase = y0 + 9
+    ytop = min(ybase + amp, y0 + h - 2)
+  end
+  local pts = self:draw_env_shape(x0, w, mode,
+    self:item_value(items, "filter_env_attack", 0),
+    self:item_value(items, "filter_env_decay", 0),
+    self:item_value(items, "filter_env_sustain", 127),
+    self:item_value(items, "filter_env_hold", 0),
+    self:item_value(items, "filter_env_release", 0),
+    ybase, ytop)
+  self:draw_env_stage_markers(pts, items, sel_lo or 1, y0, h)
+  screen.level(3)
+  screen.move(x0 + w - 2, y0 + 7)
+  screen.text_right((depth < 0 and "-" or "") .. (mode == 1 and "ADSR" or "AHR"))
+end
+
+-- Filter magnitude-response shapes (sketches, not measurements): unity band,
+-- rolloff past cutoff, resonance as a gaussian bump at the cutoff.
+local function resp_lp(u, fc, q)
+  local d = u - fc
+  local base = d <= 0 and 1 or (1 - d * 3.5)
+  if base < 0 then
+    base = 0
+  end
+  return base + q * 1.05 * exp(-(d * d) / 0.005)
+end
+
+local function resp_notch(u, fc, q)
+  local d = u - fc
+  local nw = 0.11 - 0.06 * q
+  return 1 - 0.95 * exp(-(d * d) / (nw * nw))
+end
+
+local function resp_bp(u, fc, q)
+  local d = u - fc
+  local bw = 0.20 - 0.13 * q
+  return (0.75 + 0.45 * q) * exp(-(d * d) / (bw * bw))
+end
+
+-- Classic machines: arg = filter_type 1..4 (LP/HP/BP/NOTCH). Morphing
+-- machines: arg = morph 0..1 (LP -> notch -> HP, 0.5 = notch).
+local function response(u, fc, q, morphing, arg)
+  if morphing then
+    if arg < 0.5 then
+      local t = arg * 2
+      return resp_lp(u, fc, q) * (1 - t) + resp_notch(u, fc, q) * t
+    end
+    local t = (arg - 0.5) * 2
+    return resp_notch(u, fc, q) * (1 - t) + resp_lp(1 - u, 1 - fc, q) * t
+  end
+  if arg == 2 then
+    return resp_lp(1 - u, 1 - fc, q) -- HP = mirrored LP
+  elseif arg == 3 then
+    return resp_bp(u, fc, q)
+  elseif arg == 4 then
+    return resp_notch(u, fc, q)
+  end
+  return resp_lp(u, fc, q)
+end
+
+function PageRender:plot_response(x0, y0, w, h, fc, q, morphing, arg, level)
+  local xl = x0 + 2
+  local xr = x0 + w - 2
+  local ybase = y0 + h - 2
+  local scale = (h - 5) / 1.5
+  screen.level(level)
+  for k = 0, N_CURVE do
+    local u = k / N_CURVE
+    local g = response(u, fc, q, morphing, arg)
+    if g < 0 then
+      g = 0
+    elseif g > 1.5 then
+      g = 1.5
+    end
+    local x = xl + u * (xr - xl)
+    local y = ybase - g * scale
+    if k == 0 then
+      screen.move(x, y)
+    else
+      screen.line(x, y)
+    end
+  end
+  screen.stroke()
+end
+
+function PageRender:draw_filter_curve(x0, y0, w, h, items)
+  local machine = floor(self.value("filter_machine", 1) + 0.5)
+  local morphing = machine % 2 == 0 -- 2/4/6 = morphing family
+  local cut = self:item_value(items, "filter_cutoff", 64)
+  local res = self:item_value(items, "filter_res", 0) / 127
+  if res < 0 then
+    res = 0
+  elseif res > 1 then
+    res = 1
+  end
+  local fc = 0.06 + min(max(cut / 127, 0), 1) * 0.88
+
+  local arg
+  if morphing then
+    arg = min(max(self:item_value(items, "filter_morph", 64) / 128, 0), 1)
+  else
+    arg = floor(min(max(self:item_value(items, "filter_type", 1), 1), 4) + 0.5)
+  end
+
+  -- Stereo / mid-side machines: Balance spreads the two channel cutoffs; the
+  -- second channel draws as a dim ghost curve.
+  local bal = 0
+  if machine >= 3 then
+    bal = (self:item_value(items, "filter_balance", 64) - 64) / 64
+  end
+  if abs(bal) > 0.03 then
+    self:plot_response(x0, y0, w, h, min(max(fc - bal * 0.12, 0.02), 0.98), res, morphing, arg, 3)
+    fc = min(max(fc + bal * 0.12, 0.02), 0.98)
+  end
+  self:plot_response(x0, y0, w, h, fc, res, morphing, arg, 12)
+
+  -- cutoff tick on the baseline
+  screen.level(4)
+  screen.rect(x0 + 2 + floor(fc * (w - 4) + 0.5), y0 + h - 3, 1, 2)
+  screen.fill()
+
+  screen.level(3)
+  screen.move(x0 + w - 2, y0 + 7)
+  screen.text_right(self.filter_names[machine] or "")
+end
+
+-- One low-profile param cell (owner redesign). `index` 0-3 places it in the
+-- 4-up row at y = FILTER_ROW_Y.
+function PageRender:draw_low_profile_cell(item, index, selected, row_y)
+  if item == nil or item.blank then
+    return
+  end
+  local pv = self.param_values
+  local raw = pv:item_raw_value(item)
+  local base_raw, actual_raw, modulated = raw, raw, false
+  if self.display_values ~= nil then
+    base_raw, actual_raw, modulated = self.display_values(item, raw)
+  end
+  local locked = pv:item_locked(item)
+  LowProfile.draw({
+    x = LowProfile.cell_x(index),
+    y = row_y or FILTER_ROW_Y,
+    label = item.short or item.id,
+    display_value = tostring(pv:item_display_value(item) or ""),
+    -- Show the value in the name row while it's flashing from an edit OR while FN is
+    -- held (owner: FN = a quick value readout across the low-profile row).
+    editing = pv:item_value_flashing(item) or (self.fn_held ~= nil and self.fn_held()),
+    -- Base bar = the track value (holds still under the crossfader); actual
+    -- bar = after crossfade morph / macro-assign preview / modulation.
+    value_frac = item_frac(item, base_raw) or 0,
+    actual_frac = item_frac(item, actual_raw) or 0,
+    centered = CENTERED[item.id] == true,
+    selected = selected,
+    modulated = modulated or locked,
+    inverted = locked
+  })
+end
+
+-- Draw ONE selection bracket around the selected K2/K3 pair (#46): a 3px
+-- top-left corner on the leftmost selected cell and a 3px bottom-right corner
+-- on the rightmost, so the pair reads as a single group -- not a box per cell.
+-- `pairs` is a list of {cell = <0-3>, inverted = <bool>} for the non-blank
+-- selected cells, left-to-right. Corners are bright on a normal cell and dark
+-- on the inverted p-lock chip (which would otherwise mask them). Two
+-- level-batched passes at most (one per corner), never per-pixel.
+function PageRender:draw_selection_bracket(cells, row_y)
+  if cells == nil or #cells == 0 then
+    return
+  end
+  local left = cells[1]
+  local right = cells[#cells]
+  screen.level(left.inverted and 0 or 15)
+  LowProfile.corner_rects(LowProfile.cell_x(left.cell), row_y, "tl")
+  screen.fill()
+  screen.level(right.inverted and 0 or 15)
+  LowProfile.corner_rects(LowProfile.cell_x(right.cell), row_y, "br")
+  screen.fill()
+end
+
+-- Resolve the selected pair (items lo..hi) into the non-blank cells the bracket
+-- should span, then draw it. `cell_for(i)` maps an item index to its cell index
+-- in the row; blanks are skipped so the bracket hugs the real params.
+function PageRender:draw_pair_bracket(items, lo, hi, cell_for, row_y)
+  local cells = {}
+  for i = lo, hi do
+    local it = items[i]
+    if it ~= nil and not it.blank then
+      cells[#cells + 1] = {cell = cell_for(i), inverted = self.param_values:item_locked(it)}
+    end
+  end
+  self:draw_selection_bracket(cells, row_y)
+end
+
+-- A 2x2 dot at the top-right of every cell in items[lo..hi] whose param is
+-- p-locked on ANY step, so the pattern's step locks are visible at a glance
+-- (owner cue; steps only). ONE level pass for the whole row (redraw-metro law).
+-- On an inverted (currently-locked) chip a level-15 dot is invisible, which is
+-- fine -- that cell already reads as locked.
+function PageRender:draw_step_lock_dots(items, lo, hi, cell_for, row_y)
+  local pv = self.param_values
+  if pv == nil or pv.item_step_locked == nil then
+    return
+  end
+  local xs = {}
+  for i = lo, hi do
+    local it = items[i]
+    if it ~= nil and not it.blank and pv:item_step_locked(it) then
+      local cell = cell_for(i)
+      if cell >= 0 and cell <= 3 then   -- an off-row cell is not drawn
+        xs[#xs + 1] = LowProfile.cell_x(cell) + LowProfile.CELL_W - 2
+      end
+    end
+  end
+  if #xs == 0 then
+    return
+  end
+  screen.level(15)
+  for _, x in ipairs(xs) do
+    screen.rect(x, row_y, 2, 2)
+  end
+  screen.fill()
+end
+
+-- The 42-bar filter magnitude render (owner redesign). Bars grow from the
+-- bottom; the cutoff (+/- envelope-depth band while stopped, single bar while
+-- playing) is drawn brighter. Two level-batched passes (performance law).
+function PageRender:draw_filter_bars(items, playing)
+  local machine = floor(self.value("filter_machine", 1) + 0.5)
+  local morphing = machine % 2 == 0
+  -- Base the curve follows (docs/BASE_VALUE_RESOLVER.md): the RESOLVED switch
+  -- output -- a firing step p-lock OR a crossfader morph overriding the track
+  -- value. NOT gated on `playing`: a morph is live regardless of transport. A
+  -- held-step / scene-anchor PREVIEW wins while you edit one -- item_value then
+  -- differs from the plain track value (self.value), so prefer it. The mod feed
+  -- (LFOs / filter env / macros) is playback-only and adds on top below.
+  local function base_of(suffix, default)
+    local track = self.value(suffix, default)
+    local item = self:item_value(items, suffix, default)
+    if item ~= track then
+      return item              -- a held-step / scene preview is showing
+    end
+    return self:resolved(suffix, default)
+  end
+  local cut = base_of("filter_cutoff", 64)
+  local res_raw = base_of("filter_res", 0)
+  if playing and self.mod_offsets ~= nil then
+    local d_cut, d_res = self.mod_offsets()
+    cut = cut + (d_cut or 0)
+    res_raw = res_raw + (d_res or 0)
+  end
+  local res = min(max(res_raw / 127, 0), 1)
+  local fc = 0.06 + min(max(cut / 127, 0), 1) * 0.88
+  local arg
+  if morphing then
+    arg = min(max(base_of("filter_morph", 64) / 128, 0), 1)
+  else
+    arg = floor(min(max(self:item_value(items, "filter_type", 1), 1), 4) + 0.5)
+  end
+  -- Envelope-depth band (stopped only). DIRECTIONAL: the envelope only pushes
+  -- the cutoff ONE way, so the highlight runs from the cutoff toward where the
+  -- envelope takes it -- up for positive depth, down for negative. (Drawing it
+  -- both ways read as if the cutoff swung symmetrically, which it doesn't.)
+  local depth = (self:item_value(items, "filter_env_depth", 64) - 64) / 64
+  local reach = playing and 0 or (depth * 0.42)
+  local lo_u, hi_u
+  if reach >= 0 then
+    lo_u, hi_u = fc, fc + reach
+  else
+    lo_u, hi_u = fc + reach, fc
+  end
+  local band = abs(reach)
+  local nearest = floor(fc * (FILTER_BARS - 1) + 0.5)  -- cutoff bar index (0-based)
+  local scale = (FILTER_REND_H - 1) / 1.5
+
+  -- Precompute each bar's height + brightness.
+  local dim, bright = {}, {}
+  for i = 1, FILTER_BARS do
+    local u = (i - 1) / (FILTER_BARS - 1)
+    local g = min(max(response(u, fc, res, morphing, arg), 0), 1.5)
+    local bh = floor(g * scale + 0.5)
+    if bh >= 1 then
+      local bx = FILTER_BAR_STEP * i
+      local is_bright
+      if band > 0 then
+        is_bright = u >= lo_u and u <= hi_u
+      else
+        is_bright = (i - 1) == nearest  -- depth 0 (or playing): the cutoff bar
+      end
+      local dest = is_bright and bright or dim
+      dest[#dest + 1] = {x = bx, top = 64 - bh, h = bh}
+    end
+  end
+
+  screen.level(6)
+  for _, b in ipairs(dim) do screen.rect(b.x, b.top, 2, b.h) end
+  screen.fill()
+  screen.level(12)
+  for _, b in ipairs(bright) do screen.rect(b.x, b.top, 2, b.h) end
+  screen.fill()
+end
+
+-- Envelope amplitude (0..1) at normalized time u (0..1), for the bar render.
+-- Stage widths mirror draw_env_shape's proportions so the bars read like the
+-- old polyline. Returns amp, stage -- the stage name lets the caller brighten
+-- the region the selected K2/K3 pair is editing.
+-- AHR treats hold/release >= 128 as INF (holds to the end of the window).
+-- Envelope as an explicit list of BARS ({amp, stage} per bar). Allocating bar
+-- counts directly -- rather than normalizing stage times -- is what lets the
+-- render honour hard visual rules that proportional scaling cannot:
+--   * ATTACK is never narrower than 1 bar, so a 0 attack still shows the
+--     instant jump to peak instead of rendering nothing.
+--   * ATTACK+DECAY together never exceed half the width, and RELEASE never
+--     exceeds the other half, so a long release stops squeezing the attack.
+--   * SUSTAIN keeps at least 1 bar (it is a level; it needs somewhere to sit).
+--   * A stage set to 0 gets 0 bars = a genuine cliff. With every AHR stage at
+--     0 only the single attack bar renders -- no phantom release slope.
+local function env_bars(mode, a, d, s, hd, r, n)
+  local half = floor(n / 2)
+  local sus = min(max(s / 127, 0), 1)
+  local function span(v, maxv)
+    return floor((v / maxv) * half + 0.5)
+  end
+
+  local out = {}
+  -- Sample each stage at k = i/count, so a stage ENDS exactly on its target
+  -- and never repeats the value the previous stage already drew. A 1-bar
+  -- attack therefore lands straight on the peak (k = 1), and a decay/release
+  -- starts descending immediately instead of echoing the peak for a bar.
+  local function push(count, from, to, stage)
+    for i = 1, count do
+      local k = i / count
+      out[#out + 1] = {amp = from + ((to - from) * k), stage = stage}
+    end
+  end
+
+  if mode == 1 then  -- ADSR
+    local a_b, d_b = span(a, 127), span(d, 127)
+    if a_b + d_b > half then           -- keep attack+decay inside the left half
+      local scale = half / (a_b + d_b)
+      a_b, d_b = floor(a_b * scale), floor(d_b * scale)
+    end
+    a_b = max(1, a_b)                  -- attack always visible
+    local r_b = (r >= 128) and 0 or min(span(r, 127), half)
+    local s_b = n - a_b - d_b - r_b
+    if s_b < 1 then                    -- sustain keeps at least one bar
+      local need = 1 - s_b
+      local take = min(need, r_b); r_b = r_b - take; need = need - take
+      if need > 0 then
+        take = min(need, d_b); d_b = d_b - take; need = need - take
+      end
+      if need > 0 then a_b = max(1, a_b - need) end
+      s_b = n - a_b - d_b - r_b
+    end
+    push(a_b, 0, 1, "attack")
+    push(d_b, 1, sus, "decay")
+    push(s_b, sus, sus, "sustain")
+    push(r_b, sus, 0, "release")
+  else  -- AHR
+    local a_b = max(1, min(span(a, 127), half))
+    if hd >= 128 then                  -- INF hold: stays open to the end
+      push(a_b, 0, 1, "attack")
+      push(n - a_b, 1, 1, "hold")
+    elseif r >= 128 then               -- INF release: holds after the hold
+      local h_b = min(span(hd, 128), n - a_b)
+      push(a_b, 0, 1, "attack")
+      push(h_b, 1, 1, "hold")
+      push(n - a_b - h_b, 1, 1, "release")
+    else
+      local h_b = min(span(hd, 128), half)
+      local r_b = min(span(r, 128), half)
+      push(a_b, 0, 1, "attack")
+      push(h_b, 1, 1, "hold")
+      push(r_b, 1, 0, "release")
+      -- Anything left is past the end of the envelope: silence, not a slope.
+    end
+  end
+
+  while #out > n do
+    out[#out] = nil
+  end
+  return out
+end
+
+-- FILTER ENV page: the envelope drawn on the same 2px-bar grid as the filter
+-- render, between a top and bottom low-profile param row. Bars covering the
+-- stage(s) the selected pair edits are brightened (the direct-editing cue that
+-- replaced the old polyline handles).
+-- `prefix` selects which envelope family to read (filter_env_ / env_ / menv_)
+-- and `mode_id` the param that says ADSR vs AHR (nil = always ADSR).
+function PageRender:draw_envelope_bars(items, sel_lo, prefix, mode_id)
+  local mode = mode_id ~= nil and floor(self.value(mode_id, 2) + 0.5) or 1
+  local a = self:item_value(items, prefix .. "attack", 0)
+  local d = self:item_value(items, prefix .. "decay", 0)
+  local s = self:item_value(items, prefix .. "sustain", 127)
+  -- AHR-only, and read only in AHR: the MOD ENV is ADSR-only and registers no
+  -- <prefix>hold param at all, so asking for it unconditionally sent an
+  -- unregistered id down the value resolver.
+  local hd = mode == 2 and self:item_value(items, prefix .. "hold", 0) or 0
+  local r = self:item_value(items, prefix .. "release", 0)
+
+  -- Which stages the selected pair is editing (id -> stage name).
+  local hot = {}
+  for i = sel_lo, sel_lo + 1 do
+    local it = items[i]
+    local stage = it ~= nil and id_to_stage(it.id) or nil
+    if stage ~= nil then
+      hot[stage] = true
+    end
+  end
+
+  local base = FENV_REND_Y + FENV_REND_H - 1
+  local bars = env_bars(mode, a, d, s, hd, r, FILTER_BARS)
+  local dim, bright = {}, {}
+  for i = 1, #bars do
+    local bar = bars[i]
+    local bh = floor(min(max(bar.amp, 0), 1) * (FENV_REND_H - 1) + 0.5)
+    if bh >= 1 then
+      local dest = hot[bar.stage] and bright or dim
+      dest[#dest + 1] = {x = FILTER_BAR_STEP * i, top = base - bh + 1, h = bh}
+    end
+  end
+
+  screen.level(6)
+  for _, b in ipairs(dim) do screen.rect(b.x, b.top, 2, b.h) end
+  screen.fill()
+  screen.level(12)
+  for _, b in ipairs(bright) do screen.rect(b.x, b.top, 2, b.h) end
+  screen.fill()
+
+  -- No ADSR/AHR label here: it overlapped the bars and the shape already says
+  -- which envelope type is active.
+end
+
+-- Full FILTER page 2. items 1-4 fill the TOP low-profile row (the env stages;
+-- AHR leaves the 4th blank), items 5-6 the BOTTOM row's cells 3 and 4
+-- (DRIVE, DEPTH) -- kept adjacent in the list so K2/K3 never lands on an
+-- all-blank pair.
+-- Shared envelope page: 4 low-profile params on top, the envelope drawn on the
+-- filter render's bar grid in the middle, and the remaining items along the
+-- bottom row starting at `bottom_first_cell` (0-3). Used by FILTER p2, AMP and
+-- MOD ENV so all three envelopes look and behave identically.
+function PageRender:draw_envelope_page(items, group, prefix, mode_id, bottom_first_cell)
+  local sel_lo = ((group or 1) - 1) * 2 + 1
+  local first_cell = bottom_first_cell or 0
+  for i = 1, 4 do
+    self:draw_low_profile_cell(items[i], i - 1, i == sel_lo or i == sel_lo + 1, FENV_ROW_TOP_Y)
+  end
+  for i = 5, #items do
+    local cell = first_cell + (i - 5)
+    if cell <= 3 then
+      self:draw_low_profile_cell(items[i], cell, i == sel_lo or i == sel_lo + 1, FENV_ROW_BOTTOM_Y)
+    end
+  end
+  -- One group bracket over the selected pair. A pair is always both on the top
+  -- row (sel_lo 1 or 3) or both on the bottom row (5 or 7) -- it never straddles.
+  if sel_lo <= 3 then
+    self:draw_pair_bracket(items, sel_lo, sel_lo + 1, function(i) return i - 1 end, FENV_ROW_TOP_Y)
+  else
+    self:draw_pair_bracket(items, sel_lo, sel_lo + 1,
+      function(i) return first_cell + (i - 5) end, FENV_ROW_BOTTOM_Y)
+  end
+  -- Step-lock dots, one level pass per row.
+  self:draw_step_lock_dots(items, 1, 4, function(i) return i - 1 end, FENV_ROW_TOP_Y)
+  self:draw_step_lock_dots(items, 5, #items, function(i) return first_cell + (i - 5) end, FENV_ROW_BOTTOM_Y)
+  self:draw_envelope_bars(items, sel_lo, prefix, mode_id)
+end
+
+function PageRender:draw_filter_env_page(items, group)
+  self:draw_envelope_page(items, group, "filter_env_", "filter_env_mode", 2)
+end
+
+-- AMP: bottom row is SND1 / SND2 / PAN / VOL, so it fills all four cells.
+function PageRender:draw_amp_page(items, group)
+  self:draw_envelope_page(items, group, "env_", "env_mode", 0)
+end
+
+-- MOD ENV: always ADSR; bottom row is DEST / DEPTH in cells 3 and 4.
+function PageRender:draw_mod_env_page(items, group)
+  self:draw_envelope_page(items, group, "menv_", nil, 2)
+end
+
+-- Full FILTER page 1: low-profile param row + bar render. The coordinator has
+-- already drawn the page header. `items` is the curated [cutoff, res,
+-- morph|type, env_depth] set; `group` is the K2/K3 pair index.
+function PageRender:draw_filter_page(items, group, playing)
+  local sel_lo = ((group or 1) - 1) * 2 + 1
+  for i = 1, 4 do
+    self:draw_low_profile_cell(items[i], i - 1, i == sel_lo or i == sel_lo + 1)
+  end
+  self:draw_pair_bracket(items, sel_lo, sel_lo + 1, function(i) return i - 1 end, FILTER_ROW_Y)
+  self:draw_step_lock_dots(items, 1, 4, function(i) return i - 1 end, FILTER_ROW_Y)
+  self:draw_filter_bars(items, playing == true)
+end
+
+-- The reusable "Mode Parameter" banner (owner spec): an FX-slot-style identity
+-- block -- a dim label over a big option value -- that stands in for a pair of
+-- low-profile cells. It brightens when its K2/K3 pair is selected and draws the
+-- usual corner bracket around the block. The param behind it is NOT p-lockable
+-- and changes only with the transport stopped + FN held; that gate lives in the
+-- enc handler (item.no_edit_playing / fn_to_edit), so this is pure rendering.
+-- Designed to be dropped onto future Warp-mode pages too, not just FILTER MIX.
+function PageRender:draw_mode_banner(x0, y0, item, selected)
+  if item == nil then
+    return
+  end
+  local pv = self.param_values
+  screen.level(3)
+  screen.move(x0 + 2, y0 + 7)
+  screen.text(string.upper(tostring(item.short or "MODE")))
+  screen.font_size(16)
+  screen.level(selected and 15 or 6)
+  screen.move(x0 + 2, y0 + 22)
+  -- Cap the big value at 9 chars (owner): at font 16 that is the most that fits
+  -- left of the trailing param's cell (a longer warp-engine name would collide).
+  -- Trim a trailing underscore the cut can leave (SPECTRAL_FREEZE -> SPECTRAL).
+  local val = string.upper(tostring(pv:item_display_value(item) or ""))
+  screen.text((string.sub(val, 1, 9):gsub("_+$", "")))
+  screen.font_size(8)
+  -- Selection bracket (top-left + bottom-right corners) around the banner block,
+  -- matching the low-profile selection language. Only when this pair is chosen.
+  if selected then
+    screen.level(15)
+    local x2 = x0 + FMIX_BANNER_W - 1
+    local y2 = 63
+    screen.rect(x0, y0, 4, 1)
+    screen.rect(x0, y0, 1, 4)
+    screen.rect(x2 - 3, y2, 4, 1)
+    screen.rect(x2, y2 - 3, 1, 4)
+    screen.fill()
+  end
+end
+
+-- Reusable "Mode Parameter" page (owner redesign, first shipped as FILTER MIX,
+-- then the WARP page). Two low-profile rows of 4 up top (items 1-8), then the last
+-- pair along the bottom: the Mode-Parameter banner (item 9, K2/B2 side) with an
+-- OPTIONAL trailing param (item 10, K3/B3 side) rendered as a low-profile cell to
+-- the banner's right -- the WARP page puts RATE there; FILTER MIX leaves item 10
+-- blank so only the banner shows. Empty pairs between the real params are skipped
+-- by Navigation:cycle_group, so the selection only ever rests on a filled row-pair
+-- or the last pair. `group` is the K2/K3 pair index.
+function PageRender:draw_mode_param_page(items, group, playing)
+  local sel_lo = ((group or 1) - 1) * 2 + 1
+  -- Top row: items 1-4. Bottom row: items 5-8.
+  for i = 1, 4 do
+    self:draw_low_profile_cell(items[i], i - 1, i == sel_lo or i == sel_lo + 1, FMIX_ROW_TOP_Y)
+  end
+  for i = 5, 8 do
+    self:draw_low_profile_cell(items[i], i - 5, i == sel_lo or i == sel_lo + 1, FMIX_ROW_BOTTOM_Y)
+  end
+  -- Selection bracket: a low-profile pair (groups 1-4) never straddles rows, so
+  -- pick the row by sel_lo; the last pair (sel_lo 9) brackets the banner + trailing.
+  if sel_lo <= 3 then
+    self:draw_pair_bracket(items, sel_lo, sel_lo + 1, function(i) return i - 1 end, FMIX_ROW_TOP_Y)
+  elseif sel_lo <= 7 then
+    self:draw_pair_bracket(items, sel_lo, sel_lo + 1, function(i) return i - 5 end, FMIX_ROW_BOTTOM_Y)
+  end
+  -- Step-lock dots, one level pass per row.
+  self:draw_step_lock_dots(items, 1, 4, function(i) return i - 1 end, FMIX_ROW_TOP_Y)
+  self:draw_step_lock_dots(items, 5, 8, function(i) return i - 5 end, FMIX_ROW_BOTTOM_Y)
+  -- Last pair, along the bottom: banner (item 9, K2) + optional trailing cell
+  -- (item 10, K3). Both highlight when the pair is selected.
+  local last_selected = sel_lo >= 9
+  self:draw_mode_banner(0, FMIX_BANNER_Y, items[9], last_selected)
+  local trailing = items[10]
+  if trailing ~= nil and not trailing.blank then
+    self:draw_low_profile_cell(trailing, FMIX_TRAIL_CELL, last_selected, FMIX_TRAIL_Y)
+    self:draw_step_lock_dots(items, 10, 10, function() return FMIX_TRAIL_CELL end, FMIX_TRAIL_Y)
+    if last_selected then
+      self:draw_selection_bracket(
+        {{cell = FMIX_TRAIL_CELL, inverted = self.param_values:item_locked(trailing)}}, FMIX_TRAIL_Y)
+    end
+  end
+end
+
+function PageRender:draw_fx_slot(x0, y0, w, h, items, page_index)
+  local slot = FX_SLOT_PAGES[page_index] or FX_SLOT_PAGES[1]
+  local machine = floor(self.value(slot.machine, 1) + 0.5)
+  screen.level(3)
+  screen.move(x0 + 2, y0 + 7)
+  screen.text(slot.label)
+  screen.level(15)
+  screen.font_size(16)
+  screen.move(x0 + 2, y0 + 22)
+  screen.text(self.fx_names[machine] or "?")
+  screen.font_size(8)
+  if machine == 1 then
+    screen.level(4)
+    screen.move(x0 + w - 2, y0 + 22)
+    screen.text_right("BYPASS")
+  end
+end
+
+function PageRender:draw_fx_sends(x0, y0, w, h, items)
+  local b1 = y0 + 10
+  local b2 = y0 + 21
+  local m1 = floor(self.value("send1_machine", 1) + 0.5)
+  local m2 = floor(self.value("send2_machine", 1) + 0.5)
+
+  screen.level(3)
+  screen.move(x0 + 2, b1)
+  screen.text("S1")
+  screen.move(x0 + 2, b2)
+  screen.text("S2")
+
+  screen.level(m1 == 1 and 4 or 12)
+  screen.move(x0 + 14, b1)
+  screen.text(self.fx_names[m1] or "")
+  screen.level(m2 == 1 and 4 or 12)
+  screen.move(x0 + 14, b2)
+  screen.text(self.fx_names[m2] or "")
+
+  -- send level bars (read through the page items so p-locks show live)
+  local bx = x0 + 62
+  local bw = w - 66
+  local l1 = min(max(self:item_value(items, "send1_level", 0) / 127, 0), 1)
+  local l2 = min(max(self:item_value(items, "send2_level", 0) / 127, 0), 1)
+  screen.level(1)
+  screen.rect(bx, b1 - 5, bw, 3)
+  screen.rect(bx, b2 - 5, bw, 3)
+  screen.fill()
+  screen.level(9)
+  if l1 > 0 then
+    screen.rect(bx, b1 - 5, max(1, floor(l1 * bw + 0.5)), 3)
+  end
+  if l2 > 0 then
+    screen.rect(bx, b2 - 5, max(1, floor(l2 * bw + 0.5)), 3)
+  end
+  screen.fill()
+end
+
+-- ---- Entry point -----------------------------------------------------------
+
+-- category/page_index locate the page; items is its resolved item list
+-- (page_items_for); group is the clamped K2/K3 pair index.
+function PageRender:draw(category, page_index, items, group)
+  local wstart, wend, wname = self:widget_span(category, page_index, items)
+
+  if #items == 0 and wname == nil then
+    screen.level(4)
+    screen.move(0, 34)
+    screen.text("empty")
+    return
+  end
+
+  local sel_lo = ((group or 1) - 1) * 2 + 1
+  self:draw_cells(items, wstart, wend, sel_lo, sel_lo + 1)
+  self:draw_selection(items, sel_lo, wstart, wend)
+
+  if wname ~= nil then
+    -- Widgets occupy one row: indices 1-4 = top row, 5-8 = bottom row.
+    local top = wend <= 4
+    local x0 = ((wstart - 1) % 4) * CELL_W
+    local ww = (wend - wstart + 1) * CELL_W
+    self[wname](self, x0, top and ROW_Y[1] or ROW_Y[2], ww, CELL_H, items, page_index, sel_lo)
+  end
+end
+
+return PageRender
