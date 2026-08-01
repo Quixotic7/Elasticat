@@ -3,3 +3,4 @@
 *.swp
 # local/experimental UGen builds -- the DISTRIBUTED prebuilt (lib/ugens/
 # ElasticatUGens.so) is tracked via lib/ugens/.gitignore's allow-rule.
+.DS_Store
