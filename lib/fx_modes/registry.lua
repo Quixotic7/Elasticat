@@ -13,6 +13,8 @@
 -- To add a machine: append its module here + a display name in `names`, add the
 -- matching SynthDef + name to the engine, and register any new param ids in
 -- lib/elasticat.lua.
+local ModeParamLayout = include("lib/ui/mode_param_layout")
+
 local Registry = {}
 
 local machines = {
@@ -32,6 +34,14 @@ end
 function Registry.source_items(machine_id, Item, prefix)
   local machine = Registry.get(machine_id)
   return machine.source_items ~= nil and machine.source_items(Item, prefix) or {}
+end
+
+-- Arrange an FX slot's params into the shared Mode-Parameter page skeleton (owner:
+-- the FX pages reuse the FILTER MIX / WARP layout, with the machine selector as the
+-- on-page banner). Delegates to lib/ui/mode_param_layout; FX has no trailing param,
+-- so callers pass a blank item for item 10.
+function Registry.arrange_page(raw, banner, trailing, blank)
+  return ModeParamLayout.arrange(raw, banner, trailing, blank)
 end
 
 function Registry.names()

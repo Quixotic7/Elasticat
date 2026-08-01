@@ -1,5 +1,11 @@
 # Changelog
 
+## FX pages: change the effect on-page (Mode-Parameter layout)
+
+- The four FX slot pages (Insert 1, Send 1, Send 2, Master) now use the same two-row + banner layout as FILTER MIX and WARP. The FX machine selector is the bottom-left banner, so you can switch the effect on the page — select the banner pair, hold FN, turn K2 — without opening the settings menu.
+- Each machine's parameters fill the two low-profile rows above the banner. Unlike the warp/filter mode banners, the FX machine can be changed during playback (FN still guards an accidental turn): the engine respawns the effect without stopping the transport.
+- The Sends routing page (send levels + tap) is unchanged.
+
 ## Filter machines + FILTER MIX page
 
 - The filter is now a selectable **machine**, like the warp engine, chosen from the FILTER settings: **CLASSIC** (LP/HP/BP/notch), **MORPHING** (continuous LP→notch→HP), **LADDER** (Moog-style, self-oscillating), **COMB** (tuned feedback comb), and **FORMANT** (A–E–I–O–U vowel bank). Cutoff, resonance, drive and the filter envelope stay p-lockable across all of them.

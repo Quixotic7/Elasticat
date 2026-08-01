@@ -2265,8 +2265,25 @@ end
 -- ids; "send1_"/"send2_"/"master_" match the params registered in
 -- lib/elasticat.lua). NONE returns no items, which draw_root_page renders as
 -- the blank "empty" page.
+-- FX slot page (Insert 1 / Send 1 / Send 2 / Master) as a Mode-Parameter page
+-- (owner): the machine's params fill the two rows, and the machine SELECTOR is the
+-- bottom-left banner so the FX can be changed on-page without the settings menu.
+-- The banner is NOT p-lockable and requires FN to change (guards an accidental
+-- turn), but -- unlike the WARP/FILTER mode banners -- it has NO no_edit_playing,
+-- so the FX can be swapped live (it is a freely-changeable setting today, and the
+-- engine respawns the FX synth without stopping playback). No trailing param, so
+-- item 10 is blank. `machine_suffix` resolves per-track for the Insert (it is in
+-- ParamsSpec) and globally for the shared Send/Master machines -- ui_id handles
+-- both -- so the banner reads/writes the right param either way.
 local function fx_slot_items(machine_suffix, item_prefix)
-  return FxRegistry.source_items(param_value_or(machine_suffix, 1), ParamItem, item_prefix)
+  local labels = {
+    fx_insert1_machine = "INSERT 1", send1_machine = "SEND 1",
+    send2_machine = "SEND 2", master_fx_machine = "MASTER"
+  }
+  local raw = FxRegistry.source_items(param_value_or(machine_suffix, 1), ParamItem, item_prefix)
+  local banner = ParamItem.item(machine_suffix, labels[machine_suffix] or "FX", {
+    mode_param = true, lockable = false, fn_to_edit = true, options = FxRegistry.count()})
+  return FxRegistry.arrange_page(raw, banner, ParamItem.blank(), ParamItem.blank)
 end
 
 -- FILTER page 2: the filter envelope, laid out by its (independent) mode -- ADSR
@@ -2894,22 +2911,14 @@ local function draw_root_page()
     return
   end
 
-  if nav:current_category() == "filter" and page_index == 3 then
-    -- FILTER MIX (owner "Mode Parameter" redesign,
-    -- elasticat-design-images/filter_add_page.png): two low-profile rows + the
-    -- stereo / mid-side mode banner in the bottom-left.
-    draw_page_header(title, page_index)
-    page_render:draw_mode_param_page(items, nav:clamp_current_group(), playing)
-    return
-  end
-
-  if nav:current_category() == "source" and page_index == 3
-    and items[9] ~= nil and items[9].mode_param == true then
-    -- WARP page reuses the Mode-Parameter layout (owner): the WARP-engine selector
-    -- became the banner, RATE is pinned bottom-right, and each mode's params fill
-    -- the two rows (Attack/Release forced to the second row for envelope modes).
-    -- source_page2_items is nil for every machine today, so page 3 is always the
-    -- warp page; the mode_param guard keeps it robust if that ever changes.
+  -- Mode-Parameter pages (owner redesign): FILTER MIX, the WARP page, and the FX
+  -- slot pages (Insert 1 / Send 1 / Send 2 / Master) all curate their items so the
+  -- machine/mode selector is a `mode_param` banner at item 9. Any such page renders
+  -- with the shared two-row + banner layout. This runs after the category-specific
+  -- dispatches above, none of which put a mode_param at item 9 -- so the single
+  -- check covers every current and future Mode-Parameter page. (The FX SENDS page,
+  -- page 2, has no banner and falls through to the generic renderer below.)
+  if items[9] ~= nil and items[9].mode_param == true then
     draw_page_header(title, page_index)
     page_render:draw_mode_param_page(items, nav:clamp_current_group(), playing)
     return
