@@ -3,7 +3,14 @@
 Elasticat is now large enough that feature work should happen through small modules, not by adding more conditionals to `elasticat.lua`.
 This document describes the current module boundaries and the rules for future changes.
 
-**Product decisions live in `docs/PRD.md`** (vision, machine/FX catalogs, parameter conventions, MVP scope, CPU budget) — read it first. For the 8-track instrument design (filters, sends, mod matrix, scenes, neighbor routing, projects) and its phased rollout, see `docs/MULTITRACK_ARCHITECTURE.md`. Parallel-agent ownership and integration rules are in `docs/WORKSTREAMS.md`. This document only covers code organization.
+**Product decisions live in `docs/PRD.md`** (vision, machine/FX catalogs, parameter conventions, MVP scope, CPU budget) — read it first. For the 8-track instrument design (filters, sends, mod matrix, scenes, neighbor routing, projects) and its phased rollout, see `docs/MULTITRACK_ARCHITECTURE.md`; the shipped multitrack behavior contract is `docs/PHASE2_CONTRACT.md`. Other binding design docs: `docs/BASE_VALUE_RESOLVER.md` (how step locks / crossfader morphs / track bases resolve into ONE engine value, non-destructively), `docs/INPUT_ACTIONS.md` (the semantic input-action layer), `docs/MODE_CATALOG.md` (every selectable machine: track/warp/filter/FX). Parallel-agent ownership and integration rules are in `docs/WORKSTREAMS.md`. This document only covers code organization.
+
+**Hard platform limits** that shape this file's rules: `elasticat.lua`'s main
+chunk sits AT LuaJIT's 200-local ceiling and `init()` at the 60-upvalue
+ceiling — new file-scope state must hang off an existing table (see the
+`status` table and `elasticat.cpu_report` for the idiom), never a new local.
+The norns screen freezes if `screen.level()` is called per-pixel — level-batch
+all drawing (see `lib/ui/page_render.lua`'s performance law).
 
 ## References
 
@@ -21,7 +28,26 @@ This document describes the current module boundaries and the rules for future c
   - Should stay a coordinator, not a feature dumping ground.
 - `lib/elasticat.lua`
   - Lua facade for `Engine_Elasticat`.
-  - Owns norns params, sample pool metadata, trim sidecars, and throttled engine sends.
+  - Owns norns params, sample pool metadata, trim sidecars, and throttled
+    engine sends (the 12Hz coalescing queue every `queue = true` param rides).
+  - Owns the **base-value resolver** (`docs/BASE_VALUE_RESOLVER.md`): step
+    lock > crossfader morph > track base, resolved into the one value the
+    engine hears, without ever overwriting the stored track value.
+  - Owns the per-track OSC feed routing: the engine forwards meter/phase/mod/
+    filter-env streams for the **viewTrack** only (plus all-track meters when
+    the mixer view is up); `elasticat.osc_report` in `elasticat.lua` decides
+    which track a reading belongs to and is unit-tested without `init()`.
+- `lib/tracks/params_spec.lua`
+  - THE per-track parameter contract: one spec row per param (id, range,
+    xform, engine command, queue/lock flags), registered for all 8 tracks.
+  - Track 1 keeps its historical unprefixed ids; a shrinking `t1` subset is
+    still hand-registered in `lib/elasticat.lua` (known debt — the dual path
+    is the recurring source of "works on track N, broken on track M" bugs).
+- `lib/sequencer/track_sequencer.lua`
+  - Per-track sequencer runtime: every track gets the identical region
+    layering, release modes, trig conditions, and slice triggering the
+    selected track gets. `grid_sequencer.lua` owns the grid *surface* and
+    forwards to the selected track's instance.
 - `lib/grid_sequencer.lua`
   - Grid controller and sequencer runtime.
   - Owns grid key handling, step advancement, loop/slice trigger dispatch.
@@ -116,8 +142,23 @@ This document describes the current module boundaries and the rules for future c
     grid device (the coordinator wraps `grid_ui.g.key` to route grid input
     to it while open) and does not touch sequencer/engine state.
 - `lib/Engine_Elasticat.sc`
-  - SuperCollider engine implementation.
-  - Owns buffer loading, continuous machines, slice voices, and warp DSP.
+  - SuperCollider engine implementation — deliberately ONE file (the crone
+    loader only discovers one `Engine_*` class file; a broken companion file
+    would take the whole class library down).
+  - `ElasticatTrack` class: one instance per track, identical node graph for
+    all 8 (transport → mod → reader → filter [carries amp/pan] → insert →
+    send tap → mix). `activeTrackCount` allocates/frees whole chains.
+  - Slice voice pool: per-track cap 8, global cap 24, oldest-first steal,
+    choke groups, bounded envelopes.
+  - **Idle pause** (CPU headroom): a stopped, silent, un-viewed track's whole
+    group is paused (`group.run(false)`); silence is measured post-everything
+    from the track-mix output, waking is command-driven (play/trig/view).
+    The same 2s tick reports avg/peak CPU to the script (`/elasticat/cpu`).
+  - Compiled UGens (`ElasticatReader`, `ElasticatGrains`) are built ON the
+    norns (armv7l) — see `ugens/` at the repo root and `lib/ugens/install.lua`.
+  - Positional-lockstep registries: `modeSynthNames`/`filterSynthNames`/
+    `fxInsertNames` must match the Lua registries index-for-index;
+    `bin/test-elasticat-contract` enforces it.
 
 ## Already Well-Factored (unchanged by this pass)
 
@@ -131,22 +172,30 @@ This document describes the current module boundaries and the rules for future c
   - One module per warp mode.
   - Owns warp parameter layout and warp-specific behavior.
 - `lib/filter_modes/*`
-  - One module per filter machine: Classic, Morphing, and their Stereo/
-    Mid-Side variants — all 6 of PRD §4.2's catalog items 1-6 are shipped
-    (registry + engine SynthDefs both complete); comb/ladder/formant
-    (catalog items 7-9) haven't been started. Mirrors the warp-mode registry
-    pattern.
+  - One module per filter machine: CLASSIC, MORPHING, LADDER, COMB, FORMANT
+    (see `docs/MODE_CATALOG.md`), all stereo with a stereo/mid-side balance.
+    Mirrors the warp-mode registry pattern.
   - The active filter machine is a *setting* (not p-lockable); its params are
     p-lockable. Registry index must stay aligned with the engine's
     `filterSynthNames` list.
 - `lib/fx_modes/*`
-  - One module per FX insert machine (None, Drive, Delay, Reverb, Lofi — PRD
-    §4.3 Tier 1, all shipped), mirroring the filter-mode registry pattern
-    exactly. Index 1 (engine 0) is always the dry-passthrough None machine,
-    so switching machines never leaves the insert chain silent.
-  - The active machine (per insert slot) is a *setting*, not p-lockable; its
-    params are. Scope today is Insert 1 only — Insert 2, sends, and the
-    master insert reuse this same registry when they land.
+  - One module per FX machine — 19 today (see `docs/MODE_CATALOG.md` for the
+    full table, param rows, the always-wet set, and the MIX-as-trailing
+    rule), mirroring the filter-mode registry pattern exactly. Index 1
+    (engine 0) is always the dry-passthrough None machine, so switching
+    machines never leaves the insert chain silent (a send-return None instead
+    spawns NO synth — a passthrough would double the sent signal).
+  - Shared by all four slots: Insert 1 (unprefixed ids), Send 1 / Send 2 /
+    Master (prefixed `send1_`/`send2_`/`master_`; the send/master rows are
+    GENERATED from the same spec, see `register_send_fx_params` and the
+    engine's `sendFxExtraSpec`).
+  - The active machine (per slot) is a *setting*, not p-lockable, but CAN be
+    swapped during playback (unlike warp/filter machines).
+  - Adding a machine touches ~8 places in lockstep — module + registry name +
+    option count, engine SynthDef + `fxInsertNames` + per-track and send
+    spec rows, `params_spec` SPEC row, sync entries, test counts. Follow an
+    existing machine (e.g. `cassette`) end-to-end; the contract test catches
+    a missed site.
 - `lib/sequencer/*`
   - `step.lua`: step data objects and sequencer model helpers. Grid
     controller asks step objects about content instead of inspecting raw
@@ -174,9 +223,22 @@ This document describes the current module boundaries and the rules for future c
 8. New category/page selection behavior goes in `lib/pages/navigation.lua`, not as new loose file-locals in `elasticat.lua`.
 9. `elasticat.lua` should be allowed to coordinate state, but feature logic belongs to modules.
 10. Every refactor or feature change must pass:
-    - `bin/test-elasticat-lua`
-    - `bin/test-elasticat-sclang`
+    - `bin/test-elasticat-lua` (syntax + module registry + render sweeps +
+      the per-module unit tests it drives)
+    - `bin/test-elasticat-sclang` (engine compile)
+    - `bin/test-elasticat-engine-runtime` (boots a real scsynth: alloc,
+      8-track scaling, slice voice caps/choke, idle pause. On a Mac the
+      compiled `ElasticatReader`/`ElasticatGrains` UGens are absent — their
+      "not installed" errors are expected noise, the assertions still bind)
+    - `bin/test-elasticat-contract` (Lua↔engine registry/command lockstep;
+      occasionally SIGSEGVs on exit — rerun, don't debug)
+    - `luajit bin/lua/fx_page_test.lua` and `luajit bin/lua/phase2_params_test.lua`
+      when touching FX pages or per-track params
     - `git diff --check`
+11. Engine `.sc` changes only take effect after a script reload on the norns;
+    deploys follow `deploy-elasticat.sh` (rsync + verify IDENTICAL), and
+    `main` is only fast-forwarded after a VERIFIED deploy (main mirrors the
+    device).
 
 ## Extension Flow
 

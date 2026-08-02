@@ -51,6 +51,16 @@ local FMIX_BANNER_Y = 37       -- Mode-Parameter banner sits below the two rows
 local FMIX_BANNER_W = 96       -- banner block width (owns cells 0-2; trailing = cell 3)
 local FMIX_TRAIL_CELL = 3      -- item 10 (K3 side, e.g. WARP's RATE): bottom-right cell
 local FMIX_TRAIL_Y = 52        -- ... along the very bottom, right of the banner
+-- Comp/Duck meter: the free wedge RIGHT of the banner (which ends at x 95) and
+-- ABOVE the trailing MIX cell (which starts at y 52), below param row 2 (ends at
+-- y 33). So the usable box is x 96..127, y 34..51 -- the meter must stay inside it
+-- or it draws over the parameter cells (it did: it used to be placed by the
+-- caller at y 24, straight through row 2). Geometry lives HERE with the rest of
+-- the layout so no caller can misplace it again; draw_fx_meter takes values only.
+local FMIX_METER_X = 97
+local FMIX_METER_Y = 40
+local FMIX_METER_W = 31
+local FMIX_METER_LABEL_W = 13  -- label column; the bars take the remainder
 
 -- FX slot pages (fx category pages 1/3/4/5): identity-banner label + the
 -- machine-selector param each page's widget reads. Page 2 (SENDS) has its own
@@ -81,7 +91,15 @@ local CENTERED = {
   lfo1_depth = true,
   lfo2_depth = true,
   menv_depth = true,
-  wt_lfo_depth = true  -- signed 0-128, 64 = off (fills from centre)
+  wt_lfo_depth = true,  -- signed 0-128, 64 = off (fills from centre)
+  echo_offset = true,   -- Echo R-tap offset: 64 = same time, </> shorter/longer
+  flanger_feedback = true,  -- 64 = off, below = negative/hollow comb
+  eq_low = true,        -- DJ EQ band gains: 64 = unity, 0 = kill, top = boost
+  eq_mid = true,
+  eq_high = true,
+  motion_width = true,  -- 64 = unity width, 0 = mono, top = wide
+  rings_freq = true,    -- bipolar shift direction (64 = 0 Hz)
+  rings_fine = true
 }
 
 function PageRender.new(opts)
@@ -761,8 +779,12 @@ function PageRender:draw_low_profile_cell(item, index, selected, row_y)
     editing = pv:item_value_flashing(item) or (self.fn_held ~= nil and self.fn_held()),
     -- Base bar = the track value (holds still under the crossfader); actual
     -- bar = after crossfade morph / macro-assign preview / modulation.
-    value_frac = item_frac(item, base_raw) or 0,
-    actual_frac = item_frac(item, actual_raw) or 0,
+    -- bar_frac, not item_frac: LOCKABLE OPTION params (Delay/Echo TIME, chop
+    -- LOOP, phaser STGS) get a position bar over their index too. item_frac
+    -- returns nil for any options param, which froze those bars at zero on
+    -- every low-profile page (owner report: "TIME bar not updating").
+    value_frac = bar_frac(item, base_raw) or 0,
+    actual_frac = bar_frac(item, actual_raw) or 0,
     centered = CENTERED[item.id] == true,
     selected = selected,
     modulated = modulated or locked,
@@ -1183,6 +1205,13 @@ function PageRender:draw_mode_param_page(items, group, playing)
       self:draw_selection_bracket(
         {{cell = FMIX_TRAIL_CELL, inverted = self.param_values:item_locked(trailing)}}, FMIX_TRAIL_Y)
     end
+  elseif trailing ~= nil and trailing.blank and trailing.tag ~= nil then
+    -- Static tag for a deliberately absent trailing param (always-wet FX
+    -- machines): a dim label in the MIX position so the empty cell reads as
+    -- "always WET", not a missing knob. Non-editable, never selectable.
+    screen.level(2)
+    screen.move(FMIX_TRAIL_CELL * 32 + 15, FMIX_TRAIL_Y + 8)
+    screen.text_center(trailing.tag)
   end
 end
 
@@ -1202,6 +1231,59 @@ function PageRender:draw_fx_slot(x0, y0, w, h, items, page_index)
     screen.move(x0 + w - 2, y0 + 22)
     screen.text_right("BYPASS")
   end
+end
+
+-- FX threshold / gain-reduction meter (owner). A compact overlay for the Comp +
+-- Duck insert pages, wedged RIGHT of the Mode-Parameter banner and ABOVE the
+-- trailing MIX cell (FMIX_METER_* above): an IN (input/key level) bar with a
+-- threshold tick (Comp only) over a GR (gain reduction) bar. All inputs are dB,
+-- fed live per viewed-track from the engine. `show_thresh` false (Duck, which has
+-- no hard threshold) hides the tick. Position is INTERNAL -- callers pass values
+-- only, so the meter can never be placed over the parameter cells.
+-- Two level-batched passes per bar (redraw-metro law).
+--
+-- Drawn extent (asserted by bin/lua/fx_page_test.lua): x 97..127, y 36..48 --
+-- text baselines sit ~6px above their y, hence the label rows at +2/+8 clear the
+-- param row that ends at y 33.
+function PageRender:draw_fx_meter(key_db, gr_db, thresh_db, show_thresh)
+  local x0, y0 = FMIX_METER_X, FMIX_METER_Y
+  local function db01(db)
+    local f = ((db or -60) + 40) / 40
+    return f < 0 and 0 or (f > 1 and 1 or f)
+  end
+  local key_f = db01(key_db)
+  local gr = -(gr_db or 0)
+  gr = gr < 0 and 0 or (gr > 20 and 20 or gr)
+  local gr_f = gr / 20
+  local bx = x0 + FMIX_METER_LABEL_W
+  local bw = FMIX_METER_W - FMIX_METER_LABEL_W
+  screen.level(3)
+  screen.move(x0, y0 + 2)
+  screen.text("IN")
+  screen.move(x0, y0 + 8)
+  screen.text("GR")
+  screen.level(1)
+  screen.rect(bx, y0, bw, 2)
+  screen.rect(bx, y0 + 6, bw, 2)
+  screen.fill()
+  screen.level(6)
+  if key_f > 0 then screen.rect(bx, y0, max(1, floor(key_f * bw + 0.5)), 2) end
+  screen.fill()
+  screen.level(12)
+  if gr_f > 0 then screen.rect(bx, y0 + 6, max(1, floor(gr_f * bw + 0.5)), 2) end
+  screen.fill()
+  if show_thresh then
+    screen.level(15)
+    screen.rect(bx + floor(db01(thresh_db) * (bw - 1) + 0.5), y0 - 1, 1, 4)
+    screen.fill()
+  end
+end
+
+-- The meter's allowed box (x0, y0, x1, y1), exported so the QA test can assert the
+-- drawn pixels stay inside it -- i.e. clear of both param rows, the banner and the
+-- trailing MIX cell.
+function PageRender.fx_meter_bounds()
+  return FMIX_BANNER_W, FMIX_ROW_BOTTOM_Y + LowProfile.CELL_H, 127, FMIX_TRAIL_Y - 1
 end
 
 function PageRender:draw_fx_sends(x0, y0, w, h, items)

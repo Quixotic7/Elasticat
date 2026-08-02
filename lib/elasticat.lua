@@ -508,8 +508,24 @@ end
 -- raw seconds -- SS5) so it stays tempo-sync'd across BPM changes. Labels are a
 -- standard delay-pedal division set; index -> beats (quarter note = 1 beat,
 -- matching the engine's existing chopBeats/targetBpm convention).
-local DELAY_TIME_LABELS = {"1/32", "1/16", "1/8", "1/4", "3/8", "1/2", "3/4", "1 BAR", "2 BAR"}
-local DELAY_TIME_BEATS = {0.125, 0.25, 0.5, 1, 1.5, 2, 3, 4, 8}
+-- ONE shared tempo-synced division list for every delay-family TIME param
+-- (DELAY, ECHO, TAPE ECHO): the full classic/dotted/triplet set, sorted by
+-- beats; default 1/4 (index 9). DELAY adopted this list 2026-08-01 (owner) --
+-- projects saved against its old 9-entry list land on a NEIGHBORING division
+-- (old default "1/4" index 4 now reads "1/8T") and need a one-time re-dial;
+-- accepted, same precedent as the warp-roster compaction.
+local DELAY_TIME_LABELS = {"1/32", "1/16T", "1/16", "1/8T", "1/16D", "1/8", "1/4T", "1/8D", "1/4", "1/2T", "1/4D", "1/2", "1/2D", "1 BAR", "2 BAR"}
+local DELAY_TIME_BEATS = {0.125, 1 / 6, 0.25, 1 / 3, 0.375, 0.5, 2 / 3, 0.75, 1, 4 / 3, 1.5, 2, 3, 4, 8}
+local ECHO_TIME_LABELS = DELAY_TIME_LABELS
+local ECHO_TIME_BEATS = DELAY_TIME_BEATS
+-- Motion (#17): the shared trem/autopan LFO rate, beats per cycle (synced).
+local MOTION_RATE_LABELS = {"4 BAR", "2 BAR", "1 BAR", "1/2", "1/4", "1/8", "1/16"}
+local MOTION_RATE_BEATS = {16, 8, 4, 2, 1, 0.5, 0.25}
+-- The new machines' generated send/master params record a sync closure here at
+-- registration time; sync_bus_fx re-pushes them all on an engine restart (they
+-- used to reset to SynthDef defaults until touched -- the "bare engine restart"
+-- gap). Each entry: {id = param id, push = function(value) -> engine call}.
+local send_fx_extra_sync = {}
 
 -- Modulation (MOD category): 2 LFOs + 1 mod envelope, computed engine-side on
 -- control buses (one \elasticatMod synth -- see Engine_Elasticat.sc). The
@@ -746,6 +762,8 @@ elasticat.param_xforms = {
   lofi_bits = function(x) return lofi_bits_depth(x) end,
   lofi_rate = function(x) return lofi_rate_hz(x) end,
   delay_beats = function(x) return DELAY_TIME_BEATS[x] or 1 end,
+  echo_beats = function(x) return ECHO_TIME_BEATS[x] or 1 end,
+  motion_beats = function(x) return MOTION_RATE_BEATS[x] or 1 end,
   mod_beats = function(x) return MOD_SPEED_BEATS[x] or 4 end,
   env_seconds = function(x, track) return env_value_to_seconds(x, track) end,
   -- Track-space 0-128 -> engine-space, folding in THIS track file-trim window
@@ -784,8 +802,47 @@ elasticat.param_actions = {
   -- Source machine (loop / loop_trig / slice) change: re-evaluate the free-run
   -- play gate so switching back to loop mid-run resumes, and switching to a
   -- slice machine stops the reader (slices sound from their own triggers) (#45).
+  -- Track 1 preserves its historical extra step: flush pending sends, re-push
+  -- the warp mode, and re-apply the active mode's params (the engine keeps its
+  -- own copies, but track 1 always re-asserted them on a machine swap and that
+  -- behavior is kept bit-for-bit through the unification).
   source_machine = function(_, track)
+    if track == 1 then
+      if elasticat.flush_engine_sends ~= nil then elasticat.flush_engine_sends() end
+      elasticat.tr_now(ids.mode, 1, "setMode", (params:get(ids.mode) or 1) - 1)
+      if elasticat.apply_current_mode_params ~= nil then elasticat.apply_current_mode_params() end
+    end
     elasticat.push_track_play_state(track)
+  end,
+  -- Track transport. Track 1 is the MASTER: starting it resets the global
+  -- clock origin + playhead (elasticat.set_engine_play). Other tracks are
+  -- plain per-track play states.
+  play = function(x, track)
+    if track == 1 and elasticat.set_engine_play ~= nil then
+      elasticat.set_engine_play(x)
+    else
+      elasticat.tr_call(track, "play", x)
+    end
+  end,
+  -- Warp mode. Flush first so the swap lands AFTER any queued param values;
+  -- track 1 additionally re-pushes the active mode's params (historical
+  -- hand-registered behavior, preserved).
+  warp_mode = function(x, track)
+    if elasticat.flush_engine_sends ~= nil then elasticat.flush_engine_sends() end
+    elasticat.tr_call(track, "setMode", x - 1)
+    if track == 1 and elasticat.apply_current_mode_params ~= nil then
+      elasticat.apply_current_mode_params()
+    end
+  end,
+  -- Slice voicing. The param is per-track state read at trigger time (the
+  -- machine/trigger path passes an explicit mono flag); the engine ALSO keeps
+  -- a legacy global mono flag that only track 1's param ever drove -- kept
+  -- exactly so (a background track's param cannot flip another track's
+  -- default-flag triggers).
+  slice_polyphony = function(x, track)
+    if track == 1 and engine_call ~= nil then
+      engine_call("setSliceMono", x == 2 and 1 or 0)
+    end
   end
 }
 
@@ -1210,6 +1267,18 @@ function elasticat.sync_tracks()
       if entry.cmd ~= nil then
         elasticat.sync_entry(track, entry)
       end
+    end
+    -- The structural rows (warp mode, play) moved from `cmd` to NAMED actions
+    -- in the track-1 unification, which took them out of the cmd loop above.
+    -- Re-fire them explicitly -- mode AFTER the values so its respawn seeds
+    -- from what was just sent, play last (at init that is play(0), a no-op).
+    local mode_pid = elasticat.track_pid(track, "mode")
+    if elasticat.param_exists(mode_pid) and elasticat.param_actions.warp_mode ~= nil then
+      elasticat.param_actions.warp_mode(params:get(mode_pid), track)
+    end
+    local play_pid = elasticat.track_pid(track, "play")
+    if elasticat.param_exists(play_pid) and elasticat.param_actions.play ~= nil then
+      elasticat.param_actions.play(params:get(play_pid), track)
     end
   end
   -- ...and the pool metadata of the slot each track binds. That is NOT in the
@@ -1735,6 +1804,9 @@ local function set_engine_play(x)
   end
   tr_call(1, "play", x)
 end
+-- The SPEC "play" action routes track 1 here (param_actions is defined above
+-- this local, so it reaches it through the module table).
+elasticat.set_engine_play = set_engine_play
 
 local function send_clock_observation()
   if ids.target_bpm == nil then
@@ -1761,21 +1833,73 @@ local function send_clock_observation()
   last_observation_time = util.time()
 end
 
--- Auto-recovery for a wedged norns clock (owner: "adjusting pattern rates stops
--- the internal clock; a double-stop fixes it"). The double-stop is reset_clock ->
--- clock.cleanup(), which frees a leaked/exhausted clock-coroutine pool that the
--- sync fiber's clock.sync() can no longer resume through. This does the SAME
--- recovery automatically. It runs on a METRO -- deliberately, because a metro is
--- not a clock coroutine, so it keeps ticking even when the clock pool is
--- exhausted. Tightly gated: only while clock sync is on, only after a >3s gap in
--- observations (normal cadence is one per 1/4 beat, <=1.5s even at 40 BPM), and
--- at most once per 10s so a genuinely dead external clock source can't churn it.
+-- Clock watchdog: two DIFFERENT failures, told apart honestly (2026-07-30
+-- on-device forensics; docs/../memory "clock watchdog" + "jack xrun hazard"):
+--
+--  1. COROUTINE-POOL WEDGE (Lua-side): the sync fiber's clock.sync() can no
+--     longer resume, but the clock itself is fine -- clock.get_beats() keeps
+--     advancing. clock.cleanup() + a sync restart genuinely FIXES this (the
+--     owner's manual "double-stop"). Auto-recovered below, as before.
+--
+--  2. JACK FRAME-TIME STALL: an xrun storm corrupts jackd's frame time, and
+--     matron's beat clock IS jack frame time -- clock.get_beats() FREEZES
+--     while wall time advances. NOTHING Lua-side can fix this; only a reboot
+--     (jackd restart) can. The old watchdog ran the same "auto-recovery"
+--     here and CLAIMED success while the clock stayed dead. Now it detects
+--     the frozen beat clock, tries recovery ONCE (harmless, and covers a
+--     misdiagnosis), and if beats stay frozen it latches
+--     elasticat.clock_stalled -- the coordinator's header shows
+--     "CLOCK STALLED - REBOOT" -- instead of pretending.
+--
+-- Runs on a METRO -- deliberately, because a metro is not a clock coroutine,
+-- so it keeps ticking through both failure modes. The stall diagnosis is
+-- gated on the INTERNAL clock source: on an external source (MIDI/Link),
+-- frozen beats just mean the source stopped, and the pool-wedge path below
+-- stays throttled so a dead source can't churn recoveries.
+local wd = {beats = nil, beats_time = 0, stall_recovery_tried = false}
+elasticat.clock_stalled = false
+
 function elasticat.start_clock_watchdog()
   if clock_watchdog_metro ~= nil then return end
   if metro == nil or metro.init == nil then return end
   clock_watchdog_metro = metro.init(function()
     if ids.clock_sync == nil or params:get(ids.clock_sync) ~= 1 then return end
     local now = util.time()
+
+    -- ---- Beat-clock proof of life (jack-stall detector) -------------------
+    local beats = (clock ~= nil and clock.get_beats ~= nil) and clock.get_beats() or nil
+    if beats ~= nil and clock_param_is_internal() then
+      if wd.beats == nil or beats ~= wd.beats then
+        wd.beats = beats
+        wd.beats_time = now
+        if elasticat.clock_stalled then
+          -- Beats moving again (in practice: after a reboot, or a transient
+          -- that resolved itself). Stand down honestly.
+          elasticat.clock_stalled = false
+          wd.stall_recovery_tried = false
+          print("elasticat: beat clock advancing again -- stall cleared")
+        end
+      elseif (now - wd.beats_time) > 3 then
+        -- Internal clock, wall time moving, beats frozen >3s: jack stall.
+        if not wd.stall_recovery_tried then
+          -- One recovery attempt, in case this is a misdiagnosed pool wedge.
+          wd.stall_recovery_tried = true
+          last_clock_recovery = now
+          print("elasticat: beat clock FROZEN -- one recovery attempt")
+          if clock.cleanup ~= nil then clock.cleanup() end
+          elasticat.start_clock_sync()
+        elseif (now - wd.beats_time) > 8 and not elasticat.clock_stalled then
+          elasticat.clock_stalled = true
+          print("elasticat: AUDIO CLOCK STALLED (jack frame time frozen). "
+            .. "Lua cannot recover this -- REBOOT the norns (SLEEP > power on).")
+        end
+        return   -- while frozen, the pool-wedge recovery below would be a lie
+      end
+    end
+
+    -- ---- Coroutine-pool wedge (beats fine, observations stopped) ----------
+    -- Normal cadence is one observation per 1/4 beat (<=1.5s even at 40 BPM);
+    -- at most one recovery per 10s so a dead external source can't churn it.
     if (now - last_observation_time) > 3 and (now - last_clock_recovery) > 10 then
       last_clock_recovery = now
       last_observation_time = now  -- grace period so recovery isn't re-triggered
@@ -2049,6 +2173,21 @@ function elasticat.sync_fx(track)
   elasticat.sync_entries(track, {
     "fx_drive", "fx_mix", "delay_time", "delay_feedback", "delay_tone",
     "reverb_size", "reverb_damp", "lofi_bits", "lofi_rate",
+    -- new machines' per-track insert params (Comp/Destroy/Echo/Blackhole)
+    "comp_thresh", "comp_ratio", "comp_attack", "comp_release", "comp_makeup",
+    "destroy_warble", "destroy_fold", "destroy_sat", "destroy_crush", "destroy_srr",
+    "destroy_tone", "destroy_level",
+    "echo_time", "echo_offset", "echo_mode", "echo_tone", "echo_wobble",
+    "bh_gravity", "bh_mod", "bh_low", "bh_predelay",
+    "modfx_rate", "modfx_depth", "modfx_tone", "chorus_width", "flanger_feedback",
+    "phaser_center", "phaser_stages", "phaser_feedback",
+    "eq_low", "eq_mid", "eq_high", "eq_xlow", "eq_xhi",
+    "duck_amount", "duck_sens", "duck_attack", "duck_release",
+    "tape_wow", "tape_flutter", "tape_sat",
+    "cass_noise", "cass_crackle", "cass_drop", "cass_tone",
+    "motion_width", "motion_rate", "motion_trem", "motion_pan", "motion_shape",
+    "rings_mode", "rings_freq", "rings_fine", "rings_feedback",
+    "limit_gain", "limit_ceil", "limit_release",
     "fx_insert1_machine",
     "send_tap", "send1_level", "send2_level"
   })
@@ -2064,7 +2203,7 @@ elasticat.sync_bus_fx = function()
   local function slot(cmd_prefix, slot_ids, machine_id, machine_cmd)
     engine_call(cmd_prefix .. "FxDrive", util.clamp((params:get(slot_ids.fx_drive) or 0) / 127, 0, 1))
     engine_call(cmd_prefix .. "FxMix", util.clamp((params:get(slot_ids.fx_mix) or 64) / 127, 0, 1))
-    engine_call(cmd_prefix .. "DelayTime", DELAY_TIME_BEATS[params:get(slot_ids.delay_time) or 4] or 1)
+    engine_call(cmd_prefix .. "DelayTime", DELAY_TIME_BEATS[params:get(slot_ids.delay_time) or 9] or 1)
     engine_call(cmd_prefix .. "DelayFeedback", util.clamp((params:get(slot_ids.delay_feedback) or 38) / 127, 0, 1))
     engine_call(cmd_prefix .. "DelayTone", util.clamp((params:get(slot_ids.delay_tone) or 127) / 127, 0, 1))
     engine_call(cmd_prefix .. "ReverbSize", util.clamp((params:get(slot_ids.reverb_size) or 64) / 127, 0, 1))
@@ -2097,6 +2236,16 @@ elasticat.sync_bus_fx = function()
     reverb_damp = ids.master_reverb_damp, lofi_bits = ids.master_lofi_bits,
     lofi_rate = ids.master_lofi_rate
   }, ids.master_fx_machine, "setMasterMachine")
+
+  -- The new machines' generated send/master params: replay every recorded sync
+  -- closure from its param value, so a bare mid-session engine restart no longer
+  -- resets them to SynthDef defaults until touched (they go through the same
+  -- coalescing queue their edit actions use).
+  for _, e in ipairs(send_fx_extra_sync) do
+    if elasticat.param_exists(e.id) then
+      e.push(params:get(e.id))
+    end
+  end
 end
 
 -- Modulation: 2 LFOs + mod envelope + the 4 macros (value + 5 matrix depths
@@ -2681,6 +2830,10 @@ function elasticat.params(options)
     -- on any mode switch regardless of which branch ran above.
     push("warp_rate", "warpRate")
   end
+  -- The SPEC "warp_mode" / "source_machine" actions re-apply track 1's mode
+  -- params through here (param_actions is defined above this params()-local,
+  -- so it reaches it via the module table).
+  elasticat.apply_current_mode_params = apply_current_mode_params
 
   -- ---- PROJECT group (PRD §7, workstream C) --------------------------------
   -- Load/Save/Save As New/New Project + the auto-name setting, exposed as
@@ -2723,7 +2876,7 @@ function elasticat.params(options)
   -- editor_prefs.data and never changes when loading or creating projects.
   params:add_option(ids.project_auto_name, "project auto-name", {"none", "date", "namesizer"}, 1)
 
-  params:add_group(param_id(prefix, "group_setup"), "elasticat setup", 18)
+  params:add_group(param_id(prefix, "group_setup"), "elasticat setup", 15)
 
   add_control(ids.sample_slot, "sample slot",
     cs.new(0, 128, "lin", 1, 1, "", 1 / 128),
@@ -2754,30 +2907,17 @@ function elasticat.params(options)
     end
   end)
 
-  params:add_option(ids.machine, "machine", elasticat.machines, 1)
-  params:set_action(ids.machine, function(x)
-    flush_engine_sends()
-    tr_call(1, "setMode", params:get(ids.mode) - 1)
-    apply_current_mode_params()
-    -- Only a continuous (loop) machine free-runs its reader; slice machines
-    -- sound from their own triggers. Track 1's transport, named explicitly.
-    tr_call(1, "play", x == 1 and params:get(ids.play) or 0)
-  end)
-
-  params:add_option(ids.mode, "engine mode", elasticat.modes, 1)
-  params:set_action(ids.mode, function(x)
-    flush_engine_sends()
-    tr_call(1, "setMode", x - 1)
-    apply_current_mode_params()
-  end)
+  -- machine + mode (warp): registered by ParamsSpec for ALL tracks including
+  -- track 1 (t1 = true) -- the "source_machine" / "warp_mode" actions carry the
+  -- track-1 extras (flush + mode-param re-apply). One registration path.
 
   -- mode_macro (CHAOS), wsola_window/search: now registered through ParamsSpec (t1)
   -- so track 1 takes the base-value resolver -- their step p-locks are non-destructive
   -- and show on the actual bar. (The engine names mode_macro's cmd \trModeMacro, an
   -- alias of the per-track \macro reader arg.)
 
-  params:add_binary(ids.play, "play", "toggle", 0)
-  params:set_action(ids.play, set_engine_play)
+  -- play: registered by ParamsSpec (t1) -- the "play" action routes track 1 to
+  -- set_engine_play (master transport) and other tracks to a plain tr play.
 
   params:add_binary(ids.clock_sync, "clock sync", "toggle", default_sync)
   params:set_action(ids.clock_sync, function(x)
@@ -2958,10 +3098,7 @@ function elasticat.params(options)
     end,
     function(param) return string.format("%.2fx", param:get()) end)
 
-  add_control(ids.pattern_steps, "pattern steps",
-    cs.new(1, 256, "lin", 1, 16, "", 1 / 255),
-    function(_) end,
-    function(param) return tostring(math.floor(param:get() + 0.5)) end)
+  -- pattern_steps: registered by ParamsSpec (t1). State-only, sequencer reads it.
 
   -- Pattern system (PRD §6). pattern_quantize = Tonverk-style change timing;
   -- global_pattern_length = the project-wide cycle a sequential switch engages
@@ -2980,24 +3117,20 @@ function elasticat.params(options)
   -- LFO / filter; a ghost trigger has these off. No engine action yet -- env /
   -- LFO / filter don't exist until Phase 2/3, so these are forward-compatible
   -- placeholders that also feed the ghost/normal derivation in grid_sequencer.
-  params:add_binary(ids.env_reset, "env reset", "toggle", 1)
-  params:add_binary(ids.lfo_reset, "lfo reset", "toggle", 1)
-  params:add_binary(ids.filter_reset, "filter reset", "toggle", 1)
+  -- env_reset / lfo_reset / filter_reset: registered by ParamsSpec (t1).
 
   -- Trig Jump (default on, p-lockable): on = a step with a start/end lock always
   -- warps the playhead to the region start; off = it only repositions if the
   -- playhead is now outside the new region (otherwise it keeps playing). Pure
   -- sequencing behaviour in grid_sequencer -- no engine action.
-  params:add_binary(ids.trig_jump, "trig jump", "toggle", 1)
-  params:set_action(ids.trig_jump, function(_) end)
+  -- trig_jump: registered by ParamsSpec (t1). State-only.
 
   -- Trig Release (default Return, p-lockable): where the playhead lands when a
   -- region-locking step's window ends. Return = where the main loop would
   -- naturally be (keeps a tempo-warped loop perfectly synced through step
   -- overrides), Boomerang = continue from the override's position, Reset =
   -- region start. Pure sequencing behaviour in grid_sequencer.
-  params:add_option(ids.trig_release, "trig release", {"return", "boomerang", "reset"}, 1)
-  params:set_action(ids.trig_release, function(_) end)
+  -- trig_release: registered by ParamsSpec (t1). State-only.
 
   -- Live Step Trig (master setting, default off): while playing, holding a step
   -- fires it immediately and it overrides the sequence until released. Off =
@@ -3011,22 +3144,18 @@ function elasticat.params(options)
   --    convention -- it's a literal percentage.)
   --  * Condition: none | A:B cycles | fill/!fill | pre/!pre | nei/!nei | 1st.
   --    NEI/!NEI evaluate always-true until the neighbor machine exists.
-  params:add_number(ids.trig_chance, "trig chance", 0, 100, 100)
-  params:set_action(ids.trig_chance, function(_) end)
-  params:add_option(ids.trig_condition, "trig condition", TRIG_CONDITIONS, 1)
-  params:set_action(ids.trig_condition, function(_) end)
+  -- trig_chance + trig_condition: registered by ParamsSpec (t1). State-only.
 
   -- Ratchet: per-step retrig count -- the step re-triggers this many times,
   -- evenly across its duration (1 = normal single hit). P-lockable.
-  params:add_number(ids.trig_ratchet, "trig ratchet", 1, 8, 1)
-  params:set_action(ids.trig_ratchet, function(_) end)
+  -- trig_ratchet: registered by ParamsSpec (t1). State-only.
 
   -- Swing (global; per-step micro-offset comes later): 50 = straight, higher
   -- delays every other step. Pure timing in grid_sequencer, no engine action.
   params:add_number(ids.swing, "swing", 50, 75, 50)
   params:set_action(ids.swing, function(_) end)
 
-  params:add_group(param_id(prefix, "group_loop"), "loop playback", 5)
+  params:add_group(param_id(prefix, "group_loop"), "loop playback", 4)
 
   add_control(param_id(prefix, "playhead"), "playhead",
     cs.new(0, 1, "lin", 0.001, 0, "", 0.001),
@@ -3082,10 +3211,7 @@ function elasticat.params(options)
   -- already sent per-track (trXfade / trPitch); the migration just makes their step
   -- p-locks non-destructive + drives the actual bar. See params_spec.lua.
 
-  params:add_binary(param_id(prefix, "loop_reverse"), "loop reverse", "toggle", 0)
-  params:set_action(param_id(prefix, "loop_reverse"), function(x)
-    elasticat.tr_queue(param_id(prefix, "loop_reverse"), 1, "setReverse", x)
-  end)
+  -- loop_reverse: registered by ParamsSpec (t1) -- same queued setReverse send.
 
   -- Send 1/2 + Master insert FX (PRD §3/§8): each slot reuses the exact same
   -- Drive/Mix/Delay*/Reverb*/Lofi* shape as Insert 1 above -- this local
@@ -3103,7 +3229,7 @@ function elasticat.params(options)
       function(x) queue_engine_call(slot_ids.fx_mix, cmd_prefix .. "FxMix", util.clamp(x / 127, 0, 1)) end,
       format_env_level)
 
-    params:add_option(slot_ids.delay_time, display_prefix .. " delay time", DELAY_TIME_LABELS, 4)
+    params:add_option(slot_ids.delay_time, display_prefix .. " delay time", DELAY_TIME_LABELS, 9)
     params:set_action(slot_ids.delay_time, function(x)
       queue_engine_call(slot_ids.delay_time, cmd_prefix .. "DelayTime", DELAY_TIME_BEATS[x] or 1)
     end)
@@ -3137,13 +3263,101 @@ function elasticat.params(options)
       cs.new(0, 127, "lin", 1, 127, "", 1 / 127),
       function(x) queue_engine_call(slot_ids.lofi_rate, cmd_prefix .. "LofiRate", lofi_rate_hz(x)) end,
       format_lofi_rate)
+
+    -- New machines' send/master params (Comp/Destroy/Echo/Blackhole), generated
+    -- (mirrors the engine's generated command block). ids are built from cmd_prefix
+    -- so no per-slot id table is needed; the engine command is cmd_prefix .. Cmd.
+    local amount_params = {
+      {"comp_thresh", "CompThresh", 38}, {"comp_ratio", "CompRatio", 25},
+      {"comp_attack", "CompAttack", 13}, {"comp_release", "CompRelease", 38},
+      {"comp_makeup", "CompMakeup", 0}, {"destroy_warble", "DestroyWarble", 0},
+      {"destroy_fold", "DestroyFold", 0}, {"destroy_sat", "DestroySat", 0},
+      {"destroy_crush", "DestroyCrush", 0}, {"destroy_srr", "DestroySrr", 0},
+      {"destroy_tone", "DestroyTone", 127},
+      {"destroy_level", "DestroyLevel", 70}, {"echo_tone", "EchoTone", 127},
+      {"echo_wobble", "EchoWobble", 0}, {"bh_gravity", "BhGravity", 64},
+      {"bh_mod", "BhMod", 25}, {"bh_low", "BhLow", 13}, {"bh_predelay", "BhPredelay", 13},
+      -- Chorus/Flanger/Phaser (mod trio + specifics), DJ EQ crossovers, Duck.
+      {"modfx_rate", "ModfxRate", 38}, {"modfx_depth", "ModfxDepth", 38},
+      {"modfx_tone", "ModfxTone", 102}, {"chorus_width", "ChorusWidth", 64},
+      {"phaser_center", "PhaserCenter", 64}, {"phaser_feedback", "PhaserFeedback", 25},
+      {"eq_xlow", "EqXlow", 38}, {"eq_xhi", "EqXhi", 89},
+      {"duck_amount", "DuckAmount", 76}, {"duck_sens", "DuckSens", 64},
+      {"duck_attack", "DuckAttack", 25}, {"duck_release", "DuckRelease", 51},
+      -- Tape Echo / Cassette / Motion / Rings / Limit.
+      {"tape_wow", "TapeWow", 25}, {"tape_flutter", "TapeFlutter", 15},
+      {"tape_sat", "TapeSat", 30}, {"cass_noise", "CassNoise", 10},
+      {"cass_crackle", "CassCrackle", 0}, {"cass_drop", "CassDrop", 0},
+      {"cass_tone", "CassTone", 80}, {"motion_trem", "MotionTrem", 0},
+      {"motion_pan", "MotionPan", 0}, {"rings_feedback", "RingsFeedback", 0},
+      {"limit_gain", "LimitGain", 0}, {"limit_ceil", "LimitCeil", 121},
+      {"limit_release", "LimitRelease", 38}
+    }
+    -- Every generated param ALSO records a sync closure (send_fx_extra_sync):
+    -- sync_bus_fx replays them on an engine restart so these no longer reset to
+    -- SynthDef defaults until touched.
+    local function reg_sync(id, push)
+      send_fx_extra_sync[#send_fx_extra_sync + 1] = {id = id, push = push}
+    end
+    for _, e in ipairs(amount_params) do
+      local id = param_id(prefix, cmd_prefix .. "_" .. e[1])
+      local cmd = e[2]
+      local push = function(x) queue_engine_call(id, cmd_prefix .. cmd, util.clamp(x / 127, 0, 1)) end
+      add_control(id, display_prefix .. " " .. e[1]:gsub("_", " "),
+        cs.new(0, 127, "lin", 1, e[3], "", 1 / 127), push, format_env_level)
+      reg_sync(id, push)
+    end
+    -- bipolar params (0-128, 64 = center -> -1..1): Echo offset, Flanger feedback,
+    -- DJ EQ band gains, Motion width, Rings freq/fine.
+    local bipolar_params = {
+      {"echo_offset", "EchoOffset", 64}, {"flanger_feedback", "FlangerFeedback", 64},
+      {"eq_low", "EqLow", 64}, {"eq_mid", "EqMid", 64}, {"eq_high", "EqHigh", 64},
+      {"motion_width", "MotionWidth", 64}, {"rings_freq", "RingsFreq", 96},
+      {"rings_fine", "RingsFine", 64}
+    }
+    for _, e in ipairs(bipolar_params) do
+      local id = param_id(prefix, cmd_prefix .. "_" .. e[1])
+      local cmd = e[2]
+      local push = function(x) queue_engine_call(id, cmd_prefix .. cmd, util.clamp((x - 64) / 64, -1, 1)) end
+      add_control(id, display_prefix .. " " .. e[1]:gsub("_", " "),
+        cs.new(0, 128, "lin", 1, e[3], "", 1 / 128), push, format_env_level)
+      reg_sync(id, push)
+    end
+    -- option params: 0-based index pushes (phaser stages, echo mode, motion shape,
+    -- rings mode) + the two beats-mapped division lists (echo time, motion rate).
+    local option_params = {
+      {"phaser_stages", "PhaserStages", {"2", "4", "6", "8"}, 2},
+      {"echo_mode", "EchoMode", {"stereo", "ping-pong"}, 1},
+      {"motion_shape", "MotionShape", {"sine", "tri", "sqr"}, 1},
+      {"rings_mode", "RingsMode", {"ring", "shift"}, 1}
+    }
+    for _, e in ipairs(option_params) do
+      local id = param_id(prefix, cmd_prefix .. "_" .. e[1])
+      local cmd = e[2]
+      local push = function(x) queue_engine_call(id, cmd_prefix .. cmd, x - 1) end
+      params:add_option(id, display_prefix .. " " .. e[1]:gsub("_", " "), e[3], e[4])
+      params:set_action(id, push)
+      reg_sync(id, push)
+    end
+    local beat_options = {
+      {"echo_time", "EchoBeats", ECHO_TIME_LABELS, ECHO_TIME_BEATS, 9},
+      {"motion_rate", "MotionBeats", MOTION_RATE_LABELS, MOTION_RATE_BEATS, 5}
+    }
+    for _, e in ipairs(beat_options) do
+      local id = param_id(prefix, cmd_prefix .. "_" .. e[1])
+      local cmd, beats = e[2], e[4]
+      local push = function(x) queue_engine_call(id, cmd_prefix .. cmd, beats[x] or 1) end
+      params:add_option(id, display_prefix .. " " .. e[1]:gsub("_", " "), e[3], e[5])
+      params:set_action(id, push)
+      reg_sync(id, push)
+    end
   end
 
   -- Send 1: machine is a setting (respawns the engine's send1 synth). The send
   -- LEVEL and the tap point are per-track (lib/tracks/params_spec.lua); the
   -- send BUS and its FX are shared by every track, so only the machine + its
   -- 9 knobs live here.
-  params:add_group(param_id(prefix, "group_send1"), "send 1", 10)
+  params:add_group(param_id(prefix, "group_send1"), "send 1", 67)
   params:add_option(ids.send1_machine, "send 1 machine", FxRegistry.names(), 1)
   params:set_action(ids.send1_machine, function(x)
     queue_engine_call(ids.send1_machine, "setSend1Machine", x - 1)
@@ -3161,7 +3375,7 @@ function elasticat.params(options)
   }, "send1", "send 1")
 
   -- Send 2: mirrors Send 1.
-  params:add_group(param_id(prefix, "group_send2"), "send 2", 10)
+  params:add_group(param_id(prefix, "group_send2"), "send 2", 67)
   params:add_option(ids.send2_machine, "send 2 machine", FxRegistry.names(), 1)
   params:set_action(ids.send2_machine, function(x)
     queue_engine_call(ids.send2_machine, "setSend2Machine", x - 1)
@@ -3181,7 +3395,7 @@ function elasticat.params(options)
   -- Master insert: sits after Insert 1 and both send returns, before the
   -- track's one stereo output path (PRD §3). No level control -- it's always
   -- in the chain, machine NONE (default) is the bypass.
-  params:add_group(param_id(prefix, "group_master_fx"), "master fx", 10)
+  params:add_group(param_id(prefix, "group_master_fx"), "master fx", 67)
   params:add_option(ids.master_fx_machine, "master fx machine", FxRegistry.names(), 1)
   params:set_action(ids.master_fx_machine, function(x)
     queue_engine_call(ids.master_fx_machine, "setMasterMachine", x - 1)
@@ -3208,52 +3422,17 @@ function elasticat.params(options)
   -- rate_x formatter). apply_current_mode_params still re-pushes them by their
   -- unprefixed ids after a mode switch (those ids are track 1's, unchanged).
 
-  params:add_group(param_id(prefix, "group_slices"), "slice machines", 13)
+  params:add_group(param_id(prefix, "group_slices"), "slice machines", 3)
 
-  add_control(param_id(prefix, "slice_count"), "slice count",
-    cs.new(1, 32, "lin", 1, 16, "", 1 / 31),
-    function(_) end,
-    function(param) return tostring(math.floor(param:get() + 0.5)) end)
+  -- slice_count / slice_index / slice_play_mode / slice_reverse / slice_sync /
+  -- slice_rate: registered by ParamsSpec (t1) -- same specs, same (or no)
+  -- engine sends, one code path for all 8 tracks.
 
-  add_control(param_id(prefix, "slice_index"), "slice index",
-    cs.new(1, 32, "lin", 1, 1, "", 1 / 31),
-    function(_) end,
-    function(param) return tostring(math.floor(param:get() + 0.5)) end)
-
-  params:add_option(param_id(prefix, "slice_play_mode"), "slice play mode", {"1shot", "hold", "loop", "cont", "pong", "cloop"}, 1)
-  params:set_action(param_id(prefix, "slice_play_mode"), function(_) end)
-
-  params:add_binary(param_id(prefix, "slice_reverse"), "slice reverse", "toggle", 0)
-  params:set_action(param_id(prefix, "slice_reverse"), function(_) end)
-
-  params:add_binary(param_id(prefix, "slice_sync"), "slice clock sync", "toggle", 1)
-  params:set_action(param_id(prefix, "slice_sync"), function(x)
-    queue_engine_call(param_id(prefix, "slice_sync"), "setSliceSyncToClock", x)
-  end)
-
-  add_control(param_id(prefix, "slice_rate"), "slice rate",
-    cs.new(0.125, 8, "exp", 0.01, 1, "x", 0.01),
-    function(x) queue_engine_call(param_id(prefix, "slice_rate"), "setSliceRate", x) end,
-    function(param) return string.format("%.2fx", param:get()) end)
-
-  -- Ratchet is Lua-scheduled (no engine cmd). Track 1 is hand-registered here;
-  -- tracks 2-8 get it from ParamsSpec.SPEC. Without this, the Machine page's RTCH
-  -- cell crashed track 1 with "invalid parameter" (esp. on Razor/Slice Poly).
-  add_control(param_id(prefix, "slice_ratchet"), "slice ratchet",
-    cs.new(1, 4, "lin", 1, 1, "x", 1 / 3),
-    function(_) end,
-    function(param) return tostring(math.floor(param:get() + 0.5)) .. "x" end)
-
-  -- Default MONO (owner): one slice voice at a time keeps the slice machine
-  -- cheap. Poly is opt-in. The engine's sliceMono default matches (mono) so a
-  -- fresh boot agrees without needing an init push.
-  params:add_option(param_id(prefix, "slice_polyphony"), "slice polyphony", {"poly 8", "mono"}, 2)
-  params:set_action(param_id(prefix, "slice_polyphony"), function(x)
-    engine_call("setSliceMono", x == 2 and 1 or 0)
-  end)
-
-  params:add_binary(param_id(prefix, "slice_hold_to_step"), "slice hold to step", "toggle", 1)
-  params:set_action(param_id(prefix, "slice_hold_to_step"), function(_) end)
+  -- slice_ratchet / slice_polyphony / slice_hold_to_step: registered by
+  -- ParamsSpec (t1). Polyphony defaults MONO (owner) for every track now --
+  -- the SPEC default had drifted to poly for tracks 2-8 -- and its
+  -- "slice_polyphony" action still pushes the engine's legacy global mono
+  -- flag for track 1 only (see param_actions).
 
   -- Razor slice-point editor snap (owner). Off = free; Zero-X snaps edited (and
   -- Razor SNAP mode: what FN + the Start/End knobs do in the razor slice-point
@@ -3291,12 +3470,8 @@ function elasticat.params(options)
   -- slice_attack / slice_release now register via ParamsSpec (t1) -- track 1 takes
   -- the base-value resolver. The engine's sliceAttack/sliceRelease is a GLOBAL var
   -- and \trSliceAttack sets the same var (track arg ignored), so track 1's send is
-  -- unchanged, just non-destructive. slice_hold has NO engine cmd (Lua-read at the
-  -- slice-trigger, not a persistent send), so it stays hand-registered here.
-  add_control(param_id(prefix, "slice_hold"), "slice hold",
-    cs.new(0, 4, "lin", 0.01, 0.25, "", 0.01 / 4),
-    function(_) end,
-    format_ms)
+  -- unchanged, just non-destructive. slice_hold has NO engine cmd (Lua-read at
+  -- the slice-trigger): registered by ParamsSpec (t1) with the same ms readout.
 
   params:add_group(param_id(prefix, "group_razor"), "razor slices", 65)
 
@@ -3354,13 +3529,22 @@ function elasticat.params(options)
       end)
   end
 
-  params:add_group(param_id(prefix, "group_system"), "system", 2)
+  params:add_group(param_id(prefix, "group_system"), "system", 3)
 
   params:add_trigger(param_id(prefix, "reset"), "reset")
   params:set_action(param_id(prefix, "reset"), function() engine_call("reset") end)
 
   params:add_option(ids.debug, "debug", {"errors", "lifecycle", "clock", "verbose"}, 2)
   params:set_action(ids.debug, function(x) engine_call("setDebug", x - 1) end)
+
+  -- Idle track pause (CPU headroom): the engine pauses a stopped, silent,
+  -- un-viewed track's whole node group and wakes it on any play/trig/view.
+  -- The kill switch exists so odd behavior in the field can be ruled in or
+  -- out in one param flip (defaults match the engine's enabled=1).
+  params:add_option(param_id(prefix, "idle_pause"), "idle track pause", {"off", "on"}, 2)
+  params:set_action(param_id(prefix, "idle_pause"), function(x)
+    engine_call("idlePauseEnable", x - 1)
+  end)
 
   -- The per-track param set: active_track_count + every SPEC entry for all 8
   -- tracks (lib/tracks/params_spec.lua). Track 1 keeps the unprefixed ids it
@@ -3386,6 +3570,8 @@ function elasticat.params(options)
     filter_types = FILTER_TYPE_LABELS,
     fx_machines = FxRegistry.names(),
     delay_times = DELAY_TIME_LABELS,
+    echo_times = ECHO_TIME_LABELS,
+    motion_rates = MOTION_RATE_LABELS,
     mod_dests = MOD_DEST_LABELS,
     mod_waves = MOD_WAVE_LABELS,
     mod_lfo_modes = MOD_LFO_MODE_LABELS,

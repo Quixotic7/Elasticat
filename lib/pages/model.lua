@@ -421,15 +421,15 @@ local page_model = {
       }
     },
     settings = {
-      -- 5 fx machines: None (passthrough/bypass), Drive, Delay, Reverb, Lofi
-      -- (PRD SS4.3 Tier 1, plus the always-present None) -- shared by Insert 1,
-      -- Send 1/2, and the Master insert. Send tap picks which point in the
-      -- chain Send 1/2 pull from (PRD SS3).
-      item("fx_insert1_machine", "MACH", {options = 5}),
+      -- 14 fx machines: None, Drive, Delay, Reverb, Lofi, Comp, Destroy, Echo, Blackhole,
+      -- Blackhole -- shared by Insert 1, Send 1/2, and the Master insert. Send tap
+      -- picks which point in the chain Send 1/2 pull from (PRD SS3). The machine is
+      -- also changeable on-page via the FX Mode-Parameter banner.
+      item("fx_insert1_machine", "MACH", {options = 19}),
       item("send_tap", "TAP", {options = 2}),
-      item("send1_machine", "SEND1", {options = 5}),
-      item("send2_machine", "SEND2", {options = 5}),
-      item("master_fx_machine", "MASTER", {options = 5})
+      item("send1_machine", "SEND1", {options = 19}),
+      item("send2_machine", "SEND2", {options = 19}),
+      item("master_fx_machine", "MASTER", {options = 19})
     }
   },
   mod = {

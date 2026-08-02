@@ -135,7 +135,13 @@ function Header.draw(opts)
   screen.text_trim(message, 76)
 
   screen.move(117, 7)
-  if tempo ~= nil then
+  if opts.cpu_hot ~= nil then
+    -- DSP overload warning: scsynth peak CPU is in xrun territory, which on
+    -- this hardware is how clocks die (jack frame-time stall). Borrowing the
+    -- tempo slot is deliberate -- it is the one always-present numeric cell,
+    -- and a hot CPU matters more than re-reading the BPM you set.
+    screen.text_right("C" .. tostring(opts.cpu_hot) .. "!")
+  elseif tempo ~= nil then
     screen.text_right(string.format("%.1f", tempo))
   else
     screen.text_right(opts.state or "")

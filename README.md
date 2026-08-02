@@ -7,8 +7,12 @@ then scrub the loop's trim/range/region live while it plays. That live-scrub
 gesture is the whole point: it stays playable and p-lockable everywhere in
 the script.
 
-This is a single-track instrument today (a multi-track version is planned).
-Everything below describes the current, shipped behavior.
+Elasticat is an **8-track** instrument: every track is a full voice with its
+own machine, sample, warp mode, regions, sequence, filter, FX insert and
+modulation. Track keys live on grid row 4 (`T1`–`T8`), and the MIX page
+(MASTER category) shows all eight at a glance — plus a live CPU readout, since
+eight warped loops on a Pi are a budget to spend deliberately. Everything
+below describes the current, shipped behavior.
 
 ## Requirements
 
@@ -177,11 +181,18 @@ settings page:
 - **loop_trig** — the same engine, but silent except during a triggered
   step; a step's loop-key lock sets exactly the region *that step* plays.
 - **grid_slice** — divides the region into up to 32 equal slices. Row `y=2`
-  plays slices 1-16, row `y=3` plays 17-32. A step can carry more than one
-  slice unless slice polyphony is set to mono.
+  plays slices 1-16, row `y=3` plays 17-32. Mono voicing (a new slice cuts
+  the last).
 - **razor_slice** — same slice-trigger engine as grid_slice, but each slice
-  gets its own precise start/end pair (moving a slice's start moves its end
-  by the same amount, preserving its length).
+  gets its own precise start/end pair, edited in the razor editor (snap
+  modes, zoom, transient auto-chop).
+- **slice_poly / razor_poly** — the same two slice machines with polyphonic
+  voicing (up to 8 voices per track, 24 across all tracks; oldest voice is
+  stolen at the cap).
+
+Slice machines carry the MPC-style chop program: per-slice p-locks (hold a
+pad + edit), choke groups, pad copy/paste and mute, ratchets, and play modes
+(one-shot / hold / loop / ping-pong / continue).
 
 Loop machines also pick a **warp mode** — how the region is actually read
 back:
@@ -189,9 +200,9 @@ back:
 - **tape** — plays at the sample's native rate, tape-deck style; pitch is
   true varispeed (faster = higher, slower = lower).
 - **tempo_varispeed** — forces the region to fit the current step length and
-  BPM, so it always lands exactly at the loop boundary. (Known gap: the
-  pitch control doesn't do anything in this mode yet.)
-- **chopped** — slices the loop into rhythmic chunks (chop steps sets how
+  BPM, so it always lands exactly at the loop boundary; pitch rides on top
+  as a varispeed offset.
+- **domino** — slices the loop into rhythmic chunks (chop steps sets how
   many) with forward-stop, loop-forward, or ping-pong playback per chunk.
 - **granular** — reads the region as small overlapping grains; grain size,
   density, and jitter shape the texture, and pitch shifts grains
@@ -201,6 +212,22 @@ back:
 - **pitch_corrected** — plays the tempo-synced region through a pitch
   shifter, so timing and pitch are corrected separately (has its own
   robotic/formant character, tunable via the PC window/dispersion params).
+- **harmonizer** — stacks up to three pitch intervals on the reader (0 =
+  interval off).
+- **wavetable** — treats the sample as a wavetable and scans it with a
+  playhead-independent oscillator: slice count, interpolated morph, and a
+  scan LFO.
+- **spectral_freeze** / **formant** — FFT-based freeze/smear and
+  formant-preserving processing. The FFT chain runs on **track 1 only**;
+  other tracks silently fall back to tape (one FFT is affordable on the
+  norns CPU, eight are not).
+- **gstretch / gstretch2** — two flavors of Paulstretch-style extreme
+  stretch.
+- **chopped** — Digitakt-style chop sync: the chop ramp restarts on every
+  step start.
+
+Every mode also carries a p-lockable, tempo-synced **RATE** multiplier
+(WARP page, last slot). See `docs/MODE_CATALOG.md` for the full table.
 
 ### The region model: Track, Step, and Actual
 
@@ -383,12 +410,28 @@ settings, and each slot's knobs get their own FX page — Insert 1 on page 1,
 Send 1/2 on pages 3/4, Master on page 5 — showing whatever the active machine
 offers (all p-lockable):
 
-- **None** — passthrough (default; costs nothing).
-- **Drive** — tanh-style clip/saturation.
-- **Delay** — tempo-synced, with feedback and a tone (filter-in-loop)
-  control.
-- **Reverb** — algorithmic (FreeVerb-family), Size/Damp/Mix.
-- **Lofi** — bit-depth and sample-rate reduction.
+There are **19 machines** — see `docs/MODE_CATALOG.md` for the full table
+with every parameter. The short version:
+
+- **None**, **Drive**, **Reverb**, **Blackhole** (huge modulated reverb),
+  **Lofi**, **Destroy** (8-param wrecking chain, bitcrush + sample-rate
+  reduction first).
+- Three tempo-synced delays, all sharing the same 15-division TIME list
+  (1/32 … 2 BAR, dotted and triplet included): **Delay** (clean digital),
+  **Echo** (colored, stereo offset, tone/wobble), **Tape Echo**
+  (wow/flutter/saturation in the loop).
+- The mod trio: **Chorus**, **Flanger**, **Phaser**.
+- Character: **Cassette** (noise/crackle/dropouts), **Motion**
+  (width/autopan/tremolo), **Rings** (ring-mod/freq-shift).
+- Dynamics, with real dB/ms readouts and on-page metering where it counts:
+  **Comp** (IN/GR meters), **Duck** (sidechain ducking keyed from the
+  master), **DJ EQ** (3-band kill EQ), **Limit**.
+
+Machines with a wet/dry sense put **MIX** in the page's bottom-right slot.
+Destroy, DJ EQ, Duck, Motion and Limit are **always fully wet by design** —
+that blank trailing cell is intentional, not a missing param. Unlike warp and
+filter machines, the FX machine can be swapped **during playback** (hold FN
+and turn — the effect respawns without stopping the transport).
 
 ## Troubleshooting
 

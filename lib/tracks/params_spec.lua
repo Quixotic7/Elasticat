@@ -58,17 +58,25 @@ ParamsSpec.MACRO_DESTS = {
 --           track-1 param did via queue_engine_call) instead of sending
 --           immediately.
 --   hidden  params:hide() after registering (macro matrix depths).
---   t1      ParamsSpec registers this for TRACK 1 as well. Entries without it
---           are still hand-registered for track 1 in lib/elasticat.lua and are
---           only generated here for tracks 2-8.
+--   t1      ParamsSpec registers this for TRACK 1 as well. Only THREE entries
+--           remain without it -- sample_slot, loop_start, loop_end -- still
+--           hand-registered for track 1 in lib/elasticat.lua because they are
+--           welded to coordinator machinery the spec path deliberately does
+--           not duplicate (the active-pool-slot editor binding, and the
+--           playback-time region resolver gate `region_edit_handled`). Merge
+--           those only with the device at hand: the live region-scrub feel is
+--           the signature feature. Everything else is ONE code path.
 ParamsSpec.SPEC = {
   -- state
-  {suffix = "play", name = "play", kind = "binary", default = 0, cmd = "play"},
+  -- play: track 1 is the MASTER transport (clock-origin reset + playhead 0 on
+  -- start, see elasticat.set_engine_play); other tracks are plain per-track
+  -- transports. One registration, one action, the branch lives in param_actions.
+  {suffix = "play", name = "play", kind = "binary", default = 0, action = "play", t1 = true},
   {suffix = "mute", name = "mute", kind = "binary", default = 0, cmd = "mute", t1 = true},
   -- source
   {suffix = "sample_slot", name = "sample slot", spec = {0, 128, "lin", 1, 1, "", 1 / 128}, cmd = "setSampleSlot"},
   {suffix = "machine", name = "machine", kind = "option", options = "machines", default = 1,
-    action = "source_machine"},
+    action = "source_machine", t1 = true},
   {suffix = "pitch", name = "pitch", spec = {-24, 24, "lin", 0.1, 0, "st", 0.1 / 48}, cmd = "setPitch", queue = true, t1 = true},
   -- region_point folds THIS track file-trim window and Range into the engine
   -- point, matching what track 1 hand-registered action does. Without it a
@@ -87,10 +95,13 @@ ParamsSpec.SPEC = {
     action = "range_start", t1 = true},
   {suffix = "range_end", name = "range end", spec = {0, 128, "lin", 0.01, 128, "", 1 / 128},
     action = "range_end", t1 = true},
-  {suffix = "loop_reverse", name = "loop reverse", kind = "binary", default = 0, cmd = "setReverse"},
+  {suffix = "loop_reverse", name = "loop reverse", kind = "binary", default = 0, cmd = "setReverse", queue = true, t1 = true},
   {suffix = "xfade", name = "loop xfade", spec = {0, 0.25, "lin", 0.001, 0.010, "s", 0.004}, cmd = "xfade", fmt = "milliseconds", queue = true, t1 = true},
   -- warp
-  {suffix = "mode", name = "warp mode", kind = "option", options = "modes", default = 1, cmd = "setMode", offset = -1},
+  -- warp mode: the action flushes pending queued sends first (so the mode swap
+  -- lands after any in-flight param values) and, on track 1, re-pushes the
+  -- active mode's params (the historical hand-registered behavior, preserved).
+  {suffix = "mode", name = "warp mode", kind = "option", options = "modes", default = 1, action = "warp_mode", t1 = true},
   -- CHAOS macro (the warp "mode macro", 0..1). t1 so track 1 registers through the
   -- SPEC / base-value resolver instead of the old hand-registered destructive path,
   -- so its step p-lock shows on the actual bar (and it now exists on tracks 2-8).
@@ -152,19 +163,25 @@ ParamsSpec.SPEC = {
   {suffix = "warp_rate", name = "warp rate", spec = {0.0625, 8, "exp", 0.01, 1, "x", 0.01}, cmd = "warpRate", fmt = "rate_x", queue = true, t1 = true},
   -- slice machines (grid_slice; razor split tables stay shared with track 1 in
   -- Phase 1 -- 64 params x 7 tracks is deferred until per-track razor lands)
-  {suffix = "slice_count", name = "slice count", spec = {1, 32, "lin", 1, 16, "", 1 / 31}},
-  {suffix = "slice_index", name = "slice index", spec = {1, 32, "lin", 1, 1, "", 1 / 31}},
+  {suffix = "slice_count", name = "slice count", spec = {1, 32, "lin", 1, 16, "", 1 / 31}, fmt = "integer", t1 = true},
+  {suffix = "slice_index", name = "slice index", spec = {1, 32, "lin", 1, 1, "", 1 / 31}, fmt = "integer", t1 = true},
+  -- Short labels on purpose: the low-profile cells fit 5 characters.
   {suffix = "slice_play_mode", name = "slice play mode", kind = "option",
-    options = {"1 shot", "hold", "loop", "continue", "ping-pong", "cont loop"}, default = 1},
-  {suffix = "slice_reverse", name = "slice reverse", kind = "binary", default = 0},
+    options = {"1shot", "hold", "loop", "cont", "pong", "cloop"}, default = 1, t1 = true},
+  {suffix = "slice_reverse", name = "slice reverse", kind = "binary", default = 0, t1 = true},
   -- Capped at 4: >=5 rapid retriggers on a poly slice pile up bounded-release
   -- warp voices faster than they free, blowing CPU into audible garble (owner).
   -- A proper engine-side same-slice hard-steal could raise this later.
-  {suffix = "slice_ratchet", name = "slice ratchet", spec = {1, 4, "lin", 1, 1, "x", 1 / 3}},
-  {suffix = "slice_sync", name = "slice clock sync", kind = "binary", default = 1, cmd = "setSliceSyncToClock"},
-  {suffix = "slice_rate", name = "slice rate", spec = {0.125, 8, "exp", 0.01, 1, "x", 0.01}, cmd = "setSliceRate", queue = true},
-  {suffix = "slice_polyphony", name = "slice polyphony", kind = "option", options = {"poly 8", "mono"}, default = 1},
-  {suffix = "slice_hold_to_step", name = "slice hold to step", kind = "binary", default = 1},
+  {suffix = "slice_ratchet", name = "slice ratchet", spec = {1, 4, "lin", 1, 1, "x", 1 / 3}, fmt = "integer", t1 = true},
+  {suffix = "slice_sync", name = "slice clock sync", kind = "binary", default = 1, cmd = "setSliceSyncToClock", queue = true, t1 = true},
+  {suffix = "slice_rate", name = "slice rate", spec = {0.125, 8, "exp", 0.01, 1, "x", 0.01}, cmd = "setSliceRate", queue = true, t1 = true},
+  -- Default MONO (owner): one slice voice at a time keeps the machine cheap;
+  -- poly is opt-in. (The old SPEC default here had drifted to poly for tracks
+  -- 2-8 -- reconciled to the shipped track-1 default on migration.) The action
+  -- pushes the engine's legacy global mono flag for track 1 only.
+  {suffix = "slice_polyphony", name = "slice polyphony", kind = "option", options = {"poly 8", "mono"}, default = 2,
+    action = "slice_polyphony", t1 = true},
+  {suffix = "slice_hold_to_step", name = "slice hold to step", kind = "binary", default = 1, t1 = true},
   -- Slice AHR envelope: attack/release are t1 (base-value resolver, ms readout).
   -- The engine's sliceAttack/sliceRelease is a GLOBAL var; \trSliceAttack sets the
   -- same var (the track arg is ignored), so track 1's send is unchanged, just now
@@ -172,19 +189,19 @@ ParamsSpec.SPEC = {
   -- so it stays hand-registered on track 1 -- the resolver's send interception
   -- doesn't apply to a read-at-trigger value.
   {suffix = "slice_attack", name = "slice attack", spec = {0.0001, 0.2, "lin", 0.0001, 0.002, "", 0.0005 / 0.1999}, cmd = "sliceAttack", fmt = "milliseconds", queue = true, t1 = true},
-  {suffix = "slice_hold", name = "slice hold", spec = {0, 4, "lin", 0.01, 0.25, "", 0.01 / 4}, queue = true},
+  {suffix = "slice_hold", name = "slice hold", spec = {0, 4, "lin", 0.01, 0.25, "", 0.01 / 4}, fmt = "milliseconds", queue = true, t1 = true},
   {suffix = "slice_release", name = "slice release", spec = {0.0001, 0.5, "lin", 0.0001, 0.02, "", 0.001 / 0.4999}, cmd = "sliceRelease", fmt = "milliseconds", queue = true, t1 = true},
   -- trig (sequencer-domain: read by grid_sequencer, never sent to the engine)
-  {suffix = "pattern_steps", name = "pattern steps", spec = {1, 256, "lin", 1, 16, "", 1 / 255}},
-  {suffix = "trig_jump", name = "trig jump", kind = "binary", default = 1},
+  {suffix = "pattern_steps", name = "pattern steps", spec = {1, 256, "lin", 1, 16, "", 1 / 255}, fmt = "integer", t1 = true},
+  {suffix = "trig_jump", name = "trig jump", kind = "binary", default = 1, t1 = true},
   {suffix = "trig_release", name = "trig release", kind = "option",
-    options = {"return", "boomerang", "reset"}, default = 1},
-  {suffix = "trig_chance", name = "trig chance", kind = "number", min = 0, max = 100, default = 100},
-  {suffix = "trig_condition", name = "trig condition", kind = "option", options = "trig_conditions", default = 1},
-  {suffix = "trig_ratchet", name = "trig ratchet", kind = "number", min = 1, max = 8, default = 1},
-  {suffix = "env_reset", name = "env reset", kind = "binary", default = 1},
-  {suffix = "lfo_reset", name = "lfo reset", kind = "binary", default = 1},
-  {suffix = "filter_reset", name = "filter reset", kind = "binary", default = 1},
+    options = {"return", "boomerang", "reset"}, default = 1, t1 = true},
+  {suffix = "trig_chance", name = "trig chance", kind = "number", min = 0, max = 100, default = 100, t1 = true},
+  {suffix = "trig_condition", name = "trig condition", kind = "option", options = "trig_conditions", default = 1, t1 = true},
+  {suffix = "trig_ratchet", name = "trig ratchet", kind = "number", min = 1, max = 8, default = 1, t1 = true},
+  {suffix = "env_reset", name = "env reset", kind = "binary", default = 1, t1 = true},
+  {suffix = "lfo_reset", name = "lfo reset", kind = "binary", default = 1, t1 = true},
+  {suffix = "filter_reset", name = "filter reset", kind = "binary", default = 1, t1 = true},
 
   -- ---- Phase 2: the signal chain (every entry below is t1 = true) ---------
   -- filter (machine/type are settings that respawn the engine's filter synth;
@@ -260,7 +277,7 @@ ParamsSpec.SPEC = {
   {suffix = "fx_mix", name = "fx mix", spec = {0, 127, "lin", 1, 64, "", 1 / 127},
     cmd = "fxMix", xform = "amount", fmt = "env_level", queue = true, t1 = true},
   {suffix = "delay_time", name = "delay time", kind = "option",
-    options = "delay_times", default = 4, cmd = "delayBeats", xform = "delay_beats", queue = true, t1 = true},
+    options = "delay_times", default = 9, cmd = "delayBeats", xform = "delay_beats", queue = true, t1 = true},
   {suffix = "delay_feedback", name = "delay feedback", spec = {0, 127, "lin", 1, 38, "", 1 / 127},
     cmd = "delayFeedback", xform = "amount", fmt = "env_level", queue = true, t1 = true},
   {suffix = "delay_tone", name = "delay tone", spec = {0, 127, "lin", 1, 127, "", 1 / 127},
@@ -273,6 +290,149 @@ ParamsSpec.SPEC = {
     cmd = "lofiBits", xform = "lofi_bits", fmt = "lofi_bits", queue = true, t1 = true},
   {suffix = "lofi_rate", name = "lofi rate", spec = {0, 127, "lin", 1, 127, "", 1 / 127},
     cmd = "lofiRate", xform = "lofi_rate", fmt = "lofi_rate", queue = true, t1 = true},
+
+  -- Comp (#6): dynamics. 0-127 amount knobs mapped to threshold/ratio/attack/
+  -- release/makeup engine-side. Reuses fx_mix for dry/wet.
+  {suffix = "comp_thresh", name = "comp threshold", spec = {0, 127, "lin", 1, 38, "", 1 / 127},
+    cmd = "compThresh", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "comp_ratio", name = "comp ratio", spec = {0, 127, "lin", 1, 25, "", 1 / 127},
+    cmd = "compRatio", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "comp_attack", name = "comp attack", spec = {0, 127, "lin", 1, 13, "", 1 / 127},
+    cmd = "compAttack", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "comp_release", name = "comp release", spec = {0, 127, "lin", 1, 38, "", 1 / 127},
+    cmd = "compRelease", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "comp_makeup", name = "comp makeup", spec = {0, 127, "lin", 1, 0, "", 1 / 127},
+    cmd = "compMakeup", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+
+  -- Destroy (#7): distortion stack. Reuses fx_drive (DRIV) + fx_mix (MIX).
+  {suffix = "destroy_warble", name = "destroy warble", spec = {0, 127, "lin", 1, 0, "", 1 / 127},
+    cmd = "destroyWarble", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "destroy_fold", name = "destroy fold", spec = {0, 127, "lin", 1, 0, "", 1 / 127},
+    cmd = "destroyFold", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "destroy_sat", name = "destroy sat", spec = {0, 127, "lin", 1, 0, "", 1 / 127},
+    cmd = "destroySat", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "destroy_crush", name = "destroy crush", spec = {0, 127, "lin", 1, 0, "", 1 / 127},
+    cmd = "destroyCrush", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "destroy_srr", name = "destroy sample rate", spec = {0, 127, "lin", 1, 0, "", 1 / 127},
+    cmd = "destroySrr", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "destroy_tone", name = "destroy tone", spec = {0, 127, "lin", 1, 127, "", 1 / 127},
+    cmd = "destroyTone", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "destroy_level", name = "destroy level", spec = {0, 127, "lin", 1, 70, "", 1 / 127},
+    cmd = "destroyLevel", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+
+  -- Echo (#8): stereo delay. Its own tempo-synced time (full division list);
+  -- reuses delay_feedback (FBK) + fx_mix (MIX).
+  {suffix = "echo_time", name = "echo time", kind = "option",
+    options = "echo_times", default = 9, cmd = "echoBeats", xform = "echo_beats", queue = true, t1 = true},
+  {suffix = "echo_offset", name = "echo offset", spec = {0, 128, "lin", 1, 64, "", 1 / 128},
+    cmd = "echoOffset", xform = "bipolar", fmt = "pan_127", queue = true, t1 = true},
+  {suffix = "echo_mode", name = "echo mode", kind = "option",
+    options = {"stereo", "ping-pong"}, default = 1, cmd = "echoMode", offset = -1, queue = true, t1 = true},
+  {suffix = "echo_tone", name = "echo tone", spec = {0, 127, "lin", 1, 127, "", 1 / 127},
+    cmd = "echoTone", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "echo_wobble", name = "echo wobble", spec = {0, 127, "lin", 1, 0, "", 1 / 127},
+    cmd = "echoWobble", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+
+  -- Blackhole (#9): freeze reverb. Reuses reverb_size (SIZE) + reverb_damp (HI)
+  -- + fx_mix (MIX).
+  {suffix = "bh_gravity", name = "blackhole gravity", spec = {0, 127, "lin", 1, 64, "", 1 / 127},
+    cmd = "bhGravity", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "bh_mod", name = "blackhole mod", spec = {0, 127, "lin", 1, 25, "", 1 / 127},
+    cmd = "bhMod", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "bh_low", name = "blackhole low", spec = {0, 127, "lin", 1, 13, "", 1 / 127},
+    cmd = "bhLow", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "bh_predelay", name = "blackhole predelay", spec = {0, 127, "lin", 1, 13, "", 1 / 127},
+    cmd = "bhPredelay", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+
+  -- Chorus/Flanger/Phaser share modfx_rate/depth/tone (exclusive per slot). All
+  -- reuse fx_mix. Phaser adds center/stages/feedback; Flanger adds bipolar FBK.
+  {suffix = "modfx_rate", name = "mod-fx rate", spec = {0, 127, "lin", 1, 38, "", 1 / 127},
+    cmd = "modfxRate", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "modfx_depth", name = "mod-fx depth", spec = {0, 127, "lin", 1, 38, "", 1 / 127},
+    cmd = "modfxDepth", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "modfx_tone", name = "mod-fx tone", spec = {0, 127, "lin", 1, 102, "", 1 / 127},
+    cmd = "modfxTone", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "chorus_width", name = "chorus width", spec = {0, 127, "lin", 1, 64, "", 1 / 127},
+    cmd = "chorusWidth", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "flanger_feedback", name = "flanger feedback", spec = {0, 128, "lin", 1, 64, "", 1 / 128},
+    cmd = "flangerFeedback", xform = "bipolar", fmt = "pan_127", queue = true, t1 = true},
+  {suffix = "phaser_center", name = "phaser center", spec = {0, 127, "lin", 1, 64, "", 1 / 127},
+    cmd = "phaserCenter", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "phaser_stages", name = "phaser stages", kind = "option",
+    options = {"2", "4", "6", "8"}, default = 2, cmd = "phaserStages", offset = -1, queue = true, t1 = true},
+  {suffix = "phaser_feedback", name = "phaser feedback", spec = {0, 127, "lin", 1, 25, "", 1 / 127},
+    cmd = "phaserFeedback", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+
+  -- DJ EQ (#13): 3 bipolar band gains (64 = unity) + 2 crossover freqs. No MIX.
+  {suffix = "eq_low", name = "eq low", spec = {0, 128, "lin", 1, 64, "", 1 / 128},
+    cmd = "eqLow", xform = "bipolar", fmt = "pan_127", queue = true, t1 = true},
+  {suffix = "eq_mid", name = "eq mid", spec = {0, 128, "lin", 1, 64, "", 1 / 128},
+    cmd = "eqMid", xform = "bipolar", fmt = "pan_127", queue = true, t1 = true},
+  {suffix = "eq_high", name = "eq high", spec = {0, 128, "lin", 1, 64, "", 1 / 128},
+    cmd = "eqHigh", xform = "bipolar", fmt = "pan_127", queue = true, t1 = true},
+  {suffix = "eq_xlow", name = "eq low split", spec = {0, 127, "lin", 1, 38, "", 1 / 127},
+    cmd = "eqXlow", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "eq_xhi", name = "eq high split", spec = {0, 127, "lin", 1, 89, "", 1 / 127},
+    cmd = "eqXhi", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+
+  -- Duck (#14): sidechain ducker keyed off the master bus. No MIX.
+  {suffix = "duck_amount", name = "duck amount", spec = {0, 127, "lin", 1, 76, "", 1 / 127},
+    cmd = "duckAmount", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "duck_sens", name = "duck sensitivity", spec = {0, 127, "lin", 1, 64, "", 1 / 127},
+    cmd = "duckSens", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "duck_attack", name = "duck attack", spec = {0, 127, "lin", 1, 25, "", 1 / 127},
+    cmd = "duckAttack", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "duck_release", name = "duck release", spec = {0, 127, "lin", 1, 51, "", 1 / 127},
+    cmd = "duckRelease", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+
+  -- Tape Echo (#15) / Cassette (#16): share tape_wow/tape_flutter (exclusive per
+  -- slot). Tape Echo also reuses echo_time/echo_tone/delay_feedback; Cassette adds
+  -- its own hiss/crackle/dropout/bandwidth.
+  {suffix = "tape_wow", name = "tape wow", spec = {0, 127, "lin", 1, 25, "", 1 / 127},
+    cmd = "tapeWow", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "tape_flutter", name = "tape flutter", spec = {0, 127, "lin", 1, 15, "", 1 / 127},
+    cmd = "tapeFlutter", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "tape_sat", name = "tape saturation", spec = {0, 127, "lin", 1, 30, "", 1 / 127},
+    cmd = "tapeSat", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "cass_noise", name = "cassette hiss", spec = {0, 127, "lin", 1, 10, "", 1 / 127},
+    cmd = "cassNoise", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "cass_crackle", name = "cassette crackle", spec = {0, 127, "lin", 1, 0, "", 1 / 127},
+    cmd = "cassCrackle", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "cass_drop", name = "cassette dropouts", spec = {0, 127, "lin", 1, 0, "", 1 / 127},
+    cmd = "cassDrop", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "cass_tone", name = "cassette tone", spec = {0, 127, "lin", 1, 80, "", 1 / 127},
+    cmd = "cassTone", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+
+  -- Motion (#17): M/S width (bipolar, 64 = unity) + one synced LFO for trem/pan.
+  {suffix = "motion_width", name = "motion width", spec = {0, 128, "lin", 1, 64, "", 1 / 128},
+    cmd = "motionWidth", xform = "bipolar", fmt = "pan_127", queue = true, t1 = true},
+  {suffix = "motion_rate", name = "motion rate", kind = "option",
+    options = "motion_rates", default = 5, cmd = "motionBeats", xform = "motion_beats", queue = true, t1 = true},
+  {suffix = "motion_trem", name = "motion tremolo", spec = {0, 127, "lin", 1, 0, "", 1 / 127},
+    cmd = "motionTrem", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "motion_pan", name = "motion autopan", spec = {0, 127, "lin", 1, 0, "", 1 / 127},
+    cmd = "motionPan", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "motion_shape", name = "motion shape", kind = "option",
+    options = {"sine", "tri", "sqr"}, default = 1, cmd = "motionShape", offset = -1, queue = true, t1 = true},
+
+  -- Rings (#18): ring mod / freq shift. FREQ + FINE are bipolar (direction
+  -- matters for SHIFT); reuses modfx_tone for the wet lowpass.
+  {suffix = "rings_mode", name = "rings mode", kind = "option",
+    options = {"ring", "shift"}, default = 1, cmd = "ringsMode", offset = -1, queue = true, t1 = true},
+  {suffix = "rings_freq", name = "rings freq", spec = {0, 128, "lin", 1, 96, "", 1 / 128},
+    cmd = "ringsFreq", xform = "bipolar", fmt = "pan_127", queue = true, t1 = true},
+  {suffix = "rings_fine", name = "rings fine", spec = {0, 128, "lin", 1, 64, "", 1 / 128},
+    cmd = "ringsFine", xform = "bipolar", fmt = "pan_127", queue = true, t1 = true},
+  {suffix = "rings_feedback", name = "rings feedback", spec = {0, 127, "lin", 1, 0, "", 1 / 127},
+    cmd = "ringsFeedback", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+
+  -- Limit (#19): master brickwall. Dynamics, so it reads in dB/ms (ID_FORMATTERS).
+  {suffix = "limit_gain", name = "limit gain", spec = {0, 127, "lin", 1, 0, "", 1 / 127},
+    cmd = "limitGain", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "limit_ceil", name = "limit ceiling", spec = {0, 127, "lin", 1, 121, "", 1 / 127},
+    cmd = "limitCeil", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  {suffix = "limit_release", name = "limit release", spec = {0, 127, "lin", 1, 38, "", 1 / 127},
+    cmd = "limitRelease", xform = "amount", fmt = "env_level", queue = true, t1 = true},
 
   -- sends: the tap point + the two per-track send LEVELS. The send BUS FX
   -- (send1_reverb_size, ...) are shared by every track and stay global in

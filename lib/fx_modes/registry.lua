@@ -22,10 +22,26 @@ local machines = {
   [2] = include("lib/fx_modes/drive"),
   [3] = include("lib/fx_modes/delay"),
   [4] = include("lib/fx_modes/reverb"),
-  [5] = include("lib/fx_modes/lofi")
+  [5] = include("lib/fx_modes/lofi"),
+  [6] = include("lib/fx_modes/comp"),
+  [7] = include("lib/fx_modes/destroy"),
+  [8] = include("lib/fx_modes/echo"),
+  [9] = include("lib/fx_modes/blackhole"),
+  [10] = include("lib/fx_modes/chorus"),
+  [11] = include("lib/fx_modes/flanger"),
+  [12] = include("lib/fx_modes/phaser"),
+  [13] = include("lib/fx_modes/dj_eq"),
+  [14] = include("lib/fx_modes/duck"),
+  [15] = include("lib/fx_modes/tape_echo"),
+  [16] = include("lib/fx_modes/cassette"),
+  [17] = include("lib/fx_modes/motion"),
+  [18] = include("lib/fx_modes/rings"),
+  [19] = include("lib/fx_modes/limit")
 }
 
-local names = {"NONE", "DRIVE", "DELAY", "REVERB", "LOFI"}
+local names = {"NONE", "DRIVE", "DELAY", "REVERB", "LOFI", "COMP", "DESTROY", "ECHO",
+  "BLACKHOLE", "CHORUS", "FLANGER", "PHASER", "DJ EQ", "DUCK",
+  "TAPE ECHO", "CASSETTE", "MOTION", "RINGS", "LIMIT"}
 
 function Registry.get(machine_id)
   return machines[math.floor((tonumber(machine_id) or 1) + 0.5)] or machines[1]

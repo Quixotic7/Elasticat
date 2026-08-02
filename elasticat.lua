@@ -119,10 +119,13 @@ local quiet_osc_paths = {
   -- 15Hz live-modulation feed: never log it (it would flood maiden).
   ["/elasticat/mod"] = true,
   ["/elasticat/filterEnv"] = true,
+  ["/elasticat/fxMeter"] = true,
   -- Per-track playhead (1Hz x 8) and level (30Hz x 8) reports: same reasoning,
   -- and they arrive for every active track rather than just one.
   ["/elasticat/track/position"] = true,
-  ["/elasticat/track/level"] = true
+  ["/elasticat/track/level"] = true,
+  -- 0.5Hz CPU + idle-pause telemetry: quiet, or it stripes maiden every 2s.
+  ["/elasticat/cpu"] = true
 }
 -- Phase 2 (docs/PHASE2_CONTRACT.md): every reading the UI used to hold as "the
 -- one track's" is now keyed by 1-based track index, and the screen shows
@@ -515,6 +518,18 @@ elasticat.osc_report = function(path, args)
     status.amp_r[track] = tonumber(args[3]) or 0
     status.amp_time[track] = util.time()
     return true
+  elseif path == "/elasticat/cpu" then
+    -- 0.5Hz scsynth telemetry (avg%, peak%, idle-paused tracks, synth count)
+    -- from the engine's idle-scan routine. Stored on the module table (the
+    -- main chunk is at the 200-local ceiling); the header draws avg/peak.
+    elasticat.cpu_report = {
+      avg = tonumber(args[1]) or 0,
+      peak = tonumber(args[2]) or 0,
+      paused = tonumber(args[3]) or 0,
+      synths = tonumber(args[4]) or 0,
+      time = util.time()
+    }
+    return true
   elseif path == "/elasticat/mod" then
     -- Live mod-bus values (pitch/cutoff/res/amp/pan, -1..1) at 15Hz: the UI's
     -- "actual value" bars and the filter render read these. The engine forwards
@@ -528,6 +543,22 @@ elasticat.osc_report = function(path, args)
     -- Filter-envelope cutoff contribution (semitones), 15Hz. Same trailing-track
     -- shape and selected-track routing as /elasticat/mod above.
     elasticat.route_filter_env_report(args)
+    return true
+  elseif path == "/elasticat/fxMeter" then
+    -- Comp/Duck gain-reduction + level meter (gr, key, thresh, all dB), keyed by
+    -- the meter id: 1-8 = that track's insert (engine gates to the viewed track),
+    -- 101/102/103 = the global Send 1 / Send 2 / Master slots. Kept as a table so
+    -- simultaneous comp/duck instances (insert + send + master) never fight over
+    -- one slot; each FX page reads its own id. RAW number, NOT osc_track (which
+    -- clamps to 1..8 and would fold the global ids onto tracks). Stored on the
+    -- module table (no new coordinator local -- the 200-local ceiling).
+    -- thresh -99 = "no threshold line" (Duck).
+    local mid = math.floor(tonumber(args[4]) or 0)
+    elasticat.fx_meter = elasticat.fx_meter or {}
+    elasticat.fx_meter[mid] = {
+      gr = tonumber(args[1]) or 0, key = tonumber(args[2]) or -60,
+      thresh = tonumber(args[3]) or -99, t = util.time()
+    }
     return true
   elseif path == "/elasticat/transport" then
     -- The 15Hz reader feed (/elasticat/status) is the AUTHORITY for track 1's
@@ -2280,10 +2311,32 @@ local function fx_slot_items(machine_suffix, item_prefix)
     fx_insert1_machine = "INSERT 1", send1_machine = "SEND 1",
     send2_machine = "SEND 2", master_fx_machine = "MASTER"
   }
-  local raw = FxRegistry.source_items(param_value_or(machine_suffix, 1), ParamItem, item_prefix)
+  local machine = math.floor(param_value_or(machine_suffix, 1) + 0.5)
+  local raw = FxRegistry.source_items(machine, ParamItem, item_prefix)
   local banner = ParamItem.item(machine_suffix, labels[machine_suffix] or "FX", {
     mode_param = true, lockable = false, fn_to_edit = true, options = FxRegistry.count()})
-  return FxRegistry.arrange_page(raw, banner, ParamItem.blank(), ParamItem.blank)
+  -- Universal dry/wet (owner): fx_mix moves OUT of the rows and into the trailing
+  -- slot (item 10, bottom-right next to the banner), like RATE on the WARP page,
+  -- so MIX always lives in the same place. Machines with no wet/dry (Destroy, DJ
+  -- EQ, Duck, Motion, Limit) don't list fx_mix, so their trailing stays blank.
+  local mix_id = (item_prefix or "") .. "fx_mix"
+  local trailing = ParamItem.blank()
+  local rows = {}
+  for _, it in ipairs(raw) do
+    if it.id == mix_id then
+      trailing = it
+    else
+      rows[#rows + 1] = it
+    end
+  end
+  -- Always-wet machines get a static "WET" tag in the MIX position, so the
+  -- empty cell reads as a statement (this machine is always fully wet) rather
+  -- than a missing param. NONE (machine 1) stays truly blank -- there is
+  -- nothing to be wet.
+  if trailing.blank and machine > 1 then
+    trailing.tag = "WET"
+  end
+  return FxRegistry.arrange_page(rows, banner, trailing, ParamItem.blank)
 end
 
 -- FILTER page 2: the filter envelope, laid out by its (independent) mode -- ADSR
@@ -2706,14 +2759,26 @@ local function draw_page_header(title, page_number)
   -- track's audio.
   local level_l, level_r = elasticat.track_level(elasticat.selected_track or 1)
 
+  -- DSP overload warning (see Header.draw): shown only while a FRESH report is
+  -- hot, so a stale reading from before a stop can't pin the warning on.
+  local cpu_hot = nil
+  local cpu = elasticat.cpu_report
+  if cpu ~= nil and cpu.peak >= 80 and (util.time() - (cpu.time or 0)) < 6 then
+    cpu_hot = math.floor(cpu.peak + 0.5)
+  end
+
   Header.draw({
     track = elasticat.selected_track or 1,
     ghost = ghost,
     -- A muted track is silent downstream of the meter, so the header says so.
     muted = grid_ui ~= nil and grid_ui.track_muted ~= nil
       and grid_ui:track_muted(elasticat.selected_track or 1) or false,
-    message = visible_message() or grid_status or title or "ELASTICAT",
+    -- A latched jack frame-time stall outranks every other message: the clock
+    -- is dead and only a reboot fixes it (see the watchdog in lib/elasticat).
+    message = (elasticat.clock_stalled and "CLOCK STALLED - REBOOT")
+      or visible_message() or grid_status or title or "ELASTICAT",
     tempo = param_value_or("target_bpm", 120),
+    cpu_hot = cpu_hot,
     amp_l = level_l,
     amp_r = level_r,
     page = page_number or 1
@@ -2866,6 +2931,14 @@ local function draw_root_page()
   end
 
   if page.mixer then
+    -- The mixer is the "what is my kit doing" page, so it carries the standing
+    -- CPU readout (avg/peak% from /elasticat/cpu; the header only warns when
+    -- hot). Composed into the title -- the header layout stays untouched.
+    local cpu = elasticat.cpu_report
+    if cpu ~= nil then
+      title = string.format("%s CPU %d/%d%%", title,
+        math.floor(cpu.avg + 0.5), math.floor(cpu.peak + 0.5))
+    end
     draw_page_header(title, page_index)
     elasticat.MixerPage.draw(elasticat.mixer_tracks(),
       elasticat.mixer_strip(page_items_for("master", page, page_index), nav:clamp_current_group()))
@@ -2921,6 +2994,32 @@ local function draw_root_page()
   if items[9] ~= nil and items[9].mode_param == true then
     draw_page_header(title, page_index)
     page_render:draw_mode_param_page(items, nav:clamp_current_group(), playing)
+    -- FX slot pages with Comp (6) or Duck (14): overlay the live gain-reduction /
+    -- level meter. It positions ITSELF in the free wedge right of the banner /
+    -- above the MIX cell (page_render's FMIX_METER_*) -- passing a position from
+    -- here is what once put it over the parameter rows. Each page reads ITS OWN
+    -- meter id (insert = the selected track; Send 1/2 / Master = 101/102/103), so
+    -- simultaneous instances never mix on screen. Draw only while the feed is
+    -- fresh. Duck's natural home is a send return, which is exactly pages 3/4.
+    if nav:current_category() == "fx" then
+      local slots = {
+        [1] = {machine = "fx_insert1_machine", meter = elasticat.selected_track},
+        [3] = {machine = "send1_machine", meter = 101},
+        [4] = {machine = "send2_machine", meter = 102},
+        [5] = {machine = "master_fx_machine", meter = 103}
+      }
+      local slot = slots[page_index]
+      if slot ~= nil then
+        local fx_machine = math.floor(param_value_or(slot.machine, 1) + 0.5)
+        local m = elasticat.fx_meter ~= nil and elasticat.fx_meter[slot.meter] or nil
+        if (fx_machine == 6 or fx_machine == 14 or fx_machine == 19) and m ~= nil
+          and (util.time() - (m.t or 0)) < 0.3 then
+          -- COMP + LIMIT show the threshold/ceiling tick; DUCK has no threshold.
+          page_render:draw_fx_meter(m.key, m.gr, m.thresh,
+            fx_machine == 6 or fx_machine == 19)
+        end
+      end
+    end
     return
   end
 

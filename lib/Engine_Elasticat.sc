@@ -57,6 +57,7 @@ Engine_Elasticat : CroneEngine {
 	var sendFxReverbDamp;
 	var sendFxLofiBits;
 	var sendFxLofiRate;
+	var sendFxExtra;   // per-slot dict of the new machines' send/master params
 
 	// --- SynthDef name registries (a machine is one row here + one SynthDef) -
 	var <modeSynthNames;
@@ -153,7 +154,18 @@ Engine_Elasticat : CroneEngine {
 	var statusResponder;
 	var modResponder;       // live mod-bus values -> script (~15Hz UI feed)
 	var filterEnvResponder; // filter-env cutoff contribution -> script (15Hz)
+	var fxMeterResponder;   // comp/duck gain-reduction + level meter -> script (20Hz)
 	var transportResponder;
+	// --- Idle pause + CPU telemetry (Pi3 xrun mitigation) --------------------
+	// A stopped, silent, un-viewed track's whole node group is paused
+	// (group.run(false)) so 8 mostly-idle tracks stop burning warp/filter DSP.
+	// Silence is measured POST-everything (\elasticatTrackMix output, 2Hz), so
+	// a ringing insert tail keeps its track awake until it has decayed.
+	var idleResponder;      // /elasticat/idleRaw -> track.reportOutLevel
+	var idleScanRoutine;    // 2s tick: pause eligible tracks + CPU report
+	var <idlePauseEnabled = 1;
+	var <idlePausedCount = 0;
+	var <idleGraceSeconds = 4.0;   // settable: test seam + live tuning
 
 	*new { arg context, doneCallback;
 		^super.new(context, doneCallback);
@@ -222,7 +234,21 @@ Engine_Elasticat : CroneEngine {
 			\elasticatFxDrive,
 			\elasticatFxDelay,
 			\elasticatFxReverb,
-			\elasticatFxLofi
+			\elasticatFxLofi,
+			\elasticatFxComp,
+			\elasticatFxDestroy,
+			\elasticatFxEcho,
+			\elasticatFxBlackhole,
+			\elasticatFxChorus,
+			\elasticatFxFlanger,
+			\elasticatFxPhaser,
+			\elasticatFxDjEq,
+			\elasticatFxDuck,
+			\elasticatFxTapeEcho,
+			\elasticatFxCassette,
+			\elasticatFxMotion,
+			\elasticatFxRings,
+			\elasticatFxLimit
 		];
 
 		sendFxDrive = [0, 0, 0];
@@ -234,6 +260,15 @@ Engine_Elasticat : CroneEngine {
 		sendFxReverbDamp = [0.5, 0.5, 0.5];
 		sendFxLofiBits = [24, 24, 24];
 		sendFxLofiRate = [48000, 48000, 48000];
+		// New FX machines (Comp/Destroy/Echo/Blackhole) route their send/master
+		// params through one generated command block instead of a hand-written
+		// command + array per param. sendFxExtra[slotIdx] is a per-slot dict of
+		// arg -> last value, seeded here to the SynthDef defaults and reapplied on
+		// respawn via sendFxArgs. See sendFxExtraSpec + installCommands.
+		sendFxExtra = [Dictionary.new, Dictionary.new, Dictionary.new];
+		this.sendFxExtraSpec.do({ arg row;
+			(0..2).do({ arg s; sendFxExtra[s][row[1]] = row[4]; });
+		});
 
 		masterBus = Bus.audio(server, 2);
 		sendBus1 = Bus.audio(server, 2);
@@ -386,6 +421,51 @@ Engine_Elasticat : CroneEngine {
 				]);
 			});
 		}, path: '/elasticat/filterEnvRaw', srcID: server.addr);
+
+		// Comp/Duck gain-reduction + level meter (owner). The insert synth of the
+		// VIEWED track reports [grDb, keyDb, threshDb], forwarded when its id
+		// matches viewTrack; the GLOBAL slots report as 101/102/103 (Send 1/2 /
+		// Master -- see sendFxArgs) and are forwarded unconditionally, so the send
+		// and master FX pages can meter their own Comp/Duck. The script matches the
+		// id against the page it is showing, so the streams never mix on screen.
+		fxMeterResponder = OSCFunc({
+			arg msg;
+			var mid = msg[2].asInteger;
+			if((mid == viewTrack) or: { mid > 100 }, {
+				scriptAddress.sendBundle(0, [
+					"/elasticat/fxMeter", msg[3].asFloat, msg[4].asFloat, msg[5].asFloat, mid
+				]);
+			});
+		}, path: '/elasticat/fxMeterRaw', srcID: server.addr);
+
+		// Idle detector: each track's post-gain output level (2Hz, from its
+		// \elasticatTrackMix). A paused track's mix synth stops reporting --
+		// deliberately fine, since paused implies silent and waking is driven
+		// by commands (play/trig/view), never by level.
+		idleResponder = OSCFunc({
+			arg msg;
+			var t, tr;
+			t = msg[2].asInteger;
+			tr = if((t >= 1) and: { t <= 8 }, { tracks[t] }, { nil });
+			if(tr.notNil, { tr.reportOutLevel(msg[3].asFloat); });
+		}, path: '/elasticat/idleRaw', srcID: server.addr);
+
+		// One 2s housekeeping tick: pause idle-eligible tracks, then report CPU
+		// + pause telemetry to the script. A plain sclang Routine (not a synth):
+		// server CPU stats only exist client-side, and 0.5Hz costs nothing.
+		idleScanRoutine = Routine({
+			loop {
+				2.0.wait;
+				this.idleScan;
+				scriptAddress.sendBundle(0, [
+					"/elasticat/cpu",
+					context.server.avgCPU ? 0,
+					context.server.peakCPU ? 0,
+					idlePausedCount,
+					context.server.numSynths ? 0
+				]);
+			}
+		}).play(SystemClock);
 
 		// --- Node graph: tracksGroup -> sendGroup -> masterGroup -------------
 		tracksGroup = Group.head(context.xg);
@@ -1582,11 +1662,16 @@ Engine_Elasticat : CroneEngine {
 			delayBeats=1, delayFeedback=0.3, delayTone=1,
 			reverbSize=0.5, reverbDamp=0.5,
 			lofiBits=24, lofiRate=48000, targetBpm=120;
-			var maxDelayTime = 2.0;
+			var maxDelayTime = 4.0;   // 2 BAR at slow tempos; was 2.0 (clipped early)
 			var sig, dry, wet, fb, delaySeconds, toneHz, recirc;
 			sig = In.ar(in, 2);
 			dry = sig;
-			delaySeconds = ((delayBeats.max(0.03125) * 60) / targetBpm.max(1)).clip(0.001, maxDelayTime);
+			// Lag the time: an instant jump in DelayC's read position is a hard
+			// discontinuity = a CLICK on every TIME/tempo change (owner report; the
+			// knob's 12Hz coalesced sends made it a click storm). The lag turns a
+			// time change into a short tape-style glide instead.
+			delaySeconds = Lag.kr(
+				((delayBeats.max(0.03125) * 60) / targetBpm.max(1)).clip(0.001, maxDelayTime), 0.15);
 			toneHz = delayTone.clip(0, 1).linexp(0.001, 1, 220, 18000);
 			fb = LocalIn.ar(2);
 			recirc = DelayC.ar(sig + (fb * delayFeedback.clip(0, 0.95)), maxDelayTime, delaySeconds);
@@ -1635,6 +1720,375 @@ Engine_Elasticat : CroneEngine {
 			Out.ar(out, fxMixBlend.value(dry, wet, mix));
 		}).add;
 
+		// Comp (#6): Compander dynamics. Detector is the mono sum so the stereo
+		// image never wanders; MIX < 1 = parallel (NY) compression. Knobs are
+		// 0-1 amounts mapped to real units here (threshold/ratio/attack/release/
+		// makeup). No feedback -- cannot blow up.
+		SynthDef(\elasticatFxComp, {
+			arg out=0, in=0, mix=0.5, meterTrack=0,
+			compThresh=0.3, compRatio=0.2, compAttack=0.1, compRelease=0.3, compMakeup=0;
+			var sig, dry, ctrl, thresh, slope, atk, rel, gain, comp, wet;
+			var inAmp, outAmp, grDb, keyDb;
+			sig = In.ar(in, 2);
+			dry = sig;
+			ctrl = ((sig[0] + sig[1]) * 0.5) ! 2;
+			thresh = compThresh.clip(0, 1).linlin(0, 1, 0.02, 1.0);   // up = higher thresh = less comp
+			slope  = compRatio.clip(0, 1).linexp(0.001, 1, 1.0, 0.05); // slopeAbove = 1/ratio (1..20:1)
+			atk    = compAttack.clip(0, 1).linexp(0.001, 1, 0.0005, 0.1);
+			rel    = compRelease.clip(0, 1).linexp(0.001, 1, 0.02, 0.8);
+			gain   = compMakeup.clip(0, 1).linlin(0, 1, 1.0, 4.0);     // 0..~+12 dB
+			comp = Compander.ar(sig, ctrl, thresh, 1.0, slope, atk, rel);
+			wet = comp * gain;
+			// Metering feed (owner): gain reduction (pre-makeup out / in, in dB),
+			// input/key level, and the threshold, all in dB, at 20Hz keyed by the
+			// track index. Gated to the viewed track by the engine responder.
+			inAmp  = Amplitude.kr(ctrl[0]);
+			outAmp = Amplitude.kr(comp[0]);
+			grDb   = (outAmp / (inAmp + 0.0001)).clip(0.0001, 1).ampdb;
+			keyDb  = inAmp.clip(0.0001, 4).ampdb;
+			SendReply.kr(Impulse.kr(20), '/elasticat/fxMeterRaw', [grDb, keyDb, thresh.ampdb], meterTrack);
+			Out.ar(out, fxMixBlend.value(dry, wet, mix));
+		}).add;
+
+		// Destroy (#7): serial distortion stack -- warble -> overdrive -> wavefold
+		// -> saturation -> bitcrush -> tone -> level. Each stage bypasses at 0
+		// (SelectX crossfade), so a stage costs its UGens but not its character
+		// until dialled in. drive is the shared fx_drive; the rest are new. Every
+		// stage is bounded arithmetic -- no feedback.
+		SynthDef(\elasticatFxDestroy, {
+			arg out=0, in=0, mix=1.0, drive=0,
+			destroyWarble=0, destroyFold=0, destroySat=0, destroyCrush=0, destroySrr=0,
+			destroyTone=1, destroyLevel=0.55;
+			var sig, dry, x, warb, driv, fold, sat, crush, srr, srrHz, toneHz, lvl, bits, step;
+			sig = In.ar(in, 2);
+			dry = sig;
+			x = sig;
+			warb = destroyWarble.clip(0, 1);
+			x = DelayC.ar(x, 0.03,
+				(0.006 + (LFNoise2.kr((warb.linexp(0.001, 1, 0.5, 9)) ! 2) * warb * 0.005)).clip(0.0003, 0.03));
+			driv = drive.clip(0, 1);
+			x = SelectX.ar(driv, [x, (((x * (1 + (driv * 24))) + (driv * 0.15)).tanh)]);
+			fold = destroyFold.clip(0, 1);
+			x = SelectX.ar(fold, [x, (x * (1 + (fold * 6))).fold2(1.0)]);
+			sat = destroySat.clip(0, 1);
+			x = SelectX.ar(sat, [x, (x * (1 + (sat * 14))).tanh]);
+			crush = destroyCrush.clip(0, 1);
+			bits = crush.linlin(0, 1, 24, 2);       // up = fewer bits = more crush
+			step = 2.0.pow(1 - bits);
+			x = SelectX.ar(crush, [x, x.round(step)]);
+			// Sample-rate reduction (owner): Latch sample-and-hold, same core-UGen
+			// approach as the LOFI machine. Up = lower rate = more aliasing; 0
+			// bypasses through the SelectX so it costs UGens but no character.
+			srr = destroySrr.clip(0, 1);
+			srrHz = srr.linexp(0, 1, 48000, 500);
+			x = SelectX.ar(srr, [x, Latch.ar(x, Impulse.ar(srrHz))]);
+			toneHz = destroyTone.clip(0, 1).linexp(0, 1, 400, 18000);
+			x = LPF.ar(x, toneHz);
+			lvl = destroyLevel.clip(0, 1).linlin(0, 1, 0.2, 2.0);
+			x = (x * lvl).softclip;
+			Out.ar(out, x);   // always fully wet (owner: Destroy has no dry/wet)
+		}).add;
+
+		// Echo (#8): Ableton-Echo-style stereo delay. Its OWN tempo-synced time
+		// (echoBeats) so the simple DELAY machine's serialized division list is
+		// untouched; the right tap is offset by a ratio, the image is stereo or
+		// ping-pong (crossed feedback), the loop has a lowpass tone + time wobble.
+		// Feedback clipped at 0.95 + softclip in the loop -- bounded.
+		SynthDef(\elasticatFxEcho, {
+			arg out=0, in=0, mix=0.5, delayFeedback=0.3,
+			echoBeats=1, echoOffset=0, echoMode=0, echoTone=1, echoWobble=0, targetBpm=120;
+			var maxT = 4.0;
+			var sig, dry, lTime, rTime, offRatio, toneHz, wob, lTmod, rTmod;
+			var fb, fbG, mSel, fbL, fbR, dl, dr, wet;
+			sig = In.ar(in, 2);
+			dry = sig;
+			// Lagged like DELAY: an instant time jump = a click (see \elasticatFxDelay).
+			lTime = Lag.kr(((echoBeats.max(0.03125) * 60) / targetBpm.max(1)).clip(0.001, maxT), 0.15);
+			offRatio = Lag.kr(echoOffset.clip(-1, 1).linexp(-1, 1, 0.5, 2.0), 0.15);
+			rTime = (lTime * offRatio).clip(0.001, maxT);
+			toneHz = echoTone.clip(0, 1).linexp(0, 1, 300, 18000);
+			wob = echoWobble.clip(0, 1);
+			lTmod = (lTime * (1 + (SinOsc.kr(0.7) * wob * 0.03) + (LFNoise2.kr(9) * wob * 0.01))).clip(0.001, maxT);
+			rTmod = (rTime * (1 + (SinOsc.kr(0.73) * wob * 0.03) + (LFNoise2.kr(9.3) * wob * 0.01))).clip(0.001, maxT);
+			fb = LocalIn.ar(2);
+			fbG = delayFeedback.clip(0, 0.95);
+			mSel = echoMode.round(1).clip(0, 1);
+			fbL = Select.ar(mSel, [fb[0], fb[1]]);   // ping-pong crosses the channels
+			fbR = Select.ar(mSel, [fb[1], fb[0]]);
+			dl = DelayC.ar(sig[0] + (fbL * fbG), maxT, lTmod);
+			dr = DelayC.ar(sig[1] + (fbR * fbG), maxT, rTmod);
+			dl = LPF.ar(dl, toneHz).softclip;
+			dr = LPF.ar(dr, toneHz).softclip;
+			LocalOut.ar([dl, dr]);
+			wet = [dl, dr];
+			Out.ar(out, fxMixBlend.value(dry, wet, mix));
+		}).add;
+
+		// Blackhole (#9): huge modulated freeze-capable reverb. A modulated
+		// AllpassC ring with a feedback gain that GRAV pushes toward 1.0 (freeze).
+		// A Limiter in the loop keeps the freeze from blowing up while sustaining.
+		// reverbSize scales the allpass times, reverbDamp is HF damping, bhLow is a
+		// tail low cut, bhPredelay offsets the onset.
+		SynthDef(\elasticatFxBlackhole, {
+			arg out=0, in=0, mix=0.5, reverbSize=0.5, reverbDamp=0.5,
+			bhGravity=0.5, bhMod=0.2, bhLow=0.1, bhPredelay=0.1, targetBpm=120;
+			var sig, dry, preT, sizeScale, fbG, dampHz, lowHz, modAmt, pre, loop, x, wet;
+			sig = In.ar(in, 2);
+			dry = sig;
+			preT = bhPredelay.clip(0, 1).linlin(0, 1, 0, 0.2);
+			sizeScale = reverbSize.clip(0, 1).linlin(0, 1, 0.5, 1.6);
+			fbG = bhGravity.clip(0, 1).linlin(0, 1, 0.7, 1.0).min(0.9995);
+			dampHz = reverbDamp.clip(0, 1).linexp(0, 1, 16000, 700);
+			lowHz = bhLow.clip(0, 1).linexp(0, 1, 20, 600);
+			modAmt = bhMod.clip(0, 1);
+			pre = DelayN.ar(sig, 0.2, preT);
+			loop = LocalIn.ar(2);
+			x = pre + (loop * fbG);
+			[0.013, 0.021, 0.031, 0.043].do({ arg t, i;
+				var mt = t * sizeScale * (1 + (LFNoise2.kr((0.2 + (i * 0.13)) ! 2) * modAmt * 0.18));
+				x = AllpassC.ar(x, 0.12, mt.clip(0.001, 0.12), 3.5 * sizeScale);
+			});
+			x = LPF.ar(x, dampHz);
+			x = HPF.ar(x, lowHz);
+			x = Limiter.ar(LeakDC.ar(x), 0.9);
+			LocalOut.ar(x);
+			wet = x;
+			Out.ar(out, fxMixBlend.value(dry, wet, mix));
+		}).add;
+
+		// Chorus (#10): dual-voice modulated delay. L/R LFOs offset by chorusWidth
+		// (quadrature at full). Shares modfxRate/Depth/Tone with Flanger/Phaser. No
+		// feedback -- safe.
+		SynthDef(\elasticatFxChorus, {
+			arg out=0, in=0, mix=0.5, modfxRate=0.3, modfxDepth=0.3, chorusWidth=0.5, modfxTone=0.8;
+			var sig, dry, rateHz, depthS, toneHz, lfoL, lfoR, dL, dR, wet;
+			sig = In.ar(in, 2);
+			dry = sig;
+			rateHz = modfxRate.clip(0, 1).linexp(0.001, 1, 0.05, 8);
+			depthS = modfxDepth.clip(0, 1).linlin(0, 1, 0, 0.012);
+			toneHz = modfxTone.clip(0, 1).linexp(0, 1, 400, 18000);
+			lfoL = SinOsc.kr(rateHz, 0);
+			lfoR = SinOsc.kr(rateHz, chorusWidth.clip(0, 1) * pi);
+			dL = DelayC.ar(sig[0], 0.05, (0.015 + (depthS * lfoL)).clip(0.001, 0.05));
+			dR = DelayC.ar(sig[1], 0.05, (0.015 + (depthS * lfoR)).clip(0.001, 0.05));
+			wet = LPF.ar([dL, dR], toneHz);
+			Out.ar(out, fxMixBlend.value(dry, wet, mix));
+		}).add;
+
+		// Flanger (#11): short modulated delay with feedback. flangerFeedback is
+		// BIPOLAR (negative = hollow comb); clipped to +/-0.9 so it can drone but
+		// not blow up.
+		SynthDef(\elasticatFxFlanger, {
+			arg out=0, in=0, mix=0.5, modfxRate=0.3, modfxDepth=0.3, flangerFeedback=0, modfxTone=0.8;
+			var sig, dry, rateHz, depthS, fbAmt, toneHz, lfo, dtime, fb, x, d, wet;
+			sig = In.ar(in, 2);
+			dry = sig;
+			rateHz = modfxRate.clip(0, 1).linexp(0.001, 1, 0.02, 4);
+			depthS = modfxDepth.clip(0, 1).linlin(0, 1, 0.0002, 0.006);
+			fbAmt = flangerFeedback.clip(-1, 1) * 0.9;
+			toneHz = modfxTone.clip(0, 1).linexp(0, 1, 400, 18000);
+			lfo = SinOsc.kr(rateHz).range(0, 1);
+			dtime = (0.0006 + (depthS * lfo)).clip(0.0002, 0.02);
+			fb = LocalIn.ar(2);
+			x = sig + (fb * fbAmt);
+			d = LPF.ar(DelayC.ar(x, 0.02, dtime ! 2), toneHz);
+			LocalOut.ar(d);
+			wet = d;
+			Out.ar(out, fxMixBlend.value(dry, wet, mix));
+		}).add;
+
+		// Phaser (#12): cascaded first-order allpass (FOS) sweep, 2/4/6/8 stages
+		// tapped by phaserStages, resonance via a clipped feedback path. All stages
+		// share the swept break frequency (classic phaser). Shares modfxRate/Depth.
+		SynthDef(\elasticatFxPhaser, {
+			arg out=0, in=0, mix=0.5, modfxRate=0.25, modfxDepth=0.6, phaserCenter=0.5, phaserStages=1, phaserFeedback=0.2;
+			var sig, dry, sr, rateHz, depth, centerHz, fbAmt, lfo, lo, hi, fc, t, c;
+			var fb, x, a2, a4, a6, a8, tapL, tapR, tapped, wet;
+			sig = In.ar(in, 2);
+			dry = sig;
+			sr = SampleRate.ir;
+			rateHz = modfxRate.clip(0, 1).linexp(0.001, 1, 0.02, 4);
+			depth = modfxDepth.clip(0, 1);
+			centerHz = phaserCenter.clip(0, 1).linexp(0, 1, 100, 4000);
+			fbAmt = phaserFeedback.clip(0, 1) * 0.9;
+			lo = (centerHz * (1 - (depth * 0.7))).max(40);
+			hi = (centerHz * (1 + (depth * 1.5))).min(12000);
+			fc = SinOsc.kr(rateHz).range(lo, hi).clip(40, 12000);
+			t = ((pi * fc) / sr).tan;
+			c = (t - 1) / (t + 1);
+			fb = LocalIn.ar(2);
+			x = sig + (fb * fbAmt);
+			// First-order allpass: y[n] = c*x[n] + x[n-1] - c*y[n-1], i.e. FOS
+			// b1 = c.NEG. (Shipped with +c, which is a shelf, not an allpass --
+			// no notches, so the phaser barely phased.)
+			a2 = x;  2.do { a2 = FOS.ar(a2, c, 1.0, c.neg); };
+			a4 = a2; 2.do { a4 = FOS.ar(a4, c, 1.0, c.neg); };
+			a6 = a4; 2.do { a6 = FOS.ar(a6, c, 1.0, c.neg); };
+			a8 = a6; 2.do { a8 = FOS.ar(a8, c, 1.0, c.neg); };
+			tapL = Select.ar(phaserStages.round(1).clip(0, 3), [a2[0], a4[0], a6[0], a8[0]]);
+			tapR = Select.ar(phaserStages.round(1).clip(0, 3), [a2[1], a4[1], a6[1], a8[1]]);
+			tapped = [tapL, tapR];
+			LocalOut.ar(tapped);
+			wet = (dry + tapped) * 0.5;
+			Out.ar(out, fxMixBlend.value(dry, wet, mix));
+		}).add;
+
+		// DJ EQ (#13): 3-band isolator with kills. Gains are BIPOLAR (64 = unity,
+		// 0 = full kill, top = boost); bands split by subtraction. No MIX (an EQ at
+		// 50% wet is a phase mess) -- writes the sum directly.
+		SynthDef(\elasticatFxDjEq, {
+			arg out=0, in=0, eqLow=0, eqMid=0, eqHigh=0, eqXlow=0.3, eqXhi=0.7;
+			var sig, xlowHz, xhiHz, gLow, gMid, gHigh, low, high, mid, wet;
+			sig = In.ar(in, 2);
+			xlowHz = eqXlow.clip(0, 1).linexp(0, 1, 80, 500);
+			xhiHz = eqXhi.clip(0, 1).linexp(0, 1, 1000, 8000);
+			gLow = (1 + eqLow.clip(-1, 1)).clip(0, 2);
+			gMid = (1 + eqMid.clip(-1, 1)).clip(0, 2);
+			gHigh = (1 + eqHigh.clip(-1, 1)).clip(0, 2);
+			low = LPF.ar(sig, xlowHz);
+			high = HPF.ar(sig, xhiHz);
+			mid = sig - low - high;
+			wet = (low * gLow) + (mid * gMid) + (high * gHigh);
+			Out.ar(out, wet);
+		}).add;
+
+		// Duck (#14): sidechain ducker keyed off keyIn (the master bus -- the dry
+		// program). Best on a send return. No MIX; writes the gained signal.
+		SynthDef(\elasticatFxDuck, {
+			arg out=0, in=0, keyIn=0, meterTrack=0, duckAmount=0.6, duckSens=0.5, duckAttack=0.2, duckRelease=0.4;
+			var sig, key, keyMono, amt, sensMult, atk, rel, keyAmp, env, gain;
+			sig = In.ar(in, 2);
+			key = In.ar(keyIn, 2);
+			keyMono = (key[0] + key[1]) * 0.5;
+			amt = duckAmount.clip(0, 1);
+			sensMult = duckSens.clip(0, 1).linexp(0, 1, 0.5, 8);
+			atk = duckAttack.clip(0, 1).linexp(0, 1, 0.001, 0.05);
+			rel = duckRelease.clip(0, 1).linexp(0, 1, 0.05, 1.2);
+			keyAmp = Amplitude.kr(keyMono, atk, rel);
+			env = (keyAmp * sensMult).clip(0, 1);
+			gain = Lag.kr((1 - (env * amt)).clip(0, 1), 0.005);
+			// Metering: the duck gain (in dB) is the reduction; the key level is the
+			// dry program. Duck has no hard threshold, so thresh is sent as -99 (the
+			// UI omits the threshold tick for duck). 20Hz, keyed by the track index.
+			SendReply.kr(Impulse.kr(20), '/elasticat/fxMeterRaw',
+				[gain.clip(0.0001, 1).ampdb, keyAmp.clip(0.0001, 4).ampdb, -99], meterTrack);
+			Out.ar(out, sig * gain);
+		}).add;
+
+		// Tape Echo (#15): the tempo-synced delay with the tape loop misbehaving --
+		// wow (slow) + flutter (fast) modulate the delay time, tanh saturation +
+		// band-limit sit inside the recirculation. Reuses echoBeats/echoTone/
+		// delayFeedback. Feedback clipped 0.95 + softclip -- bounded.
+		SynthDef(\elasticatFxTapeEcho, {
+			arg out=0, in=0, mix=0.5, delayFeedback=0.3, echoBeats=1, echoTone=1,
+			tapeWow=0.2, tapeFlutter=0.12, tapeSat=0.24, targetBpm=120;
+			var maxT = 4.0;
+			var sig, dry, t, wowMod, flutMod, tMod, toneHz, fb, fbG, x, rec, driven, wet;
+			sig = In.ar(in, 2);
+			dry = sig;
+			// Lagged like DELAY: an instant time jump = a click (see \elasticatFxDelay).
+			t = Lag.kr(((echoBeats.max(0.03125) * 60) / targetBpm.max(1)).clip(0.001, maxT), 0.15);
+			wowMod = SinOsc.kr(0.5) * tapeWow.clip(0, 1) * 0.02;
+			flutMod = LFNoise2.kr(8) * tapeFlutter.clip(0, 1) * 0.006;
+			tMod = (t * (1 + wowMod + flutMod)).clip(0.001, maxT);
+			toneHz = echoTone.clip(0, 1).linexp(0, 1, 300, 14000);
+			fb = LocalIn.ar(2);
+			fbG = delayFeedback.clip(0, 0.95);
+			x = sig + (fb * fbG);
+			rec = DelayC.ar(x, maxT, tMod ! 2);
+			rec = LPF.ar(HPF.ar(rec, 70), toneHz);
+			driven = ((rec * (1 + (tapeSat.clip(0, 1) * 5))).tanh) * (0.9 / (1 + (tapeSat.clip(0, 1) * 1.2)));
+			rec = SelectX.ar(tapeSat.clip(0, 1), [rec, driven]).softclip;
+			LocalOut.ar(rec);
+			wet = rec;
+			Out.ar(out, fxMixBlend.value(dry, wet, mix));
+		}).add;
+
+		// Cassette (#16): degraded-media character -- pitch wobble (shared tapeWow/
+		// tapeFlutter), hiss bed, Dust crackle, random dropouts, band-limit. All
+		// bounded arithmetic, no feedback.
+		SynthDef(\elasticatFxCassette, {
+			arg out=0, in=0, mix=1.0,
+			tapeWow=0.2, tapeFlutter=0.12, cassNoise=0.08, cassCrackle=0, cassDrop=0, cassTone=0.63;
+			var sig, dry, wob, dropMod, toneHz, band, hiss, crackle, wet;
+			sig = In.ar(in, 2);
+			dry = sig;
+			wob = DelayC.ar(sig, 0.03,
+				(0.012 + (SinOsc.kr(0.6) * tapeWow.clip(0, 1) * 0.004)
+					+ (LFNoise2.kr(6) * tapeFlutter.clip(0, 1) * 0.002)).clip(0.001, 0.03));
+			dropMod = (1 - (cassDrop.clip(0, 1) * LFNoise1.kr(3).range(0, 1).pow(3))).clip(0, 1);
+			toneHz = cassTone.clip(0, 1).linexp(0, 1, 1200, 16000);
+			band = LPF.ar(HPF.ar(wob * dropMod, 60), toneHz);
+			hiss = HPF.ar(PinkNoise.ar(cassNoise.clip(0, 1) * 0.02 ! 2), 800);
+			crackle = BPF.ar(Decay.ar(Dust2.ar(cassCrackle.clip(0, 1) * 40 ! 2), 0.002), 2500, 1.5) * 0.4;
+			wet = band + hiss + crackle;
+			Out.ar(out, fxMixBlend.value(dry, wet, mix));
+		}).add;
+
+		// Motion (#17): M/S stereo width + one tempo-synced LFO driving tremolo
+		// (in-phase) and autopan (opposite-phase). Depths at 0 = exact unity, so
+		// there is no mix arg. motionWidth -1..1: -1 mono, 0 unity, +1 wide.
+		SynthDef(\elasticatFxMotion, {
+			arg out=0, in=0, motionWidth=0, motionBeats=1, motionTrem=0, motionPan=0, motionShape=0, targetBpm=120;
+			var sig, mid, side, sideGain, l2, r2, hz, lfoU, trem, panL, panR;
+			sig = In.ar(in, 2);
+			mid = (sig[0] + sig[1]) * 0.5;
+			side = (sig[0] - sig[1]) * 0.5;
+			sideGain = (1 + motionWidth.clip(-1, 1)).clip(0, 2);
+			l2 = mid + (side * sideGain);
+			r2 = mid - (side * sideGain);
+			hz = ((targetBpm.max(1) / 60) / motionBeats.max(0.0625)).clip(0.01, 40);
+			lfoU = Select.kr(motionShape.round(1).clip(0, 2), [
+				SinOsc.kr(hz).range(0, 1), LFTri.kr(hz).range(0, 1), LFPulse.kr(hz)
+			]);
+			trem = 1 - (motionTrem.clip(0, 1) * lfoU);
+			panL = 1 - (motionPan.clip(0, 1) * lfoU);
+			panR = 1 - (motionPan.clip(0, 1) * (1 - lfoU));
+			Out.ar(out, [l2 * trem * panL, r2 * trem * panR]);
+		}).add;
+
+		// Rings (#18): RING = sig * SinOsc (freq magnitude), SHIFT = FreqShift
+		// (bipolar direction) with feedback for barberpole recirculation. Reuses
+		// modfxTone as the wet lowpass. Feedback clipped 0.85 -- bounded.
+		SynthDef(\elasticatFxRings, {
+			arg out=0, in=0, mix=0.5, ringsMode=0, ringsFreq=0.5, ringsFine=0, ringsFeedback=0, modfxTone=0.8;
+			var sig, dry, mag, freqHz, fineHz, toneHz, fb, x, ring, shift, wet;
+			sig = In.ar(in, 2);
+			dry = sig;
+			mag = ringsFreq.clip(-1, 1);
+			freqHz = (mag.abs.linexp(0.001, 1, 1, 2000)) * mag.sign;
+			fineHz = ringsFine.clip(-1, 1) * 20;
+			toneHz = modfxTone.clip(0, 1).linexp(0, 1, 400, 18000);
+			fb = LocalIn.ar(2);
+			x = sig + (fb * ringsFeedback.clip(0, 1) * 0.85);
+			ring = x * SinOsc.ar((freqHz + fineHz).abs.max(0.1));
+			shift = FreqShift.ar(x, freqHz + fineHz);
+			wet = LPF.ar(Select.ar(ringsMode.round(1).clip(0, 1), [ring, shift]), toneHz);
+			LocalOut.ar(wet.softclip);
+			Out.ar(out, fxMixBlend.value(dry, wet, mix));
+		}).add;
+
+		// Limit (#19): brickwall + loudness for the master slot. limitGain pushes
+		// 0..+18 dB into a -6..0 dB ceiling; limitRelease maps to the lookahead
+		// window. No mix arg -- it IS the output stage.
+		SynthDef(\elasticatFxLimit, {
+			arg out=0, in=0, limitGain=0, limitCeil=0.95, limitRelease=0.3, meterTrack=0;
+			var sig, g, ceil, dur, wet, inAmp, outAmp, grDb, keyDb;
+			sig = In.ar(in, 2);
+			g = limitGain.clip(0, 1).linlin(0, 1, 0, 18).dbamp;
+			ceil = limitCeil.clip(0, 1).linlin(0, 1, -6, 0).dbamp;
+			dur = limitRelease.clip(0, 1).linexp(0, 1, 0.002, 0.1);
+			wet = Limiter.ar(sig * g, ceil, dur);
+			// Metering feed, same shape as COMP: gain reduction (out/in dB),
+			// post-gain input level, and the ceiling as the threshold tick.
+			inAmp  = Amplitude.kr(sig[0] * g);
+			outAmp = Amplitude.kr(wet[0]);
+			grDb   = (outAmp / (inAmp + 0.0001)).clip(0.0001, 1).ampdb;
+			keyDb  = inAmp.clip(0.0001, 4).ampdb;
+			SendReply.kr(Impulse.kr(20), '/elasticat/fxMeterRaw', [grDb, keyDb, ceil.ampdb], meterTrack);
+			Out.ar(out, wet);
+		}).add;
+
 		// --- Send tap (global; PRD SS3/SS8) -------------------------------------
 		// Reads both the pre-insert (insertBus, post-filter) and post-insert-1
 		// (masterBus, read here before any send FX has written back to it this
@@ -1660,14 +2114,22 @@ Engine_Elasticat : CroneEngine {
 		// IDENTICAL for track 1 and tracks 2-8: no per-track difference, no double
 		// gain. `alive` fades to 0 (~30 ms Lag) before freeing the chain.
 		SynthDef(\elasticatTrackMix, {
-			arg out=0, in=0, amp=1, pan=0, mute=0, alive=1;
-			var sig, gain;
+			arg out=0, in=0, amp=1, pan=0, mute=0, alive=1, trackIndex=1;
+			var sig, gain, outSig, lvl;
 			sig = In.ar(in, 2);
 			gain = Lag.kr(
 				amp.max(0) * (1 - mute.clip(0, 1)) * alive.clip(0, 1),
 				0.03
 			);
-			Out.ar(out, Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), gain));
+			outSig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), gain);
+			// Idle detector feed: this track's POST-gain output level at 2Hz.
+			// Post-everything on purpose -- a ringing insert delay/reverb tail
+			// registers here, so the idle scan can never pause a track that is
+			// still audible. The slow 0.3s release keeps gaps between grains /
+			// sparse hits from reading as silence between two 2Hz samples.
+			lvl = Amplitude.kr(outSig[0] + outSig[1], 0.01, 0.3);
+			SendReply.kr(Impulse.kr(2), '/elasticat/idleRaw', [lvl], trackIndex);
+			Out.ar(out, outSig);
 		}).add;
 
 		// --- Modulation synth (2 LFOs + mod envelope; MOD category) -------------
@@ -2122,7 +2584,9 @@ Engine_Elasticat : CroneEngine {
 		this.addCommand(\activeTrackCount, "i", { arg msg; this.setActiveTrackCount(msg[1]); });
 		// Which track's mod / filter-env stream the script receives.
 		this.addCommand(\uiTrack, "i", { arg msg; uiTrack = msg[1].asInteger.clip(1, 8); });
-		this.addCommand(\viewTrack, "i", { arg msg; viewTrack = msg[1].asInteger.clip(1, 8); });
+		this.addCommand(\viewTrack, "i", { arg msg; this.setViewTrack(msg[1]); });
+		this.addCommand(\idlePauseEnable, "i", { arg msg; this.setIdlePauseEnabled(msg[1]); });
+		this.addCommand(\idleGrace, "f", { arg msg; this.setIdleGrace(msg[1]); });
 		this.addCommand(\meterAll, "i", { arg msg; meterAll = msg[1].asInteger.clip(0, 1); });
 		this.addCommand(\maxSliceVoices, "i", { arg msg;
 			maxSliceVoices = msg[1].asInteger.clip(1, 64);
@@ -2210,6 +2674,98 @@ Engine_Elasticat : CroneEngine {
 		this.addCommand(\masterReverbDamp, "f", { arg msg; sendFxReverbDamp[2] = msg[1].clip(0, 1); this.setMasterFx(\reverbDamp, sendFxReverbDamp[2]); });
 		this.addCommand(\masterLofiBits, "f", { arg msg; sendFxLofiBits[2] = msg[1].clip(1, 24); this.setMasterFx(\lofiBits, sendFxLofiBits[2]); });
 		this.addCommand(\masterLofiRate, "f", { arg msg; sendFxLofiRate[2] = msg[1].clip(500, 48000); this.setMasterFx(\lofiRate, sendFxLofiRate[2]); });
+
+		// --- Generated: the new machines' (Comp/Destroy/Echo/Blackhole) send +
+		// master FX params. One row per param generates send1<Cmd>/send2<Cmd>/
+		// master<Cmd>, storing into sendFxExtra so a respawn (sendFxArgs) reapplies
+		// it. Additive to the hand-written commands above; existing sends untouched.
+		this.sendFxExtraSpec.do({ arg row;
+			var cmdBase = row[0], key = row[1], lo = row[2], hi = row[3];
+			[[\send1, 0], [\send2, 1], [\master, 2]].do({ arg sp;
+				var prefix = sp[0], idx = sp[1];
+				this.addCommand((prefix ++ cmdBase).asSymbol, "f", { arg msg;
+					var v = msg[1].clip(lo, hi);
+					sendFxExtra[idx][key] = v;
+					this.setSendSlot(idx, key, v);
+				});
+			});
+		});
+	}
+
+	// The new machines' send/master param table: [cmdBase, synthArg, lo, hi,
+	// default]. cmdBase is the UpperCamel suffix the Lua slot prefix ("send1"/
+	// "send2"/"master") is prepended to. Values arrive already in engine units
+	// (0-1 amounts, bipolar -1..1, or beats) -- lo/hi just clips. Add a machine's
+	// send params by adding rows here; nothing else in the command surface changes.
+	sendFxExtraSpec {
+		^[
+			[\CompThresh,   \compThresh,   0, 1, 0.3],
+			[\CompRatio,    \compRatio,    0, 1, 0.2],
+			[\CompAttack,   \compAttack,   0, 1, 0.1],
+			[\CompRelease,  \compRelease,  0, 1, 0.3],
+			[\CompMakeup,   \compMakeup,   0, 1, 0],
+			[\DestroyWarble, \destroyWarble, 0, 1, 0],
+			[\DestroyFold,  \destroyFold,  0, 1, 0],
+			[\DestroySat,   \destroySat,   0, 1, 0],
+			[\DestroyCrush, \destroyCrush, 0, 1, 0],
+			[\DestroySrr,    \destroySrr,   0, 1, 0],
+			[\DestroyTone,  \destroyTone,  0, 1, 1],
+			[\DestroyLevel, \destroyLevel, 0, 1, 0.55],
+			[\EchoBeats,    \echoBeats,    0.03125, 8, 1],
+			[\EchoOffset,   \echoOffset,   -1, 1, 0],
+			[\EchoMode,     \echoMode,     0, 1, 0],
+			[\EchoTone,     \echoTone,     0, 1, 1],
+			[\EchoWobble,   \echoWobble,   0, 1, 0],
+			[\BhGravity,    \bhGravity,    0, 1, 0.5],
+			[\BhMod,        \bhMod,        0, 1, 0.2],
+			[\BhLow,        \bhLow,        0, 1, 0.1],
+			[\BhPredelay,   \bhPredelay,   0, 1, 0.1],
+			[\ModfxRate,      \modfxRate,      0, 1, 0.3],
+			[\ModfxDepth,     \modfxDepth,     0, 1, 0.3],
+			[\ModfxTone,      \modfxTone,      0, 1, 0.8],
+			[\ChorusWidth,    \chorusWidth,    0, 1, 0.5],
+			[\FlangerFeedback, \flangerFeedback, -1, 1, 0],
+			[\PhaserCenter,   \phaserCenter,   0, 1, 0.5],
+			[\PhaserStages,   \phaserStages,   0, 3, 1],
+			[\PhaserFeedback, \phaserFeedback, 0, 1, 0.2],
+			[\EqLow,          \eqLow,          -1, 1, 0],
+			[\EqMid,          \eqMid,          -1, 1, 0],
+			[\EqHigh,         \eqHigh,         -1, 1, 0],
+			[\EqXlow,         \eqXlow,         0, 1, 0.3],
+			[\EqXhi,          \eqXhi,          0, 1, 0.7],
+			[\DuckAmount,     \duckAmount,     0, 1, 0.6],
+			[\DuckSens,       \duckSens,       0, 1, 0.5],
+			[\DuckAttack,     \duckAttack,     0, 1, 0.2],
+			[\DuckRelease,    \duckRelease,    0, 1, 0.4],
+			[\TapeWow,        \tapeWow,        0, 1, 0.2],
+			[\TapeFlutter,    \tapeFlutter,    0, 1, 0.12],
+			[\TapeSat,        \tapeSat,        0, 1, 0.24],
+			[\CassNoise,      \cassNoise,      0, 1, 0.08],
+			[\CassCrackle,    \cassCrackle,    0, 1, 0],
+			[\CassDrop,       \cassDrop,       0, 1, 0],
+			[\CassTone,       \cassTone,       0, 1, 0.63],
+			[\MotionWidth,    \motionWidth,    -1, 1, 0],
+			[\MotionBeats,    \motionBeats,    0.0625, 16, 1],
+			[\MotionTrem,     \motionTrem,     0, 1, 0],
+			[\MotionPan,      \motionPan,      0, 1, 0],
+			[\MotionShape,    \motionShape,    0, 2, 0],
+			[\RingsMode,      \ringsMode,      0, 1, 0],
+			[\RingsFreq,      \ringsFreq,      -1, 1, 0.5],
+			[\RingsFine,      \ringsFine,      -1, 1, 0],
+			[\RingsFeedback,  \ringsFeedback,  0, 1, 0],
+			[\LimitGain,      \limitGain,      0, 1, 0],
+			[\LimitCeil,      \limitCeil,      0, 1, 0.95],
+			[\LimitRelease,   \limitRelease,   0, 1, 0.3]
+		];
+	}
+
+	// Set one arg on whichever send/master synth slotIdx names (0/1/2), reusing
+	// the existing per-slot setters (no-op when that synth is None / not spawned).
+	setSendSlot { arg slotIdx, key, value;
+		switch(slotIdx,
+			0, { this.setSend1(key, value); },
+			1, { this.setSend2(key, value); },
+			2, { this.setMasterFx(key, value); });
 	}
 
 	// field -> \tr<UpperCamelField>, the contract's mechanical naming rule.
@@ -2368,6 +2924,15 @@ Engine_Elasticat : CroneEngine {
 	// Shared arg list for any send/master FX slot -- slotIdx indexes the
 	// sendFx* arrays (0 = Send 1, 1 = Send 2, 2 = Master).
 	sendFxArgs { arg slotIdx, inBusIndex, outBusIndex;
+		var extra;
+		// The new machines' params (Comp/Destroy/Echo/Blackhole) come from the
+		// per-slot dict so a respawn reapplies the last value; unknown args are
+		// ignored by whatever SynthDef spawns, so this is safe for every machine.
+		extra = [];
+		this.sendFxExtraSpec.do({ arg row;
+			var key = row[1];
+			extra = extra ++ [key, sendFxExtra[slotIdx][key]];
+		});
 		^[
 			\out, outBusIndex,
 			\in, inBusIndex,
@@ -2380,8 +2945,14 @@ Engine_Elasticat : CroneEngine {
 			\reverbDamp, sendFxReverbDamp[slotIdx],
 			\lofiBits, sendFxLofiBits[slotIdx],
 			\lofiRate, sendFxLofiRate[slotIdx],
-			\targetBpm, targetBpm
-		];
+			\targetBpm, targetBpm,
+			\keyIn, masterBus.index,   // Duck sidechain source (the dry program)
+			// Comp/Duck meter id for the GLOBAL slots: 101 = Send 1, 102 = Send 2,
+			// 103 = Master. Never collides with a track index (1-8); the responder
+			// forwards ids > 100 unconditionally so the send/master FX pages can
+			// show their meters too.
+			\meterTrack, 101 + slotIdx
+		] ++ extra;
 	}
 
 	spawnSend1 {
@@ -2768,11 +3339,63 @@ Engine_Elasticat : CroneEngine {
 		]);
 	}
 
+	// ---- Idle pause (see the var block comment) ---------------------------
+	// Eligibility lives in ONE place: stopped, awake, allocated, not the
+	// viewed track, silent past the grace window, and holding no live slice
+	// voices (a stopped track can still be auditioning pads).
+	idleScan {
+		var now;
+		if(idlePauseEnabled == 0, { ^this });
+		now = Main.elapsedTime;
+		(1..8).do({ arg t;
+			var tr = tracks[t];
+			if(tr.notNil and: { tr.isAllocated }, {
+				if(tr.idleEligible(now, viewTrack, idleGraceSeconds) and: {
+					sliceVoiceOrder.count({ arg e; e[\track] === tr }) == 0
+				}, {
+					tr.idlePause;
+					// Drop the script-side mixer meter to zero: the paused mix
+					// synth can no longer report its (silent) level itself.
+					scriptAddress.sendBundle(0, ["/elasticat/track/level", t, 0, 0]);
+				});
+			});
+		});
+		idlePausedCount = (1..8).count({ arg t;
+			tracks[t].notNil and: { tracks[t].idlePaused }
+		});
+	}
+
+	wakeAllTracks {
+		(1..8).do({ arg t;
+			if(tracks[t].notNil, { tracks[t].idleWake; });
+		});
+		idlePausedCount = 0;
+	}
+
+	setIdlePauseEnabled { arg flag;
+		idlePauseEnabled = flag.asInteger.clip(0, 1);
+		if(idlePauseEnabled == 0, { this.wakeAllTracks; });
+	}
+
+	setIdleGrace { arg secs;
+		idleGraceSeconds = secs.clip(0.1, 60);
+	}
+
+	setViewTrack { arg t;
+		viewTrack = t.asInteger.clip(1, 8);
+		// The viewed track drives the UI feeds (meter/phase/mod) and is the
+		// one being auditioned -- it must never sit paused.
+		if(tracks[viewTrack].notNil, { tracks[viewTrack].idleWake; });
+	}
+
 	free {
 		this.releaseAllSlices;
+		if(idleScanRoutine.notNil, { idleScanRoutine.stop; });
+		if(idleResponder.notNil, { idleResponder.free; });
 		if(statusResponder.notNil, { statusResponder.free; });
 		if(modResponder.notNil, { modResponder.free; });
 		if(filterEnvResponder.notNil, { filterEnvResponder.free; });
+		if(fxMeterResponder.notNil, { fxMeterResponder.free; });
 		if(transportResponder.notNil, { transportResponder.free; });
 		if(previewSynth.notNil, { previewSynth.free; });
 		if(send1Synth.notNil, { send1Synth.free; });
@@ -2840,6 +3463,10 @@ ElasticatTrack {
 
 	var <engine;     // back-reference: server, groups, global busses, defs, tempo
 	var <index;      // 1-based track number; also every SendReply's replyID
+
+	// --- idle pause state (engine.idleScan drives it; see engine var block) ---
+	var <idlePaused = false;
+	var lastLoudTime = 0;   // Main.elapsedTime of the last non-silent 2Hz report
 
 	// --- transport / reader state -------------------------------------------
 	var <machine = 0, <playing = 0, <muted = 0;
@@ -2912,6 +3539,24 @@ ElasticatTrack {
 	var <fxInsertMachine = 0, <fxDrive = 0, <fxMix = 0.5;
 	var <delayBeats = 1, <delayFeedback = 0.3, <delayTone = 1;
 	var <reverbSize = 0.5, <reverbDamp = 0.5, <lofiBits = 24, <lofiRate = 48000;
+	// New machines' per-track insert params (Comp/Destroy/Echo/Blackhole). Each is
+	// a setSpec field (instVarPut writes here) AND seeded into fxInsertArgs so it
+	// survives a machine swap. Defaults mirror the SynthDef arg defaults.
+	var <compThresh = 0.3, <compRatio = 0.2, <compAttack = 0.1, <compRelease = 0.3, <compMakeup = 0;
+	var <destroyWarble = 0, <destroyFold = 0, <destroySat = 0, <destroyCrush = 0, <destroySrr = 0, <destroyTone = 1, <destroyLevel = 0.55;
+	var <echoBeats = 1, <echoOffset = 0, <echoMode = 0, <echoTone = 1, <echoWobble = 0;
+	var <bhGravity = 0.5, <bhMod = 0.2, <bhLow = 0.1, <bhPredelay = 0.1;
+	// Chorus/Flanger/Phaser (share modfx*), DJ EQ, Duck.
+	var <modfxRate = 0.3, <modfxDepth = 0.3, <modfxTone = 0.8;
+	var <chorusWidth = 0.5, <flangerFeedback = 0, <phaserCenter = 0.5, <phaserStages = 1, <phaserFeedback = 0.2;
+	var <eqLow = 0, <eqMid = 0, <eqHigh = 0, <eqXlow = 0.3, <eqXhi = 0.7;
+	var <duckAmount = 0.6, <duckSens = 0.5, <duckAttack = 0.2, <duckRelease = 0.4;
+	// Tape Echo / Cassette (share tapeWow/Flutter), Motion, Rings, Limit.
+	var <tapeWow = 0.2, <tapeFlutter = 0.12, <tapeSat = 0.24;
+	var <cassNoise = 0.08, <cassCrackle = 0, <cassDrop = 0, <cassTone = 0.63;
+	var <motionWidth = 0, <motionBeats = 1, <motionTrem = 0, <motionPan = 0, <motionShape = 0;
+	var <ringsMode = 0, <ringsFreq = 0.5, <ringsFine = 0, <ringsFeedback = 0;
+	var <limitGain = 0, <limitCeil = 0.95, <limitRelease = 0.3;
 
 	// --- send levels into the two GLOBAL send busses ------------------------
 	var <sendTap = 0, <sendLevel1 = 0, <sendLevel2 = 0;
@@ -3029,6 +3674,67 @@ ElasticatTrack {
 			\reverbDamp    -> (arg: \reverbDamp,    synth: \insert, lo: 0, hi: 1),
 			\lofiBits      -> (arg: \lofiBits,      synth: \insert, lo: 1, hi: 24),
 			\lofiRate      -> (arg: \lofiRate,      synth: \insert, lo: 500, hi: 48000),
+			// new insert FX machines (Comp/Destroy/Echo/Blackhole). Values arrive in
+			// engine units (0-1 amounts, -1..1 offset, or beats); lo/hi just clips.
+			\compThresh    -> (arg: \compThresh,    synth: \insert, lo: 0, hi: 1),
+			\compRatio     -> (arg: \compRatio,     synth: \insert, lo: 0, hi: 1),
+			\compAttack    -> (arg: \compAttack,    synth: \insert, lo: 0, hi: 1),
+			\compRelease   -> (arg: \compRelease,   synth: \insert, lo: 0, hi: 1),
+			\compMakeup    -> (arg: \compMakeup,    synth: \insert, lo: 0, hi: 1),
+			\destroyWarble -> (arg: \destroyWarble, synth: \insert, lo: 0, hi: 1),
+			\destroyFold   -> (arg: \destroyFold,   synth: \insert, lo: 0, hi: 1),
+			\destroySat    -> (arg: \destroySat,    synth: \insert, lo: 0, hi: 1),
+			\destroyCrush  -> (arg: \destroyCrush,  synth: \insert, lo: 0, hi: 1),
+			\destroySrr    -> (arg: \destroySrr,    synth: \insert, lo: 0, hi: 1),
+			\destroyTone   -> (arg: \destroyTone,   synth: \insert, lo: 0, hi: 1),
+			\destroyLevel  -> (arg: \destroyLevel,  synth: \insert, lo: 0, hi: 1),
+			\echoBeats     -> (arg: \echoBeats,     synth: \insert, lo: 0.03125, hi: 8),
+			\echoOffset    -> (arg: \echoOffset,    synth: \insert, lo: -1, hi: 1),
+			\echoMode      -> (arg: \echoMode,      synth: \insert, lo: 0, hi: 1, int: true),
+			\echoTone      -> (arg: \echoTone,      synth: \insert, lo: 0, hi: 1),
+			\echoWobble    -> (arg: \echoWobble,    synth: \insert, lo: 0, hi: 1),
+			\bhGravity     -> (arg: \bhGravity,     synth: \insert, lo: 0, hi: 1),
+			\bhMod         -> (arg: \bhMod,         synth: \insert, lo: 0, hi: 1),
+			\bhLow         -> (arg: \bhLow,         synth: \insert, lo: 0, hi: 1),
+			\bhPredelay    -> (arg: \bhPredelay,    synth: \insert, lo: 0, hi: 1),
+			// Chorus/Flanger/Phaser (shared modfx*), DJ EQ, Duck
+			\modfxRate      -> (arg: \modfxRate,      synth: \insert, lo: 0, hi: 1),
+			\modfxDepth     -> (arg: \modfxDepth,     synth: \insert, lo: 0, hi: 1),
+			\modfxTone      -> (arg: \modfxTone,      synth: \insert, lo: 0, hi: 1),
+			\chorusWidth    -> (arg: \chorusWidth,    synth: \insert, lo: 0, hi: 1),
+			\flangerFeedback -> (arg: \flangerFeedback, synth: \insert, lo: -1, hi: 1),
+			\phaserCenter   -> (arg: \phaserCenter,   synth: \insert, lo: 0, hi: 1),
+			\phaserStages   -> (arg: \phaserStages,   synth: \insert, lo: 0, hi: 3, int: true),
+			\phaserFeedback -> (arg: \phaserFeedback, synth: \insert, lo: 0, hi: 1),
+			\eqLow          -> (arg: \eqLow,          synth: \insert, lo: -1, hi: 1),
+			\eqMid          -> (arg: \eqMid,          synth: \insert, lo: -1, hi: 1),
+			\eqHigh         -> (arg: \eqHigh,         synth: \insert, lo: -1, hi: 1),
+			\eqXlow         -> (arg: \eqXlow,         synth: \insert, lo: 0, hi: 1),
+			\eqXhi          -> (arg: \eqXhi,          synth: \insert, lo: 0, hi: 1),
+			\duckAmount     -> (arg: \duckAmount,     synth: \insert, lo: 0, hi: 1),
+			\duckSens       -> (arg: \duckSens,       synth: \insert, lo: 0, hi: 1),
+			\duckAttack     -> (arg: \duckAttack,     synth: \insert, lo: 0, hi: 1),
+			\duckRelease    -> (arg: \duckRelease,    synth: \insert, lo: 0, hi: 1),
+			// Tape Echo / Cassette / Motion / Rings / Limit
+			\tapeWow        -> (arg: \tapeWow,        synth: \insert, lo: 0, hi: 1),
+			\tapeFlutter    -> (arg: \tapeFlutter,    synth: \insert, lo: 0, hi: 1),
+			\tapeSat        -> (arg: \tapeSat,        synth: \insert, lo: 0, hi: 1),
+			\cassNoise      -> (arg: \cassNoise,      synth: \insert, lo: 0, hi: 1),
+			\cassCrackle    -> (arg: \cassCrackle,    synth: \insert, lo: 0, hi: 1),
+			\cassDrop       -> (arg: \cassDrop,       synth: \insert, lo: 0, hi: 1),
+			\cassTone       -> (arg: \cassTone,       synth: \insert, lo: 0, hi: 1),
+			\motionWidth    -> (arg: \motionWidth,    synth: \insert, lo: -1, hi: 1),
+			\motionBeats    -> (arg: \motionBeats,    synth: \insert, lo: 0.0625, hi: 16),
+			\motionTrem     -> (arg: \motionTrem,     synth: \insert, lo: 0, hi: 1),
+			\motionPan      -> (arg: \motionPan,      synth: \insert, lo: 0, hi: 1),
+			\motionShape    -> (arg: \motionShape,    synth: \insert, lo: 0, hi: 2, int: true),
+			\ringsMode      -> (arg: \ringsMode,      synth: \insert, lo: 0, hi: 1, int: true),
+			\ringsFreq      -> (arg: \ringsFreq,      synth: \insert, lo: -1, hi: 1),
+			\ringsFine      -> (arg: \ringsFine,      synth: \insert, lo: -1, hi: 1),
+			\ringsFeedback  -> (arg: \ringsFeedback,  synth: \insert, lo: 0, hi: 1),
+			\limitGain      -> (arg: \limitGain,      synth: \insert, lo: 0, hi: 1),
+			\limitCeil      -> (arg: \limitCeil,      synth: \insert, lo: 0, hi: 1),
+			\limitRelease   -> (arg: \limitRelease,   synth: \insert, lo: 0, hi: 1),
 			// send tap
 			\sendTap    -> (arg: \tap,    synth: \sendTap, lo: 0, hi: 1, int: true),
 			\sendLevel1 -> (arg: \level1, synth: \sendTap, lo: 0, hi: 1),
@@ -3288,6 +3994,7 @@ ElasticatTrack {
 	// ---- transport ----------------------------------------------------------
 	setPlay { arg state;
 		playing = state.asInteger.clip(0, 1);
+		if(playing == 1, { this.idleWake; });
 		if(playing == 0, { this.releaseAllSlices; });
 		if(transportSynth.notNil, { transportSynth.set(\playing, playing); });
 		this.setReader(\playing, playing);
@@ -3307,6 +4014,43 @@ ElasticatTrack {
 	// Phase reported back by this track's own transport/reader SendReply.
 	reportPhase { arg phase;
 		lastPhase = phase.wrap(0, 1);
+	}
+
+	// ---- Idle pause (engine.idleScan decides; these do the node work) --------
+	// Post-gain output level from this track's mix synth (2Hz). Anything above
+	// the floor counts as "recently audible" and defers the pause -- FX tails
+	// included, since the level is measured after the insert.
+	reportOutLevel { arg lvl;
+		if(lvl > 0.001, { lastLoudTime = Main.elapsedTime; });
+	}
+
+	idleEligible { arg now, view, grace;
+		^(playing == 0)
+			and: { idlePaused.not }
+			and: { index != view }
+			and: { group.notNil }
+			and: { (now - lastLoudTime) > grace }
+	}
+
+	// Pause the WHOLE track group -- transport, reader, mod, filter, insert,
+	// send tap and mix all stop executing. Nodes spawned into the paused group
+	// later (machine swaps on a background track) stay paused with it, and one
+	// run(true) resumes the entire subtree, so the bookkeeping is a single flag.
+	idlePause {
+		if(idlePaused or: { group.isNil }, { ^this });
+		group.run(false);
+		idlePaused = true;
+	}
+
+	// Called from EVERY entry point that makes this track sound (play, note and
+	// slice trigs, mod trig) plus becoming the viewed track. Also bumps
+	// lastLoudTime so the next scan tick can't re-pause the track before its
+	// first audio arrives.
+	idleWake {
+		lastLoudTime = Main.elapsedTime;
+		if(idlePaused.not, { ^this });
+		idlePaused = false;
+		if(group.notNil, { group.run(true); });
 	}
 
 	setReverse { arg value;
@@ -3412,6 +4156,7 @@ ElasticatTrack {
 	// seconds <= 0 is the indefinite-hold sentinel: the gate stays open until
 	// noteOff. The filter env shares the amp env's trigger counter and gate.
 	noteOn { arg seconds;
+		this.idleWake;
 		envNoteSeconds = if(seconds > 0, { seconds.max(0.005) }, { -1 });
 		envTrigCount = envTrigCount + 1;
 		if(activeSynth.notNil, {
@@ -3438,6 +4183,7 @@ ElasticatTrack {
 	// same-block set/reset on SetResetFF is reset-wins (stuck closed).
 	retrigNote { arg seconds;
 		var applyNoteOn;
+		this.idleWake;
 		applyNoteOn = {
 			envNoteSeconds = if(seconds > 0, { seconds.max(0.005) }, { -1 });
 			envTrigCount = envTrigCount + 1;
@@ -3461,6 +4207,7 @@ ElasticatTrack {
 	// Per-step modulation retrigger: arg 1 != 0 retriggers both LFOs (their
 	// non-FREE modes), arg 2 != 0 retriggers the mod envelope.
 	modTrig { arg lfo, env;
+		this.idleWake;
 		if(lfo.asInteger != 0, {
 			lfoTrigCount = lfoTrigCount + 1;
 			if(modSynth.notNil, {
@@ -3642,7 +4389,31 @@ ElasticatTrack {
 			\reverbDamp, reverbDamp,
 			\lofiBits, lofiBits,
 			\lofiRate, lofiRate,
-			\targetBpm, engine.targetBpm
+			\targetBpm, engine.targetBpm,
+			// new machines' params (unknown args are ignored by whichever machine spawns)
+			\compThresh, compThresh, \compRatio, compRatio, \compAttack, compAttack,
+			\compRelease, compRelease, \compMakeup, compMakeup,
+			\destroyWarble, destroyWarble, \destroyFold, destroyFold, \destroySat, destroySat,
+			\destroyCrush, destroyCrush, \destroySrr, destroySrr, \destroyTone, destroyTone, \destroyLevel, destroyLevel,
+			\echoBeats, echoBeats, \echoOffset, echoOffset, \echoMode, echoMode,
+			\echoTone, echoTone, \echoWobble, echoWobble,
+			\bhGravity, bhGravity, \bhMod, bhMod, \bhLow, bhLow, \bhPredelay, bhPredelay,
+			\modfxRate, modfxRate, \modfxDepth, modfxDepth, \modfxTone, modfxTone,
+			\chorusWidth, chorusWidth, \flangerFeedback, flangerFeedback,
+			\phaserCenter, phaserCenter, \phaserStages, phaserStages, \phaserFeedback, phaserFeedback,
+			\eqLow, eqLow, \eqMid, eqMid, \eqHigh, eqHigh, \eqXlow, eqXlow, \eqXhi, eqXhi,
+			\duckAmount, duckAmount, \duckSens, duckSens, \duckAttack, duckAttack, \duckRelease, duckRelease,
+			\tapeWow, tapeWow, \tapeFlutter, tapeFlutter, \tapeSat, tapeSat,
+			\cassNoise, cassNoise, \cassCrackle, cassCrackle, \cassDrop, cassDrop, \cassTone, cassTone,
+			\motionWidth, motionWidth, \motionBeats, motionBeats, \motionTrem, motionTrem,
+			\motionPan, motionPan, \motionShape, motionShape,
+			\ringsMode, ringsMode, \ringsFreq, ringsFreq, \ringsFine, ringsFine, \ringsFeedback, ringsFeedback,
+			\limitGain, limitGain, \limitCeil, limitCeil, \limitRelease, limitRelease,
+			// Duck keys off the master bus (the dry program); best on a send return.
+			\keyIn, engine.masterBus.index,
+			// Comp/Duck meter reply id = this track's index (so the engine responder
+			// forwards only the viewed track's meter to the script).
+			\meterTrack, index
 		];
 	}
 
@@ -3783,6 +4554,11 @@ ElasticatTrack {
 		modBusPan = Bus.control(server, 1);
 		group = Group.tail(engine.tracksGroup);
 		sourceGroup = Group.head(group);
+		// The instance survives free/alloc cycles (activeTrackCount changes),
+		// but the paused NODE does not -- a fresh group runs. Reset the flag so
+		// idleWake/idleScan reason about the new group, not the freed one.
+		idlePaused = false;
+		lastLoudTime = Main.elapsedTime;
 		// Fresh busses can carry whatever a previous owner left behind.
 		this.zeroModBusses;
 		// Only spawns if this track actually modulates something (see needsMod);
@@ -3811,7 +4587,8 @@ ElasticatTrack {
 			\amp, 1,
 			\pan, 0,
 			\mute, muted,
-			\alive, 1
+			\alive, 1,
+			\trackIndex, index
 		]);
 		this.spawnFilter;
 		this.spawnInsert;
@@ -3861,6 +4638,9 @@ ElasticatTrack {
 	forgetNodes {
 		engine.forgetSliceVoicesOf(this);
 		sliceVoices = Array.fill(32, { nil });
+		// A freed track is not "paused" -- the node the flag described is gone
+		// (and idlePausedCount must not keep counting it).
+		idlePaused = false;
 		group = nil; sourceGroup = nil;
 		phaseBus = nil; fxBus = nil; insertBus = nil; mixBus = nil;
 		modBusPitch = nil; modBusCutoff = nil; modBusRes = nil;
@@ -3877,6 +4657,7 @@ ElasticatTrack {
 	triggerSlice { arg sliceIndex, startPoint, endPoint, playMode, reverse, velocity, lengthSeconds, notePitch, chokeGroup = 0, mono = (-1);
 		var idx, startPos, endPos, mode, rev, pitchValue, pitchRatio, duration, sliceRatio, synth, chk, isMono;
 		if(group.isNil, { ^nil });
+		this.idleWake;
 		idx = sliceIndex.asInteger.clip(1, 32);
 		chk = (chokeGroup ? 0).asInteger.clip(0, 8);
 		startPos = startPoint.asFloat.clip(0, 127.99);

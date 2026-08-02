@@ -1,5 +1,55 @@
 # Changelog
 
+## CPU headroom: idle track pause + CPU readout
+
+- The engine now **pauses idle tracks**: a track that is stopped, actually silent (FX tails ring out first — silence is measured post-everything), not the selected track, and holding no slice voices has its whole DSP chain suspended. Any play/trig/preview or selecting the track wakes it instantly. Eight mostly-idle tracks now cost roughly nothing — this directly attacks the Pi3's xrun-storm → wedged-clock failure mode. Kill switch: params → system → "idle track pause".
+- **CPU readout**: the MIX page title shows scsynth's average/peak CPU (`MIX CPU 23/45%`, 2s refresh). The header warns only when it matters — peak ≥ 80% replaces the tempo cell with `C87!`.
+
+## DELAY fixes + FX review (phaser)
+
+- DELAY's **TIME** now covers the full 15-division list — `1/32 … 2 BAR` including dotted and triplet — matching ECHO/TAPE ECHO (old saves land on a neighboring division and need a one-time re-dial; default is now 1/4).
+- **Click fix**: delay-time changes in DELAY / ECHO / TAPE ECHO now glide tape-style instead of clicking on every knob tick or tempo change.
+- Fixed the TIME **parameter bar not moving** — the same bug froze every lockable option's bar on low-profile pages (Delay/Echo TIME, phaser STGS, chop LOOP).
+- FX review sweep: **PHASER** shipped with an allpass sign error that made it a barely-audible shelf — it actually phases now. All other feedback paths, delay headrooms and scalings checked clean.
+
+## FX collection: 14 new machines (19 total)
+
+- New machines: **COMP** (compressor with on-page IN/GR metering), **DESTROY** (bitcrush + sample-rate reduction lead an 8-param wrecking chain; always fully wet), **ECHO** (colored stereo echo with L/R offset), **BLACKHOLE** (huge modulated reverb), **CHORUS** / **FLANGER** / **PHASER** (the mod trio), **DJ EQ** (3-band kill EQ), **DUCK** (master-keyed sidechain ducking, metered), **TAPE ECHO** (wow/flutter/saturation in the loop), **CASSETTE** (noise/crackle/dropout degradation), **MOTION** (width/autopan/tremolo), **RINGS** (ring-mod/freq-shift), **LIMIT** (limiter). See `docs/MODE_CATALOG.md` for the full table.
+- **MIX is universal**: machines with a wet/dry sense carry MIX as the page's bottom-right trailing param; always-wet machines (DESTROY, DJ EQ, DUCK, MOTION, LIMIT) deliberately have none.
+- **Units**: dynamics machines (COMP/DUCK/LIMIT) display real dB/ms; everything else stays Elektron 0–127. FN-snaps target clean real-world values.
+- All 19 machines work in all four slots (Insert 1, Send 1/2, Master) with per-slot p-lockable params; send/master params now survive engine restarts (sync gap fixed) and the send/master pages show the comp/duck meters too.
+
+## Sample editor overhaul
+
+- "Number of steps" now means the **trimmed portion's** steps, so warping a trim to a clean bar behaves as expected.
+- New 5-group page layout with preview-on-waveform, a trim SNAP editor, and a fix for the gain-gate bug.
+
+## Per-track clock lock
+
+- Clock lock is now **per-track**: every playing loop syncs to its own loop length, not just track 1's — fixing loop re-sync on non-track-1 loops and giving trig release "return" modes a defined target everywhere.
+
+## Slice machines: the MPC chop program
+
+- **Razor editor**: per-slice start/end editing with 5 snap modes (grid / zoom / zero-cross / transient / neighbors), visual zoom, redistribute-evenly, and transient **auto-chop** (cached onset analysis + live threshold).
+- **Per-slice p-locks**: hold a pad + edit a param — each slice carries its own settings, MPC chop-program style. Hold a pad + the mini keyboard sets a pitch p-lock.
+- **Choke groups**, slice **mute**, **copy/paste pads**, **ratchets**, velocity as a mod source, and play modes (one-shot / hold / loop / ping-pong / continue).
+- **Polyphonic slice machines**: `slice_poly` and `razor_poly` join the machine list. Voices are bounded — 8 per track, 24 global, oldest-first steal — which is also what stopped slice storms from crashing the audio engine.
+
+## Multitrack Phase 2: eight real tracks
+
+- All 8 tracks are now full instruments: per-track machines, warp modes, regions, sequencing, filters, FX insert, mod, and scenes (`docs/PHASE2_CONTRACT.md` is the binding contract).
+- New **MIX page**: all 8 tracks at a glance — selection, mutes, machine, volume, live meters, sequencer position.
+- **A/B crossfader** morphs every captured track (muted ones included); FN+glide gives a slow momentary morph; scene capture reads correctly while morphed.
+- The **base-value resolver** (`docs/BASE_VALUE_RESOLVER.md`) makes step locks and crossfader morphs non-destructive layers over the stored track value — switching tracks or clearing a lock always restores the right base.
+- The screen follows the **selected track** everywhere: meters, playhead, mod bars, filter render.
+
+## Warp engine overhaul: compiled UGens + 7 new modes
+
+- Custom SuperCollider UGens (`ElasticatReader`, `ElasticatGrains`) — compiled **on the norns itself** — replace the old SC-graph readers. Loop/region jumps are click-free (the long-standing jump-pop is solved), and the granular family runs much lighter.
+- New warp modes: **harmonizer** (up to 3 stacked intervals), **wavetable** (playhead-independent scanning oscillator with slice morph + scan LFO), **spectral_freeze**, **formant**, **gstretch / gstretch2** (Paulstretch-style extreme stretch), and **chopped** (Digitakt-style chop sync). The mode formerly named `chopped` is now **domino**.
+- Every mode gains a p-lockable synced **RATE** multiplier (WARP page, slot 8).
+- Amp envelope: retrigger only on new notes (portamento holds a sounding note through), preview uses the same retrigger path.
+
 ## FX pages: change the effect on-page (Mode-Parameter layout)
 
 - The four FX slot pages (Insert 1, Send 1, Send 2, Master) now use the same two-row + banner layout as FILTER MIX and WARP. The FX machine selector is the bottom-left banner, so you can switch the effect on the page — select the banner pair, hold FN, turn K2 — without opening the settings menu.

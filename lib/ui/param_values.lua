@@ -94,6 +94,39 @@ local function fmt_warp_rate(value)
   return string.format("%.2fx", v)
 end
 
+-- FX dynamics unit displays (owner: most FX params stay Elektron-style raw 0-127,
+-- but the compressor + duck read in dB / ms / ratio where it matters for dialling
+-- them in). The value here is the 0-127 knob; these MIRROR the amount->units maps
+-- in the SynthDefs (lib/Engine_Elasticat.sc, elasticatFxComp / elasticatFxDuck) --
+-- keep the two in sync. LuaJIT is 5.1 (no 2-arg math.log), hence log10().
+local function log10(x) return math.log(x) / math.log(10) end
+local function fx_linlin(x, imin, imax, omin, omax)
+  x = util.clamp(x, imin, imax)
+  return omin + (((x - imin) / (imax - imin)) * (omax - omin))
+end
+local function fx_linexp(x, imin, imax, omin, omax)
+  x = util.clamp(x, imin, imax)
+  return omin * ((omax / omin) ^ ((x - imin) / (imax - imin)))
+end
+local function fmt_ms(sec)
+  local ms = sec * 1000
+  return ms >= 100 and string.format("%.0fms", ms) or string.format("%.1fms", ms)
+end
+local function fmt_comp_thresh(v) return string.format("%.0fdB", 20 * log10(fx_linlin((v or 0) / 127, 0, 1, 0.02, 1.0))) end
+local function fmt_comp_ratio(v) return string.format("%.1f:1", 1 / fx_linexp((v or 0) / 127, 0.001, 1, 1.0, 0.05)) end
+local function fmt_comp_attack(v) return fmt_ms(fx_linexp((v or 0) / 127, 0.001, 1, 0.0005, 0.1)) end
+local function fmt_comp_release(v) return fmt_ms(fx_linexp((v or 0) / 127, 0.001, 1, 0.02, 0.8)) end
+local function fmt_comp_makeup(v) return string.format("+%.1fdB", 20 * log10(fx_linlin((v or 0) / 127, 0, 1, 1.0, 4.0))) end
+local function fmt_duck_amount(v)
+  local amt = util.clamp((v or 0) / 127, 0, 1)
+  return amt >= 0.995 and "MAX" or string.format("%.0fdB", 20 * log10(1 - amt))
+end
+local function fmt_duck_attack(v) return fmt_ms(fx_linexp((v or 0) / 127, 0, 1, 0.001, 0.05)) end
+local function fmt_duck_release(v) return fmt_ms(fx_linexp((v or 0) / 127, 0, 1, 0.05, 1.2)) end
+local function fmt_limit_gain(v) return string.format("+%.1fdB", fx_linlin((v or 0) / 127, 0, 1, 0, 18)) end
+local function fmt_limit_ceil(v) return string.format("%.1fdB", fx_linlin((v or 0) / 127, 0, 1, -6, 0)) end
+local function fmt_limit_release(v) return fmt_ms(fx_linexp((v or 0) / 127, 0, 1, 0.002, 0.1)) end
+
 -- Every simple numeric-display parameter maps its id to a formatter here.
 -- Adding a new one is a single line; only params with bespoke display logic
 -- (enum remapping, pseudo-items, etc.) need an explicit branch below instead.
@@ -180,7 +213,20 @@ local ID_FORMATTERS = {
   xfade = fmt_milli,
   slice_attack = fmt_milli,
   slice_hold = fmt_milli,
-  slice_release = fmt_milli
+  slice_release = fmt_milli,
+  -- FX dynamics: dB / ratio / ms (owner). Everything else in the FX machines
+  -- keeps the raw 0-127 (Elektron-style) default -- no entry needed.
+  comp_thresh = fmt_comp_thresh,
+  comp_ratio = fmt_comp_ratio,
+  comp_attack = fmt_comp_attack,
+  comp_release = fmt_comp_release,
+  comp_makeup = fmt_comp_makeup,
+  duck_amount = fmt_duck_amount,
+  duck_attack = fmt_duck_attack,
+  duck_release = fmt_duck_release,
+  limit_gain = fmt_limit_gain,
+  limit_ceil = fmt_limit_ceil,
+  limit_release = fmt_limit_release
 }
 
 function ParamValues.new(opts)
@@ -503,6 +549,12 @@ function ParamValues:format_item_value(param_item, value)
   end
 
   local formatter = ID_FORMATTERS[param_item.id]
+  if formatter == nil then
+    -- Send/Master slot params are the insert params namespaced send1_/send2_/
+    -- master_; strip the slot prefix so the dB/ms dynamics formatters (comp/duck/
+    -- limit) apply on the send + master FX pages too.
+    formatter = ID_FORMATTERS[param_item.id:gsub("^send1_", ""):gsub("^send2_", ""):gsub("^master_", "")]
+  end
   if formatter ~= nil then
     return formatter(value)
   end
