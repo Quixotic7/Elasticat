@@ -25,6 +25,12 @@ Shared rules:
 | 4 | `razor_slice` | Slices with **individually placed** start/end pairs (the razor editor: snap modes, zoom, transient auto-chop). Mono voicing. |
 | 5 | `slice_poly` | `grid_slice` with polyphonic voicing (per-track cap 8 voices, global cap 24). |
 | 6 | `razor_poly` | `razor_slice` with polyphonic voicing (same caps). |
+| 7 | `neighbor` | **Tracks 2–6 only.** The LEFT track's output is the source, fully rerouted (the left track is audible only through this one) — serial-stack two tracks' filters/inserts. Playing-independent; warp/pitch inactive. |
+| 8 | `input` | The norns audio input is the source (external gear through the track chain). Norns' input monitoring is auto-muted while in use, restored after. Playing-independent. |
+
+**Bus pseudo-tracks** (row 4, x14–16): SEND 1 / SEND 2 / MASTER select as
+screen-only "tracks" — sends expose their FX page, MASTER exposes the MIX
+overview (SOURCE) and the master insert (FX). The track cap is **6**.
 
 Slice machines: per-slice p-locks (hold a pad + edit), choke groups,
 play modes (one-shot / hold / **loop** / ping-pong / continue), ratchets,
@@ -80,7 +86,7 @@ cell 2, envelope DEPTH cell 4, so the core controls never move.
 
 ## FX machines (Insert 1 / Send 1 / Send 2 / Master)
 
-All four slots pick from the same 19-machine list; each slot's params are
+All four slots pick from the same 18-machine list; each slot's params are
 namespaced (`send1_`/`send2_`/`master_` prefixes) and p-lockable. Slot
 behavior for **NONE** differs by role: an *insert/master* None is a clean
 passthrough, but a *send return* None spawns **no synth at all** (the bus is
@@ -99,24 +105,27 @@ are meaningless without units. FN-snap targets are clean real-world values.
 | # | Name | Params | Identity |
 |---:|---|---|---|
 | 1 | `NONE` | — | Passthrough (insert/master) or silent (send). |
-| 2 | `DRIVE` | DRIV, MIX | tanh clip/saturation. |
-| 3 | `DELAY` | TIME, FBK, TONE, MIX | **Clean digital** tempo-synced delay. TIME covers the full 15-division list (1/32 … 2 BAR incl. dotted + triplet); time changes glide (no clicks). |
-| 4 | `REVERB` | SIZE, DAMP, MIX | Algorithmic (FreeVerb family). |
-| 5 | `LOFI` | BITS, RATE, MIX | Bit-depth + sample-rate reduction. |
-| 6 | `COMP` | THRS, RATO, ATK, REL, MKUP, MIX | Compressor with IN/GR metering on-page. dB/ms units. |
-| 7 | `DESTROY` | CRSH, SRR, WARB, DRIV, FOLD, SAT, TONE, LEVL | Kitchen-sink destruction: bitcrush + sample-rate reduction lead. *Always wet.* |
-| 8 | `ECHO` | TIME, OFST, FBK, MODE, TONE, WOBL, MIX | **Colored stereo echo**: L/R offset ratio, tone-in-loop, wobble. Same 15-division TIME as DELAY. |
-| 9 | `BLACKHOLE` | SIZE, GRAV, MOD, LOW, HI, PRE, MIX | Huge modulated reverb. |
-| 10 | `CHORUS` | RATE, DPTH, WDTH, TONE, MIX | Modulated short-delay chorus. |
-| 11 | `FLANGER` | RATE, DPTH, FBK, TONE, MIX | Swept comb flanger. |
-| 12 | `PHASER` | RATE, DPTH, CNTR, STGS, FBK, MIX | 2–8 stage allpass phaser. |
-| 13 | `DJ EQ` | LOW, MID, HIGH, XLOW, XHI | 3-band kill EQ + crossover trims. *Always wet.* |
-| 14 | `DUCK` | AMNT, SENS, ATK, REL | Sidechain-style ducking keyed from the master bus, with metering. dB/ms units. *Always wet.* |
-| 15 | `TAPE ECHO` | TIME, FBK, WOW, FLUT, SAT, TONE, MIX | **Dirty tape delay**: wow/flutter + saturation in the loop. Same 15-division TIME. |
-| 16 | `CASSETTE` | WOW, FLUT, NOIS, CRKL, DROP, TONE, MIX | Cassette degradation: noise, crackle, dropouts. |
-| 17 | `MOTION` | WDTH, RATE, TREM, PAN, SHPE | Stereo motion: width (up to +6 dB side at max), autopan, tremolo. *Always wet.* |
-| 18 | `RINGS` | MODE, FREQ, FINE, FBK, TONE, MIX | Ring-mod / frequency-shift family. |
-| 19 | `LIMIT` | GAIN, CEIL, REL | Brickwall-style limiter. dB units. *Always wet.* |
+| 2 | `DELAY` | TIME, FBK, TONE, MIX | **Clean digital** tempo-synced delay. TIME covers the full 15-division list (1/32 … 2 BAR incl. dotted + triplet); time changes glide (no clicks). |
+| 3 | `REVERB` | SIZE, DAMP, MIX | Algorithmic (FreeVerb family). |
+| 4 | `LOFI` | BITS, RATE, MIX | Bit-depth + sample-rate reduction. |
+| 5 | `COMP` | THRS, RATO, ATK, REL, MKUP, MIX | Compressor with IN/GR metering on-page. dB/ms units. |
+| 6 | `DESTROY` | CRSH, SRR, WARB, DRIV, FOLD, SAT, TONE, LEVL | Kitchen-sink destruction: bitcrush + sample-rate reduction lead. *Always wet.* |
+| 7 | `ECHO` | TIME, OFST, FBK, MODE, TONE, WOBL, MIX | **Colored stereo echo**: L/R offset ratio, tone-in-loop, wobble. Same 15-division TIME as DELAY. |
+| 8 | `BLACKHOLE` | SIZE, GRAV, MOD, LOW, HI, PRE, MIX | Huge modulated reverb. |
+| 9 | `CHORUS` | RATE, DPTH, WDTH, TONE, MIX | Modulated short-delay chorus. |
+| 10 | `FLANGER` | RATE, DPTH, FBK, TONE, MIX | Swept comb flanger. |
+| 11 | `PHASER` | RATE, DPTH, CNTR, STGS, FBK, MIX | 1–8 stage allpass phaser (steps of 1). |
+| 12 | `DJ EQ` | LOW, MID, HIGH, XLOW, XHI | 3-band kill EQ + crossover trims. *Always wet.* |
+| 13 | `DUCK` | AMNT, SENS, ATK, REL | Sidechain-style ducking keyed from the master bus, with metering. dB/ms units. *Always wet.* |
+| 14 | `TAPE ECHO` | TIME, FBK, WOW, FLUT, SAT, TONE, MIX | **Dirty tape delay**: wow/flutter + saturation in the loop. Same 15-division TIME. |
+| 15 | `CASSETTE` | WOW, FLUT, NOIS, CRKL, DROP, TONE, MIX | Cassette degradation: noise, crackle, dropouts. |
+| 16 | `MOTION` | WDTH, RATE, TREM, PAN, SHPE | Stereo motion: width (up to +6 dB side at max), autopan, tremolo; RATE spans the full division list up to 4 BAR. *Always wet.* |
+| 17 | `RINGS` | MODE, FREQ, FINE, FBK, TONE, MIX | Ring-mod / frequency-shift family. |
+| 18 | `LIMIT` | GAIN, CEIL, REL | Brickwall-style limiter, ceiling −12..0 dB, IN/GR metered. *Always wet.* |
+
+**DRIVE was removed 2026-08-01** (the filter stage already carries drive):
+machine indices above it shifted down one, so older projects that used a
+machine above DRIVE load one machine off and need a one-time re-pick.
 
 **The three delays** at a glance: `DELAY` = clean and surgical; `ECHO` =
 character echo with stereo offset and tone shaping; `TAPE ECHO` = the same

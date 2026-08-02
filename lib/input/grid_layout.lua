@@ -33,7 +33,12 @@ local GridLayout = {
   octave = {row = 5, cols = {1, 2}},
   scene  = {row = 5, cols = {9, 16}},
   macro  = {row = 4, cols = {1, 4}},
-  track  = {row = 4, cols = {8, 15}},
+  track  = {row = 4, cols = {8, 13}},   -- T1-T6 (track count is capped at 6)
+  -- Bus pseudo-track keys (owner 2026-08-02): SEND 1 / SEND 2 / MASTER get the
+  -- three keys right of the track row. Selecting one flips the SCREEN to that
+  -- bus's pages (FX for sends; SOURCE = the mixer for master) -- the grid's
+  -- step/loop surface keeps editing the last real track.
+  bus    = {row = 4, cols = {14, 16}},
 }
 
 -- "col:row" string key, for the router's GRID_KEYS lookup table.

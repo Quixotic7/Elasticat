@@ -112,8 +112,19 @@ local function fmt_ms(sec)
   local ms = sec * 1000
   return ms >= 100 and string.format("%.0fms", ms) or string.format("%.1fms", ms)
 end
-local function fmt_comp_thresh(v) return string.format("%.0fdB", 20 * log10(fx_linlin((v or 0) / 127, 0, 1, 0.02, 1.0))) end
-local function fmt_comp_ratio(v) return string.format("%.1f:1", 1 / fx_linexp((v or 0) / 127, 0.001, 1, 1.0, 0.05)) end
+-- Threshold reads in 0.5 dB steps (owner) -- the knob's ~0.27dB/step raw value
+-- is rounded to the nearest half so the display moves in clean increments.
+local function fmt_comp_thresh(v)
+  local db = 20 * log10(fx_linlin((v or 0) / 127, 0, 1, 0.02, 1.0))
+  return string.format("%.1fdB", math.floor(db * 2 + 0.5) / 2)
+end
+-- ">=10:1 drops the decimal ("14:1"), else "6.4:1" -- 6 chars overflowed the
+-- 5-char cell and rendered as "14.0:" (owner).
+local function fmt_comp_ratio(v)
+  local r = 1 / fx_linexp((v or 0) / 127, 0.001, 1, 1.0, 0.05)
+  if r >= 9.95 then return string.format("%.0f:1", r) end
+  return string.format("%.1f:1", r)
+end
 local function fmt_comp_attack(v) return fmt_ms(fx_linexp((v or 0) / 127, 0.001, 1, 0.0005, 0.1)) end
 local function fmt_comp_release(v) return fmt_ms(fx_linexp((v or 0) / 127, 0.001, 1, 0.02, 0.8)) end
 local function fmt_comp_makeup(v) return string.format("+%.1fdB", 20 * log10(fx_linlin((v or 0) / 127, 0, 1, 1.0, 4.0))) end
@@ -124,7 +135,7 @@ end
 local function fmt_duck_attack(v) return fmt_ms(fx_linexp((v or 0) / 127, 0, 1, 0.001, 0.05)) end
 local function fmt_duck_release(v) return fmt_ms(fx_linexp((v or 0) / 127, 0, 1, 0.05, 1.2)) end
 local function fmt_limit_gain(v) return string.format("+%.1fdB", fx_linlin((v or 0) / 127, 0, 1, 0, 18)) end
-local function fmt_limit_ceil(v) return string.format("%.1fdB", fx_linlin((v or 0) / 127, 0, 1, -6, 0)) end
+local function fmt_limit_ceil(v) return string.format("%.1fdB", fx_linlin((v or 0) / 127, 0, 1, -12, 0)) end
 local function fmt_limit_release(v) return fmt_ms(fx_linexp((v or 0) / 127, 0, 1, 0.002, 0.1)) end
 
 -- Every simple numeric-display parameter maps its id to a formatter here.
@@ -624,6 +635,23 @@ end
 
 function ParamValues:adjusted_value(param_item, current, delta, snap)
   if param_item.options ~= nil then
+    -- opt_coarse = N: require N encoder detents per option step. For very
+    -- short option lists (MOTION's 3-entry SHPE) a bare detent-per-step flips
+    -- the whole range with a nudge (owner: "too easy to adjust").
+    local coarse = param_item.opt_coarse
+    if coarse ~= nil then
+      local acc = self._opt_accum
+      if acc == nil then acc = {} self._opt_accum = acc end
+      local a = acc[param_item.id] or 0
+      local dir = delta >= 0 and 1 or -1
+      if a ~= 0 and (a > 0) ~= (dir > 0) then a = 0 end   -- direction change resets
+      a = a + dir
+      if math.abs(a) < coarse then
+        acc[param_item.id] = a
+        return current
+      end
+      acc[param_item.id] = 0
+    end
     return util.clamp(math.floor(current + (delta >= 0 and 1 or -1)), 1, param_item.options)
   end
 

@@ -17,24 +17,8 @@ local page_model = {
           item("crossfade", "XFD", {lockable = false, min = 0, max = 128, step = 1, snaps = {0, 32, 64, 96, 128}})
         }
       },
-      {
-        -- MIX: the 8-track overview (lib/ui/mixer_page.lua). The coordinator
-        -- detects `mixer` and renders the column grid under the normal header.
-        --
-        -- Its items are ordinary per-track params, so K2/K3 + E2/E3 edit the
-        -- SELECTED track's mix from this page with no new input handling --
-        -- they resolve through elasticat.lua's ui_id funnel like every other
-        -- page. MUTE is per-track today (ParamsSpec.SPEC); VOL/PAN become
-        -- per-track the moment those suffixes land in SPEC, at which point this
-        -- page follows the selection automatically.
-        title = "MIX",
-        mixer = true,
-        items = {
-          item("amp", "VOL", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 100, 127}}),
-          item("pan", "PAN", {lockable = true, min = 0, max = 128, step = 1, snaps = {0, 32, 64, 96, 128}}),
-          item("mute", "MUTE", {lockable = false, binary = true, min = 0, max = 1, step = 1})
-        }
-      },
+      -- (The MIX overview moved to the MASTER bus pseudo-track's SOURCE page,
+      -- owner 2026-08-02 -- see page_model.bus_master_mix at the bottom.)
       {
         -- Full-screen looping sprite + grid comet sweep, tempo-scaled. The
         -- coordinator detects `animation` and renders it with no header/UI.
@@ -215,7 +199,7 @@ local page_model = {
       -- All 6 machines: Loop, Trig, Slice, Razor, Slice Poly, Razor Poly. The cap
       -- is the encoder's clamp (param_values option_delta), so 4 hid the two poly
       -- machines even though the param + display formatter already know all six.
-      item("machine", "MACH", {options = 6}),
+      item("machine", "MACH", {options = 8}),   -- +neighbor/input (owner QA fix)
       item("loop_division", "LDIV", {lockable = false, min = 2, max = 32, step = 2, snaps = {2, 4, 8, 16, 32}}),
       item("trig_polyphony", "POLY", {options = 2}),
       -- Auto-Chop / Transient-snap sensitivity (%), tweakable on-device.
@@ -393,43 +377,21 @@ local page_model = {
           blank()
         }
       },
-      {
-        -- Pages 3-5: Send 1 / Send 2 / Master insert machine rows, resolved per
-        -- each slot's machine setting in page_items_for (elasticat.lua's
-        -- fx_slot_items) with ids namespaced send1_/send2_/master_. These
-        -- static lists are the DRIVE-default fallbacks, same as page 1; a slot
-        -- on NONE resolves to no items and draws as the blank "empty" page.
-        title = "SEND1 FX",
-        items = {
-          item("send1_fx_drive", "DRIV", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}}),
-          item("send1_fx_mix", "MIX", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}})
-        }
-      },
-      {
-        title = "SEND2 FX",
-        items = {
-          item("send2_fx_drive", "DRIV", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}}),
-          item("send2_fx_mix", "MIX", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}})
-        }
-      },
-      {
-        title = "MASTER FX",
-        items = {
-          item("master_fx_drive", "DRIV", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}}),
-          item("master_fx_mix", "MIX", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 96, 127}})
-        }
-      }
+      -- (The Send 1 / Send 2 / Master FX-editing pages moved to the bus
+      -- pseudo-tracks, owner 2026-08-02: select SEND1/SEND2/MASTER on row 4
+      -- and the FX category shows THAT bus's machine page. A track's FX
+      -- category is now just Insert 1 + the SENDS routing page above.)
     },
     settings = {
       -- 14 fx machines: None, Drive, Delay, Reverb, Lofi, Comp, Destroy, Echo, Blackhole,
       -- Blackhole -- shared by Insert 1, Send 1/2, and the Master insert. Send tap
       -- picks which point in the chain Send 1/2 pull from (PRD SS3). The machine is
       -- also changeable on-page via the FX Mode-Parameter banner.
-      item("fx_insert1_machine", "MACH", {options = 19}),
+      item("fx_insert1_machine", "MACH", {options = 18}),
       item("send_tap", "TAP", {options = 2}),
-      item("send1_machine", "SEND1", {options = 19}),
-      item("send2_machine", "SEND2", {options = 19}),
-      item("master_fx_machine", "MASTER", {options = 19})
+      item("send1_machine", "SEND1", {options = 18}),
+      item("send2_machine", "SEND2", {options = 18}),
+      item("master_fx_machine", "MASTER", {options = 18})
     }
   },
   mod = {
@@ -505,6 +467,23 @@ local page_model = {
       }
     },
     settings = {}
+  }
+}
+
+-- The MIX overview (lib/ui/mixer_page.lua), now rendered as the MASTER bus
+-- pseudo-track's SOURCE page (owner 2026-08-02; was master category page 2).
+-- Not inside any category's `pages` -- the coordinator's bus branch renders it
+-- and page_items_for returns its items while the master bus is selected, so
+-- K2/K3 + E2/E3 still edit the SELECTED track's mix through the ui_id funnel.
+page_model.bus_master_mix = {
+  -- Just "MASTER" (owner QA: "MASTER MIX CPU 1" truncated the CPU readout;
+  -- it's obviously a mixer).
+  title = "MASTER",
+  mixer = true,
+  items = {
+    item("amp", "VOL", {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 100, 127}}),
+    item("pan", "PAN", {lockable = true, min = 0, max = 128, step = 1, snaps = {0, 32, 64, 96, 128}}),
+    item("mute", "MUTE", {lockable = false, binary = true, min = 0, max = 1, step = 1})
   }
 }
 

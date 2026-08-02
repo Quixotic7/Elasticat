@@ -6,8 +6,18 @@ local machines = {
   [3] = include("lib/machines/grid_slice"),
   [4] = include("lib/machines/razor_slice"),
   [5] = include("lib/machines/slice_poly"),
-  [6] = include("lib/machines/razor_poly")
+  [6] = include("lib/machines/razor_poly"),
+  -- Routing sources (owner 2026-08-02): the track's "sample" is another
+  -- signal -- the LEFT track's output (7, tracks 2-6 only) or the norns
+  -- audio input (8). Both map to the engine's trSourceRouting, not a reader
+  -- warp mode.
+  [7] = include("lib/machines/neighbor"),
+  [8] = include("lib/machines/input")
 }
+
+function Registry.count()
+  return #machines
+end
 
 function Registry.get(machine_id)
   return machines[math.floor((tonumber(machine_id) or 1) + 0.5)] or machines[1]

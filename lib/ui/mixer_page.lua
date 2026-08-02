@@ -36,7 +36,7 @@ local LowProfile = include("lib/ui/low_profile")
 
 local MixerPage = {}
 
-local TRACKS = 8
+local TRACKS = 6   -- capped from 8 (owner 2026-08-02); columns 7-8 stay dark
 local COL_PITCH = 16
 local COL_W = 15
 local CHIP_Y = 11
@@ -62,7 +62,7 @@ MixerPage.TRACKS = TRACKS
 -- 2-character machine codes (lib/machines/registry.lua order): Loop,
 -- Loop Trig, Grid Slice, Razor Slice. Two characters is what fits a 15px
 -- column at the default font size.
-MixerPage.MACHINE_CODES = {"LP", "LT", "GS", "RS"}
+MixerPage.MACHINE_CODES = {"LP", "LT", "GS", "RS", "SP", "RP", "NB", "IN"}
 
 function MixerPage.column_x(track)
   return (track - 1) * COL_PITCH

@@ -131,7 +131,14 @@ GridSequencer.is_slice_machine = is_slice_machine
 -- routine (TrackSequencer:enter_step) off the SAME shared beat count -- a trig
 -- behaves identically whether or not its track is selected. Only the selected
 -- track is edited/displayed.
-local TRACK_COUNT_MAX = 8
+local TRACK_COUNT_MAX = 6   -- capped from 8 (owner 2026-08-02): keys x14-16 = bus pseudo-tracks
+-- Bus LANES (owner 2026-08-02: "sends and master should be fully sequencable"):
+-- lanes 7/8/9 are full TrackSequencer instances for SEND1/SEND2/MASTER. Their
+-- trigs carry step P-LOCKS of the bus's (global) FX params -- the lock
+-- apply/restore machinery resolves non-per-track suffixes to the global ids
+-- unchanged, and their engine note calls hit unallocated tracks (no-ops).
+-- Selecting a bus key swaps the step-editing surface to its lane.
+local LANE_COUNT = TRACK_COUNT_MAX + 3
 
 function GridSequencer.new(options)
   local self = setmetatable({}, GridSequencer)
@@ -145,7 +152,7 @@ function GridSequencer.new(options)
   self.global_cycle = 0
   self.tracks = {}
   local ctx = self:build_track_context()
-  for track = 1, TRACK_COUNT_MAX do
+  for track = 1, LANE_COUNT do
     self.tracks[track] = TrackSequencer.new(track, ctx)
   end
   self.track = 1
@@ -476,7 +483,7 @@ end
 -- so a pre-multitrack script reading a new snapshot still gets track 1.
 function GridSequencer:serialize()
   local tracks = {}
-  for track = 1, TRACK_COUNT_MAX do
+  for track = 1, LANE_COUNT do   -- 1-6 tracks + 7-9 bus lanes
     tracks[track] = self.tracks[track]:serialize()
   end
   return {
@@ -500,7 +507,7 @@ function GridSequencer:deserialize(snapshot)
   if tracks == nil then
     tracks = {[1] = snapshot}
   end
-  for track = 1, TRACK_COUNT_MAX do
+  for track = 1, LANE_COUNT do
     -- deserialize() replaces only the PATTERN-owned fields in place, so the
     -- instance keeps its transport state (clock position, pass counters, live
     -- overrides) -- the coordinator's on_pattern_applied decides whether to
@@ -508,7 +515,16 @@ function GridSequencer:deserialize(snapshot)
     -- anything else holding a reference) pointing at the right track.
     self.tracks[track]:deserialize(tracks[track])
   end
-  self.seq = self.tracks[self.track]
+  self.seq = self.tracks[self:selected_lane()]
+end
+
+-- The lane whose steps the grid edits: the selected bus's lane when a bus is
+-- selected, the selected track otherwise.
+function GridSequencer:selected_lane()
+  if self.bus_selected == "send1" then return TRACK_COUNT_MAX + 1 end
+  if self.bus_selected == "send2" then return TRACK_COUNT_MAX + 2 end
+  if self.bus_selected == "master" then return TRACK_COUNT_MAX + 3 end
+  return self.track
 end
 
 function GridSequencer:held_step_index()
@@ -1466,9 +1482,17 @@ end
 
 -- Anchor EVERY active track at position 0 and fire its step 1. All tracks are
 -- primed identically -- there is no "the selected one gets the real path".
+-- Bus lanes (7-9) prime with the tracks: their step-1 p-locks fire too.
+local function prime_lane_indices(count)
+  local out = {}
+  for track = 1, count do out[#out + 1] = track end
+  for lane = TRACK_COUNT_MAX + 1, LANE_COUNT do out[#out + 1] = lane end
+  return out
+end
+
 function GridSequencer:prime_tracks(reset)
   local count = self:active_track_count()
-  for track = 1, count do
+  for _, track in ipairs(prime_lane_indices(count)) do
     local seq = self.tracks[track]
     if reset then
       seq:anchor(0)
@@ -1554,10 +1578,9 @@ function GridSequencer:reset_live_state()
   self.keys_anchor = nil
   self.manual_region = nil
   self.preview_active = false
-  -- New Project resets EVERY track's live override state, not just the
-  -- selected one -- each track owns its own now, so clearing self.seq alone
-  -- would leave seven tracks holding stale param locks and anchors.
-  for track = 1, TRACK_COUNT_MAX do
+  -- New Project resets EVERY lane's live override state (tracks AND the
+  -- three bus lanes), not just the selected one.
+  for track = 1, LANE_COUNT do
     local seq = self.tracks[track]
     seq:clear_param_lock_holds()
     seq:reset_transport()
@@ -1580,8 +1603,8 @@ function GridSequencer:stop_sequence()
   self.live_step_hold = false
   self.live_step_index = nil
   self.keys_anchor = nil
-  -- Stop re-anchors EVERY track at step 1 and drops the shared origin.
-  for track = 1, TRACK_COUNT_MAX do
+  -- Stop re-anchors EVERY lane (tracks + buses) at step 1, drops the origin.
+  for track = 1, LANE_COUNT do
     self.tracks[track]:reset_transport()
   end
   self.paused_beats = nil
@@ -1632,9 +1655,13 @@ function GridSequencer:tick_sequence()
   local count = self:active_track_count()
 
   -- Note-length lock windows expire per track (a background track's region lock
-  -- has to revert on its own exactly like the selected track's).
+  -- has to revert on its own exactly like the selected track's). Bus lanes
+  -- (7-9) always run -- their p-lock windows expire the same way.
   for track = 1, count do
     self.tracks[track]:tick(now)
+  end
+  for lane = TRACK_COUNT_MAX + 1, LANE_COUNT do
+    self.tracks[lane]:tick(now)
   end
 
   -- Global pattern boundary (PRD §6.4): the project-wide cycle runs on the
@@ -1650,6 +1677,9 @@ function GridSequencer:tick_sequence()
   local fired = 0
   for track = 1, count do
     fired = fired + self.tracks[track]:advance_to(elapsed)
+  end
+  for lane = TRACK_COUNT_MAX + 1, LANE_COUNT do
+    fired = fired + self.tracks[lane]:advance_to(elapsed)
   end
   if fired > 0 then
     self:request_redraw()
@@ -1705,7 +1735,7 @@ function GridSequencer:on_pattern_applied(restart)
     -- A fresh pattern start is pattern-wide: re-anchor the shared origin so
     -- EVERY track restarts at position 0 together, still perfectly in phase.
     self:reset_clock_origin()
-    for track = 1, TRACK_COUNT_MAX do
+    for track = 1, LANE_COUNT do
       self.tracks[track]:reset_transport()
       self.tracks[track]:anchor(0)
     end
@@ -1718,7 +1748,7 @@ function GridSequencer:on_pattern_applied(restart)
     -- position is DERIVED, so a shorter pattern folds it in automatically on
     -- the next tick. Only re-derive the display indices here.
     local elapsed = self:elapsed_beats()
-    for track = 1, TRACK_COUNT_MAX do
+    for track = 1, LANE_COUNT do
       local seq = self.tracks[track]
       if seq.position ~= nil then
         seq:anchor(seq:position_at(elapsed))
@@ -1902,6 +1932,19 @@ end
 
 function GridSequencer:select_track(track)
   track = util.clamp(math.floor((tonumber(track) or 1) + 0.5), 1, TRACK_COUNT_MAX)
+  -- Selecting any real track drops the bus pseudo-track selection -- even a
+  -- re-press of the CURRENT track (that's the "get me back" gesture). The
+  -- step surface returns to the track's lane.
+  if self.bus_selected ~= nil then
+    self.seq:push_param_locks(nil)
+    self.bus_selected = nil
+    self.seq = self.tracks[self.track]
+    self:sync_play_page_step()
+    if self.options.on_bus_selected ~= nil then
+      self.options.on_bus_selected(nil)
+    end
+    self:request_redraw()
+  end
   if track == self.track then
     return
   end
@@ -1987,6 +2030,40 @@ function GridSequencer:key_track(track, z)
   end
 end
 
+-- Bus pseudo-tracks (SEND 1 / SEND 2 / MASTER, keys x14-16). Selecting one is
+-- a SCREEN-side act only: the coordinator flips the pages to that bus (FX for
+-- sends, the mixer for master). The grid's step/loop editing surface keeps
+-- pointing at the last real track, and selecting any real track clears the
+-- bus selection (coordinator side).
+local BUS_NAMES = {"send1", "send2", "master"}
+
+function GridSequencer:key_bus(index, z)
+  if z ~= 1 then
+    return
+  end
+  local name = BUS_NAMES[index]
+  if name == nil then
+    return
+  end
+  -- The bus LANE becomes the step-editing surface (trigs + held-step
+  -- p-locks of the bus's FX params). Same bookkeeping as select_track: mark
+  -- physically-held steps as edited and unwind the OLD lane's lock display.
+  for step, held in pairs(self.step_holds) do
+    if held then
+      self.step_edited[step] = true
+    end
+  end
+  self.seq:push_param_locks(nil)
+  self.bus_selected = name
+  self.seq = self.tracks[TRACK_COUNT_MAX + index]
+  self:sync_play_page_step()
+  if self.options.on_bus_selected ~= nil then
+    self.options.on_bus_selected(name)
+  end
+  self:message(name == "master" and "Master" or ("Send " .. index))
+  self:request_redraw()
+end
+
 -- Macro keys (row 4, cols 1-4). Holding one routes E2 -> that macro's value
 -- and E3 -> its depth (coordinator enc), so you can ride a macro live from any
 -- page; with a step ALSO held the value edit p-locks onto the step, exactly
@@ -2038,7 +2115,7 @@ function GridSequencer:draw_track_row()
     local level = 0
     if track <= count then
       local muted = self:track_muted(track)
-      if track == self.track then
+      if track == self.track and self.bus_selected == nil then
         level = muted and 12 or 15
       elseif self:track_has_content(track) then
         level = muted and 3 or 7
@@ -2046,6 +2123,14 @@ function GridSequencer:draw_track_row()
         level = muted and 2 or 4
       end
     end
+    self.g:led(x, 4, self:pressed_level(x, 4, level))
+  end
+  -- Bus pseudo-track keys (SEND1 / SEND2 / MASTER at x14-16): always available
+  -- (dim), bright when that bus's pages are on screen.
+  for i = 1, 3 do
+    local x = GridLayout.bus.cols[1] + i - 1
+    local name = ({"send1", "send2", "master"})[i]
+    local level = (self.bus_selected == name) and 15 or 4
     self.g:led(x, 4, self:pressed_level(x, 4, level))
   end
 end
@@ -2153,6 +2238,8 @@ function GridSequencer:key(x, y, z)
     self:key_macro(x, z)
   elseif L.in_region(L.track, x, y) then
     self:key_track(x - TRACK_KEY_MIN_COL + 1, z)
+  elseif L.in_region(L.bus, x, y) then
+    self:key_bus(x - L.bus.cols[1] + 1, z)
   elseif self:key_pitch_control(x, y, z) then
     -- handled
   elseif z == 1 then
@@ -2614,15 +2701,13 @@ function GridSequencer:key_controls(x, z)
     self:request_redraw()
     return
   end
+  -- FN + transport is deliberately INERT (owner QA 2026-08-01): FN+REC used to
+  -- copy the pattern and FN+PLAY to clear it -- surprising destructive actions
+  -- on the two most-hammered keys, duplicating the page-key copy/clear/paste
+  -- scopes. Consume the press so FN+REC can never toggle recording by
+  -- fall-through. copy_pattern/paste_pattern/clear_pattern_trigs stay for a
+  -- future deliberate binding.
   if self.fn_down then
-    if x == 3 then
-      self:copy_pattern()
-    elseif x == 4 then
-      self:clear_pattern_trigs()
-    else
-      self:paste_pattern()
-    end
-    self:request_redraw()
     return
   end
 

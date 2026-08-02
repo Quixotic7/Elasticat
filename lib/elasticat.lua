@@ -31,7 +31,9 @@ elasticat.machines = {
   "grid_slice",
   "razor_slice",
   "slice_poly",
-  "razor_poly"
+  "razor_poly",
+  "neighbor",   -- 7: left track's output as the source (tracks 2-6 only)
+  "input"       -- 8: norns audio input as the source
 }
 
 elasticat.modes = {
@@ -519,8 +521,12 @@ local DELAY_TIME_BEATS = {0.125, 1 / 6, 0.25, 1 / 3, 0.375, 0.5, 2 / 3, 0.75, 1,
 local ECHO_TIME_LABELS = DELAY_TIME_LABELS
 local ECHO_TIME_BEATS = DELAY_TIME_BEATS
 -- Motion (#17): the shared trem/autopan LFO rate, beats per cycle (synced).
-local MOTION_RATE_LABELS = {"4 BAR", "2 BAR", "1 BAR", "1/2", "1/4", "1/8", "1/16"}
-local MOTION_RATE_BEATS = {16, 8, 4, 2, 1, 0.5, 0.25}
+-- Full delay-style division list (owner: "same options as the delays") plus
+-- 4 BAR on top for the really slow sweeps. Order matches DELAY_TIME_*.
+local MOTION_RATE_LABELS = {"1/32", "1/16T", "1/16", "1/8T", "1/16D", "1/8", "1/4T",
+  "1/8D", "1/4", "1/2T", "1/4D", "1/2", "1/2D", "1 BAR", "2 BAR", "4 BAR"}
+local MOTION_RATE_BEATS = {0.125, 1 / 6, 0.25, 1 / 3, 0.375, 0.5, 2 / 3, 0.75,
+  1, 4 / 3, 1.5, 2, 3, 4, 8, 16}
 -- The new machines' generated send/master params record a sync closure here at
 -- registration time; sync_bus_fx re-pushes them all on an engine restart (they
 -- used to reset to SynthDef defaults until touched -- the "bare engine restart"
@@ -806,13 +812,29 @@ elasticat.param_actions = {
   -- the warp mode, and re-apply the active mode's params (the engine keeps its
   -- own copies, but track 1 always re-asserted them on a machine swap and that
   -- behavior is kept bit-for-bit through the unification).
-  source_machine = function(_, track)
+  source_machine = function(x, track, pid)
+    -- NEIGHBOR (7) needs a LEFT track: reject it on track 1 (re-set fires this
+    -- action again with 1; the engine also clamps, belt and braces).
+    if track == 1 and math.floor((tonumber(x) or 1) + 0.5) == 7 and pid ~= nil then
+      print("elasticat: neighbor machine needs a track to the left -- tracks 2-6 only")
+      params:set(pid, 1)
+      return
+    end
+    -- Routing sources (owner 2026-08-02): neighbor/input replace the buffer
+    -- reader engine-side; 0 restores the warp reader. Sent BEFORE the play
+    -- gate so the respawned reader is the one the gate applies to.
+    local machine = math.floor((tonumber(x) or 1) + 0.5)
+    elasticat.tr_call(track, "sourceRouting",
+      machine == 7 and 1 or (machine == 8 and 2 or 0))
     if track == 1 then
       if elasticat.flush_engine_sends ~= nil then elasticat.flush_engine_sends() end
       elasticat.tr_now(ids.mode, 1, "setMode", (params:get(ids.mode) or 1) - 1)
       if elasticat.apply_current_mode_params ~= nil then elasticat.apply_current_mode_params() end
     end
     elasticat.push_track_play_state(track)
+    -- INPUT machine anywhere -> norns' own input monitoring must be off
+    -- (otherwise the raw input reaches the output twice).
+    if elasticat.refresh_input_monitor ~= nil then elasticat.refresh_input_monitor() end
   end,
   -- Track transport. Track 1 is the MASTER: starting it resets the global
   -- clock origin + playhead (elasticat.set_engine_play). Other tracks are
@@ -1222,6 +1244,49 @@ end
 -- this gate on the fresh synth, or a track switched back to loop mid-run stays
 -- silent until stop/start (#45). Track 1's hand-registered machine action
 -- already does this inline; this is the shared path for tracks 2-8.
+-- INPUT-machine monitor management (owner 2026-08-02): while ANY active track
+-- uses the input machine (8), norns' built-in input->output monitoring is
+-- muted -- otherwise the raw input is heard twice (dry via the monitor AND
+-- through the track chain). The user's monitor level is saved on the way in
+-- and restored the moment no track uses it -- and at script cleanup.
+elasticat.restore_input_monitor = function()
+  if elasticat._saved_monitor == nil then
+    return
+  end
+  -- Restore through the same door the save was read from: the system param
+  -- (dB, action re-applies the level) when it exists, the raw amp otherwise.
+  if elasticat.param_exists("monitor_level") then
+    params:set("monitor_level", elasticat._saved_monitor)
+  elseif audio ~= nil and audio.level_monitor ~= nil then
+    audio.level_monitor(elasticat._saved_monitor)
+  end
+  elasticat._saved_monitor = nil
+  print("elasticat: input monitor restored")
+end
+
+elasticat.refresh_input_monitor = function()
+  local wants_input = false
+  for track = 1, elasticat.active_track_count() do
+    if math.floor((tonumber(elasticat.track_param_value(track, "machine")) or 1) + 0.5) == 8 then
+      wants_input = true
+      break
+    end
+  end
+  if wants_input and elasticat._saved_monitor == nil then
+    if elasticat.param_exists("monitor_level") then
+      elasticat._saved_monitor = params:get("monitor_level")
+    else
+      elasticat._saved_monitor = 1
+    end
+    if audio ~= nil and audio.level_monitor ~= nil then
+      audio.level_monitor(0)
+    end
+    print("elasticat: input machine active -- norns monitor muted")
+  elseif not wants_input then
+    elasticat.restore_input_monitor()
+  end
+end
+
 elasticat.push_track_play_state = function(track)
   local machine = elasticat.track_param_value(track, "machine") or 1
   local transport = ids.play ~= nil and elasticat.param_exists(ids.play)
@@ -1268,10 +1333,16 @@ function elasticat.sync_tracks()
         elasticat.sync_entry(track, entry)
       end
     end
-    -- The structural rows (warp mode, play) moved from `cmd` to NAMED actions
-    -- in the track-1 unification, which took them out of the cmd loop above.
-    -- Re-fire them explicitly -- mode AFTER the values so its respawn seeds
-    -- from what was just sent, play last (at init that is play(0), a no-op).
+    -- The structural rows (machine, warp mode, play) moved from `cmd` to
+    -- NAMED actions in the track-1 unification, which took them out of the
+    -- cmd loop above. Re-fire them explicitly -- machine first (it pushes
+    -- sourceRouting for the neighbor/input machines), mode AFTER the values
+    -- so its respawn seeds from what was just sent, play last (at init that
+    -- is play(0), a no-op).
+    local machine_pid = elasticat.track_pid(track, "machine")
+    if elasticat.param_exists(machine_pid) and elasticat.param_actions.source_machine ~= nil then
+      elasticat.param_actions.source_machine(params:get(machine_pid), track, machine_pid)
+    end
     local mode_pid = elasticat.track_pid(track, "mode")
     if elasticat.param_exists(mode_pid) and elasticat.param_actions.warp_mode ~= nil then
       elasticat.param_actions.warp_mode(params:get(mode_pid), track)
@@ -1897,6 +1968,24 @@ function elasticat.start_clock_watchdog()
       end
     end
 
+    -- ---- Clock-pool PROBE (owner QA 2026-08-01: fast pattern-rate edits ----
+    -- exhaust the pool while the sync fiber SURVIVES, so the observation-gap
+    -- detector below never fired and only the manual double-stop recovered).
+    -- Spawning a trivial clock each tick is a direct test: it completes
+    -- immediately and frees its slot, but with the pool exhausted clock.run
+    -- errors/returns nil -- run the SAME recovery the double-stop does.
+    if clock.run ~= nil and (now - last_clock_recovery) > 10 then
+      local ok, cid = pcall(clock.run, function() end)
+      if (not ok) or cid == nil then
+        last_clock_recovery = now
+        last_observation_time = now
+        print("elasticat: clock pool EXHAUSTED (probe failed) -- auto-recovering")
+        if clock.cleanup ~= nil then clock.cleanup() end
+        elasticat.start_clock_sync()
+        return
+      end
+    end
+
     -- ---- Coroutine-pool wedge (beats fine, observations stopped) ----------
     -- Normal cadence is one observation per 1/4 beat (<=1.5s even at 40 BPM);
     -- at most one recovery per 10s so a dead external source can't churn it.
@@ -2055,8 +2144,13 @@ end
 
 -- Panic hard-kill of every slice voice on every track (stop-twice). A plain
 -- stop only opens the gate; a stuck or long-releasing voice needs the steal.
+-- Also clears every ringing FX TAIL (owner QA: "double stop should kill all
+-- playing voices" -- delay/reverb tails kept sounding): the engine respawns
+-- the insert/send/master FX synths, which keeps their settings but starts
+-- them with silent delay lines.
 function elasticat.kill_all_slices()
   engine_call("killAllSlices")
+  engine_call("panicClearFx")
 end
 
 -- Retrigger the amp envelope on the active reader with the given note length
@@ -3326,7 +3420,7 @@ function elasticat.params(options)
     -- option params: 0-based index pushes (phaser stages, echo mode, motion shape,
     -- rings mode) + the two beats-mapped division lists (echo time, motion rate).
     local option_params = {
-      {"phaser_stages", "PhaserStages", {"2", "4", "6", "8"}, 2},
+      {"phaser_stages", "PhaserStages", {"1", "2", "3", "4", "5", "6", "7", "8"}, 4},
       {"echo_mode", "EchoMode", {"stereo", "ping-pong"}, 1},
       {"motion_shape", "MotionShape", {"sine", "tri", "sqr"}, 1},
       {"rings_mode", "RingsMode", {"ring", "shift"}, 1}
@@ -3341,7 +3435,7 @@ function elasticat.params(options)
     end
     local beat_options = {
       {"echo_time", "EchoBeats", ECHO_TIME_LABELS, ECHO_TIME_BEATS, 9},
-      {"motion_rate", "MotionBeats", MOTION_RATE_LABELS, MOTION_RATE_BEATS, 5}
+      {"motion_rate", "MotionBeats", MOTION_RATE_LABELS, MOTION_RATE_BEATS, 9}
     }
     for _, e in ipairs(beat_options) do
       local id = param_id(prefix, cmd_prefix .. "_" .. e[1])
@@ -3411,6 +3505,16 @@ function elasticat.params(options)
     lofi_bits = ids.master_lofi_bits,
     lofi_rate = ids.master_lofi_rate
   }, "master", "master fx")
+
+  -- Master output volume (owner 2026-08-02: the MASTER bus's AMP page).
+  -- Deliberately UNGROUPED (the send/master group sizes are pinned equal by
+  -- the test ledger). Post-master-insert gain on the dedicated master out
+  -- synth; p-lockable from the MASTER bus lane.
+  add_control(param_id(prefix, "master_amp"), "master volume",
+    cs.new(0, 127, "lin", 1, 127, "", 1 / 127),
+    function(x)
+      queue_engine_call(param_id(prefix, "master_amp"), "masterAmp", x / 127)
+    end)
 
   -- The "engine algorithms" group is gone: every warp-mode param -- CHAOS macro,
   -- OLA/wsola, granular, PC, chop/domino, harmonizer, wavetable, spectral/formant,

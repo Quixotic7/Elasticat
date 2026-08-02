@@ -1273,8 +1273,12 @@ function PageRender:draw_fx_meter(key_db, gr_db, thresh_db, show_thresh)
   if gr_f > 0 then screen.rect(bx, y0 + 6, max(1, floor(gr_f * bw + 0.5)), 2) end
   screen.fill()
   if show_thresh then
+    -- 2px wide and clamped a pixel short of the right edge: at a 0 dB ceiling
+    -- the 1px tick sat ON the meter frame's last column and vanished (owner:
+    -- no ceiling tick on the insert page -- same math, just invisible).
     screen.level(15)
-    screen.rect(bx + floor(db01(thresh_db) * (bw - 1) + 0.5), y0 - 1, 1, 4)
+    local tx = bx + floor(db01(thresh_db) * (bw - 2) + 0.5)
+    screen.rect(tx, y0 - 1, 2, 4)
     screen.fill()
   end
 end

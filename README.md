@@ -7,12 +7,14 @@ then scrub the loop's trim/range/region live while it plays. That live-scrub
 gesture is the whole point: it stays playable and p-lockable everywhere in
 the script.
 
-Elasticat is an **8-track** instrument: every track is a full voice with its
+Elasticat is a **6-track** instrument: every track is a full voice with its
 own machine, sample, warp mode, regions, sequence, filter, FX insert and
-modulation. Track keys live on grid row 4 (`T1`–`T8`), and the MIX page
-(MASTER category) shows all eight at a glance — plus a live CPU readout, since
-eight warped loops on a Pi are a budget to spend deliberately. Everything
-below describes the current, shipped behavior.
+modulation. Track keys live on grid row 4 (`T1`–`T6`), and the three keys to
+their right select the **SEND 1 / SEND 2 / MASTER buses** as pseudo-tracks —
+select one and the screen flips to that bus's pages (each send's FX machine
+on its FX page; the MASTER bus's SOURCE page is the MIX overview with a live
+CPU readout). Press any track key to get back. Everything below describes the
+current, shipped behavior.
 
 ## Requirements
 
@@ -189,6 +191,14 @@ settings page:
 - **slice_poly / razor_poly** — the same two slice machines with polyphonic
   voicing (up to 8 voices per track, 24 across all tracks; oldest voice is
   stolen at the cap).
+- **neighbor** (tracks 2–6) — no sample at all: the track's source is the
+  **output of the track to its left**, rerouted in full (the left track is
+  audible only through this one). Stack two tracks for a longer serial
+  chain — left's filter + insert feed into this track's filter + insert.
+- **input** — the norns **audio input** is the source, so external gear runs
+  through the track's whole chain. While any track uses it, norns' built-in
+  input monitoring is muted automatically (you'd hear the input twice
+  otherwise) and restored when no track uses it.
 
 Slice machines carry the MPC-style chop program: per-slice p-locks (hold a
 pad + edit), choke groups, pad copy/paste and mute, ratchets, and play modes
@@ -410,12 +420,12 @@ settings, and each slot's knobs get their own FX page — Insert 1 on page 1,
 Send 1/2 on pages 3/4, Master on page 5 — showing whatever the active machine
 offers (all p-lockable):
 
-There are **19 machines** — see `docs/MODE_CATALOG.md` for the full table
+There are **18 machines** — see `docs/MODE_CATALOG.md` for the full table
 with every parameter. The short version:
 
-- **None**, **Drive**, **Reverb**, **Blackhole** (huge modulated reverb),
-  **Lofi**, **Destroy** (8-param wrecking chain, bitcrush + sample-rate
-  reduction first).
+- **None**, **Reverb**, **Blackhole** (huge modulated reverb), **Lofi**,
+  **Destroy** (8-param wrecking chain, bitcrush + sample-rate reduction
+  first). (Looking for Drive? The filter stage carries it.)
 - Three tempo-synced delays, all sharing the same 15-division TIME list
   (1/32 … 2 BAR, dotted and triplet included): **Delay** (clean digital),
   **Echo** (colored, stereo offset, tone/wobble), **Tape Echo**

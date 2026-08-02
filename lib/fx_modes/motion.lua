@@ -10,10 +10,12 @@ function Mode.source_items(Item, prefix)
   local q = {0, 32, 64, 96, 127}
   return {
     Item.item(prefix .. "motion_width", "WDTH", {lockable = true, min = 0, max = 128, step = 1, snaps = {0, 32, 64, 96, 128}}),
-    Item.item(prefix .. "motion_rate", "RATE", {lockable = true, options = 7}),
+    Item.item(prefix .. "motion_rate", "RATE", {lockable = true, options = 16}),
     Item.item(prefix .. "motion_trem", "TREM", {lockable = true, min = 0, max = 127, step = 1, snaps = q}),
     Item.item(prefix .. "motion_pan", "PAN", {lockable = true, min = 0, max = 127, step = 1, snaps = q}),
-    Item.item(prefix .. "motion_shape", "SHPE", {lockable = true, options = 3})
+    -- opt_coarse: 3 options flip past too fast at a detent each (owner) --
+    -- require 4 detents per shape step.
+    Item.item(prefix .. "motion_shape", "SHPE", {lockable = true, options = 3, opt_coarse = 4})
   }
 end
 

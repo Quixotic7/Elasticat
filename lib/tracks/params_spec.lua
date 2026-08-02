@@ -21,7 +21,10 @@ local unpack = table.unpack or unpack
 
 local ParamsSpec = {}
 
-ParamsSpec.TRACK_COUNT_MAX = 8
+-- Capped from 8 (owner 2026-08-02): the last three row-4 keys became the
+-- SEND1/SEND2/MASTER bus pseudo-tracks. t7/t8 params are no longer registered;
+-- projects that used tracks 7-8 lose those two tracks on load.
+ParamsSpec.TRACK_COUNT_MAX = 6
 
 -- Macro mod matrix: each macro holds a signed depth to each of these 5
 -- destinations. `key` names the macro's per-dest depth param suffix
@@ -358,8 +361,9 @@ ParamsSpec.SPEC = {
     cmd = "flangerFeedback", xform = "bipolar", fmt = "pan_127", queue = true, t1 = true},
   {suffix = "phaser_center", name = "phaser center", spec = {0, 127, "lin", 1, 64, "", 1 / 127},
     cmd = "phaserCenter", xform = "amount", fmt = "env_level", queue = true, t1 = true},
+  -- 1..8 in steps of 1 (owner; was 2/4/6/8 -- saved indices land near-neighbors).
   {suffix = "phaser_stages", name = "phaser stages", kind = "option",
-    options = {"2", "4", "6", "8"}, default = 2, cmd = "phaserStages", offset = -1, queue = true, t1 = true},
+    options = {"1", "2", "3", "4", "5", "6", "7", "8"}, default = 4, cmd = "phaserStages", offset = -1, queue = true, t1 = true},
   {suffix = "phaser_feedback", name = "phaser feedback", spec = {0, 127, "lin", 1, 25, "", 1 / 127},
     cmd = "phaserFeedback", xform = "amount", fmt = "env_level", queue = true, t1 = true},
 
@@ -406,13 +410,15 @@ ParamsSpec.SPEC = {
   -- Motion (#17): M/S width (bipolar, 64 = unity) + one synced LFO for trem/pan.
   {suffix = "motion_width", name = "motion width", spec = {0, 128, "lin", 1, 64, "", 1 / 128},
     cmd = "motionWidth", xform = "bipolar", fmt = "pan_127", queue = true, t1 = true},
+  -- Full delay-style division list + 4 BAR (owner); default 1/4 (index 9).
   {suffix = "motion_rate", name = "motion rate", kind = "option",
-    options = "motion_rates", default = 5, cmd = "motionBeats", xform = "motion_beats", queue = true, t1 = true},
+    options = "motion_rates", default = 9, cmd = "motionBeats", xform = "motion_beats", queue = true, t1 = true},
   {suffix = "motion_trem", name = "motion tremolo", spec = {0, 127, "lin", 1, 0, "", 1 / 127},
     cmd = "motionTrem", xform = "amount", fmt = "env_level", queue = true, t1 = true},
   {suffix = "motion_pan", name = "motion autopan", spec = {0, 127, "lin", 1, 0, "", 1 / 127},
     cmd = "motionPan", xform = "amount", fmt = "env_level", queue = true, t1 = true},
-  {suffix = "motion_shape", name = "motion shape", kind = "option",
+  -- Named just "shape" so the header reads "Shape: Tri" untruncated (owner).
+  {suffix = "motion_shape", name = "shape", kind = "option",
     options = {"sine", "tri", "sqr"}, default = 1, cmd = "motionShape", offset = -1, queue = true, t1 = true},
 
   -- Rings (#18): ring mod / freq shift. FREQ + FINE are bipolar (direction
@@ -429,7 +435,8 @@ ParamsSpec.SPEC = {
   -- Limit (#19): master brickwall. Dynamics, so it reads in dB/ms (ID_FORMATTERS).
   {suffix = "limit_gain", name = "limit gain", spec = {0, 127, "lin", 1, 0, "", 1 / 127},
     cmd = "limitGain", xform = "amount", fmt = "env_level", queue = true, t1 = true},
-  {suffix = "limit_ceil", name = "limit ceiling", spec = {0, 127, "lin", 1, 121, "", 1 / 127},
+  -- Ceiling now spans -12..0 dB (owner; was -6..0) -- default stays ~-0.3 dB.
+  {suffix = "limit_ceil", name = "limit ceiling", spec = {0, 127, "lin", 1, 124, "", 1 / 127},
     cmd = "limitCeil", xform = "amount", fmt = "env_level", queue = true, t1 = true},
   {suffix = "limit_release", name = "limit release", spec = {0, 127, "lin", 1, 38, "", 1 / 127},
     cmd = "limitRelease", xform = "amount", fmt = "env_level", queue = true, t1 = true},

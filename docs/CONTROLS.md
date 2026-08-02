@@ -15,7 +15,7 @@ y\x     1    2    3    4    5    6    7    8    9   10   11   12   13   14   15 
 y1     FN    -  REC PLAY STOP    -  MST FILE  PAT    - TRIG  SRC FILT  AMP   FX  MOD
 y2      1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16
 y3     17   18   19   20   21   22   23   24   25   26   27   28   29   30   31   32
-y4    MC1  MC2  MC3  MC4    -    -    -   T1   T2   T3   T4   T5   T6   T7   T8    -
+y4    MC1  MC2  MC3  MC4    -    -    -   T1   T2   T3   T4   T5   T6  SD1  SD2  MST
 y5   OCT- OCT+    -    -    -    -    - PATN SC-A  xf1  xf2  xf3  xf4  xf5  xf6 SC-B
 y6      -   C#   D#    -   F#   G#   A#    -    -    -  YES    -   UP    -    - FILL
 y7      C    D    E    F    G    A    B  C+1    -    -   NO LEFT DOWN RGHT    - PAGE
@@ -65,7 +65,10 @@ once: start+end from their span.
 | x,y | Key | Action |
 |---|---|---|
 | 1,4-4,4 | MC1-MC4 | Macro keys (mod matrix). Hold + turn a destination param's encoder = dial that macro's signed depth to it. LED brightness tracks the macro's value. |
-| 8,4-15,4 | T1-T8 | Track select (up to ACTIVE TRACKS). Press = select; FN+press = mute. |
+| 8,4-13,4 | T1-T6 | Track select (up to ACTIVE TRACKS; the cap is 6). Press = select; FN+press = mute. |
+| 14,4 | SD1 | Select the SEND 1 bus: the current category shows its view (FX = the send's machine page). The step row edits the bus's OWN lane — trigs + held-step p-locks of its FX params. Press any track key to return. |
+| 15,4 | SD2 | Select the SEND 2 bus (same as SD1). |
+| 16,4 | MST | Select the MASTER bus: SOURCE = the MIX overview, AMP = master VOL, FX = the master insert; sequencable like the sends. MASTER + FILE categories stay global on every bus. |
 
 ## Grid: row 5 — octave, pattern load, scenes
 
@@ -151,7 +154,10 @@ pattern.
 |---|---|---|---|
 | Step(s) | hold step(s) + REC | hold step + PLAY (removes p-locks, keeps the trig) | hold step + STOP |
 | Sequencer page | hold PAGE + REC (selected page) | hold PAGE + PLAY | hold PAGE + STOP |
-| Pattern | FN + REC | FN + PLAY (confirm popup; wipes trigs only) | FN + STOP |
+
+(The FN + REC/PLAY/STOP *pattern*-scope bindings were removed 2026-08-01 —
+accidental pattern copy/clear on the most-hammered keys. FN + transport is
+now inert; pattern-level state still moves via the pattern slots.)
 
 Multi-step copy: hold several steps and press REC — pasting onto a held step
 places the copies in the same relation to each other (steps that would land

@@ -43,6 +43,13 @@ Engine_Elasticat : CroneEngine {
 	var send1Synth;
 	var send2Synth;
 	var masterSynth;
+	// Master output stage (owner 2026-08-02): the master INSERT writes into
+	// masterOutBus and this one synth applies the master volume on the way to
+	// the hardware out -- so VOL is independent of whatever machine the master
+	// insert runs (none of the FX defs carry an output-gain arg).
+	var masterOutSynth;
+	var <masterOutBus;
+	var masterAmp = 1.0;
 	var send1Machine = 0;   // index into fxInsertNames
 	var send2Machine = 0;
 	var masterFxMachine = 0;
@@ -229,9 +236,10 @@ Engine_Elasticat : CroneEngine {
 			\elasticatFilterComb,
 			\elasticatFilterFormant
 		];
+		// DRIVE removed 2026-08-01 (owner) -- indices above it shifted down one,
+		// in lockstep with lib/fx_modes/registry.lua.
 		fxInsertNames = [
 			\elasticatFxNone,
-			\elasticatFxDrive,
 			\elasticatFxDelay,
 			\elasticatFxReverb,
 			\elasticatFxLofi,
@@ -271,6 +279,7 @@ Engine_Elasticat : CroneEngine {
 		});
 
 		masterBus = Bus.audio(server, 2);
+		masterOutBus = Bus.audio(server, 2);
 		sendBus1 = Bus.audio(server, 2);
 		sendBus2 = Bus.audio(server, 2);
 
@@ -444,10 +453,21 @@ Engine_Elasticat : CroneEngine {
 		// by commands (play/trig/view), never by level.
 		idleResponder = OSCFunc({
 			arg msg;
-			var t, tr;
+			var t, tr, lvl;
 			t = msg[2].asInteger;
 			tr = if((t >= 1) and: { t <= 8 }, { tracks[t] }, { nil });
-			if(tr.notNil, { tr.reportOutLevel(msg[3].asFloat); });
+			if(tr.notNil, {
+				lvl = msg[3].asFloat;
+				tr.reportOutLevel(lvl);
+				// STOPPED tracks have no reader meter feed, so their on-screen
+				// meters froze at the stop-moment level and never showed the
+				// insert tail ringing out (owner QA). Forward this post-gain
+				// level as their meter instead: the tail is visible, the decay
+				// to zero is real, and the pause path already zeroes it.
+				if((tr.playing == 0) and: { (t == viewTrack) or: { meterAll == 1 } }, {
+					scriptAddress.sendBundle(0, ["/elasticat/track/level", t, lvl, lvl]);
+				});
+			});
 		}, path: '/elasticat/idleRaw', srcID: server.addr);
 
 		// One 2s housekeeping tick: pause idle-eligible tracks, then report CPU
@@ -475,6 +495,7 @@ Engine_Elasticat : CroneEngine {
 		this.spawnSend1;
 		this.spawnSend2;
 		this.spawnMasterFx;
+		this.spawnMasterOut;
 
 		// Allocate every active chain through the ONE code path. Track 1 is
 		// included here, not spawned separately.
@@ -1637,19 +1658,9 @@ Engine_Elasticat : CroneEngine {
 			Out.ar(out, In.ar(in, 2));
 		}).add;
 
-		// Drive: pre-insert clip/distortion (tanh saturation), the cheapest
-		// machine here and the one that validates the insert infrastructure.
-		SynthDef(\elasticatFxDrive, {
-			arg out=0, in=0, mix=0.5, drive=0,
-			delayBeats=1, delayFeedback=0.3, delayTone=1,
-			reverbSize=0.5, reverbDamp=0.5,
-			lofiBits=24, lofiRate=48000, targetBpm=120;
-			var sig, dry, wet;
-			sig = In.ar(in, 2);
-			dry = sig;
-			wet = fxDriveShape.value(sig, drive);
-			Out.ar(out, fxMixBlend.value(dry, wet, mix));
-		}).add;
+		// (The DRIVE machine was removed 2026-08-01 -- the filter stage already
+		// carries drive (owner). fxDriveShape + the fx_drive/trFxDrive plumbing
+		// stay: DESTROY-family machines and the dormant params still use them.)
 
 		// Delay: tempo-synced (beat-division delayBeats, quarter note = 1,
 		// recomputed from targetBpm every block so it stays in sync across
@@ -1714,7 +1725,10 @@ Engine_Elasticat : CroneEngine {
 			var sig, dry, wet, held, step;
 			sig = In.ar(in, 2);
 			dry = sig;
-			held = Latch.ar(sig, Impulse.ar(lofiRate.clip(500, 48000)));
+			// Cap at Nyquist: at the old 48000 cap Impulse.ar(sr) degenerates
+			// and the Latch never retriggers -- rate at max went SILENT (owner).
+			// 24000 = a trigger every other sample: audibly transparent.
+			held = Latch.ar(sig, Impulse.ar(lofiRate.clip(500, 24000)));
 			step = 2.0.pow(1 - lofiBits.clip(1, 24));
 			wet = held.round(step);
 			Out.ar(out, fxMixBlend.value(dry, wet, mix));
@@ -1903,7 +1917,7 @@ Engine_Elasticat : CroneEngine {
 		SynthDef(\elasticatFxPhaser, {
 			arg out=0, in=0, mix=0.5, modfxRate=0.25, modfxDepth=0.6, phaserCenter=0.5, phaserStages=1, phaserFeedback=0.2;
 			var sig, dry, sr, rateHz, depth, centerHz, fbAmt, lfo, lo, hi, fc, t, c;
-			var fb, x, a2, a4, a6, a8, tapL, tapR, tapped, wet;
+			var fb, x, s1, s2, s3, s4, s5, s6, s7, s8, stageSel, tapL, tapR, tapped, wet;
 			sig = In.ar(in, 2);
 			dry = sig;
 			sr = SampleRate.ir;
@@ -1921,12 +1935,19 @@ Engine_Elasticat : CroneEngine {
 			// First-order allpass: y[n] = c*x[n] + x[n-1] - c*y[n-1], i.e. FOS
 			// b1 = c.NEG. (Shipped with +c, which is a shelf, not an allpass --
 			// no notches, so the phaser barely phased.)
-			a2 = x;  2.do { a2 = FOS.ar(a2, c, 1.0, c.neg); };
-			a4 = a2; 2.do { a4 = FOS.ar(a4, c, 1.0, c.neg); };
-			a6 = a4; 2.do { a6 = FOS.ar(a6, c, 1.0, c.neg); };
-			a8 = a6; 2.do { a8 = FOS.ar(a8, c, 1.0, c.neg); };
-			tapL = Select.ar(phaserStages.round(1).clip(0, 3), [a2[0], a4[0], a6[0], a8[0]]);
-			tapR = Select.ar(phaserStages.round(1).clip(0, 3), [a2[1], a4[1], a6[1], a8[1]]);
+			// Eight single stages with a tap after EACH -- STGS selects 1..8 in
+			// steps of 1 (owner; was 2/4/6/8).
+			s1 = FOS.ar(x, c, 1.0, c.neg);
+			s2 = FOS.ar(s1, c, 1.0, c.neg);
+			s3 = FOS.ar(s2, c, 1.0, c.neg);
+			s4 = FOS.ar(s3, c, 1.0, c.neg);
+			s5 = FOS.ar(s4, c, 1.0, c.neg);
+			s6 = FOS.ar(s5, c, 1.0, c.neg);
+			s7 = FOS.ar(s6, c, 1.0, c.neg);
+			s8 = FOS.ar(s7, c, 1.0, c.neg);
+			stageSel = phaserStages.round(1).clip(0, 7);
+			tapL = Select.ar(stageSel, [s1[0], s2[0], s3[0], s4[0], s5[0], s6[0], s7[0], s8[0]]);
+			tapR = Select.ar(stageSel, [s1[1], s2[1], s3[1], s4[1], s5[1], s6[1], s7[1], s8[1]]);
 			tapped = [tapL, tapR];
 			LocalOut.ar(tapped);
 			wet = (dry + tapped) * 0.5;
@@ -2076,7 +2097,7 @@ Engine_Elasticat : CroneEngine {
 			var sig, g, ceil, dur, wet, inAmp, outAmp, grDb, keyDb;
 			sig = In.ar(in, 2);
 			g = limitGain.clip(0, 1).linlin(0, 1, 0, 18).dbamp;
-			ceil = limitCeil.clip(0, 1).linlin(0, 1, -6, 0).dbamp;
+			ceil = limitCeil.clip(0, 1).linlin(0, 1, -12, 0).dbamp;   // -12..0 dB (owner; was -6)
 			dur = limitRelease.clip(0, 1).linexp(0, 1, 0.002, 0.1);
 			wet = Limiter.ar(sig * g, ceil, dur);
 			// Metering feed, same shape as COMP: gain reduction (out/in dB),
@@ -2113,6 +2134,26 @@ Engine_Elasticat : CroneEngine {
 		// volume/pan (and the AMP/PAN mod destinations), so the mix staging is
 		// IDENTICAL for track 1 and tracks 2-8: no per-track difference, no double
 		// gain. `alive` fades to 0 (~30 ms Lag) before freeing the chain.
+		// --- Routing source readers (owner 2026-08-02) ----------------------
+		// Replace the buffer reader when a track's SOURCE is another signal:
+		// NEIGHBOR reads the bus the LEFT track's mix was re-pointed into,
+		// INPUT reads the norns hardware input. Both are playing-independent
+		// pass-throughs into the track's fxBus -- the track's filter / amp /
+		// insert / sends do all the shaping.
+		SynthDef(\elasticatNeighborReader, {
+			arg out=0, in=0;
+			Out.ar(out, In.ar(in, 2));
+		}).add;
+		// Master volume stage: the only writer of the hardware out now.
+		SynthDef(\elasticatMasterOut, {
+			arg out=0, in=0, amp=1;
+			Out.ar(out, In.ar(in, 2) * Lag.kr(amp.clip(0, 1.5), 0.02));
+		}).add;
+		SynthDef(\elasticatInputReader, {
+			arg out=0;
+			Out.ar(out, SoundIn.ar([0, 1]));
+		}).add;
+
 		SynthDef(\elasticatTrackMix, {
 			arg out=0, in=0, amp=1, pan=0, mute=0, alive=1, trackIndex=1;
 			var sig, gain, outSig, lvl;
@@ -2473,6 +2514,10 @@ Engine_Elasticat : CroneEngine {
 		this.addCommand(\trModTrig, "iii", { arg msg;
 			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.modTrig(msg[2], msg[3]); });
 		});
+		// Source routing (owner 2026-08-02): 0 = buffer, 1 = neighbor, 2 = input.
+		this.addCommand(\trSourceRouting, "ii", { arg msg;
+			var tr; tr = this.track(msg[1]); if(tr.notNil, { tr.setSourceRouting(msg[2]); });
+		});
 		// Transport.
 		this.addCommand(\trPlay, "ii", { arg msg;
 			var tr; tr = this.track(msg[1]);
@@ -2566,6 +2611,7 @@ Engine_Elasticat : CroneEngine {
 		// Panic: HARD-kill every slice voice on every track (20ms fade + free),
 		// unlike releaseAllSlices which only opens the gate. Owner: stop-twice.
 		this.addCommand(\killAllSlices, "", { this.stealAllSlices; });
+		this.addCommand(\panicClearFx, "", { this.panicClearFx; });
 		// Generic warp-param escape hatch (live set only, same as before).
 		this.addCommand(\trModeParam, "isf", { arg msg;
 			var tr; tr = this.track(msg[1]);
@@ -2587,6 +2633,7 @@ Engine_Elasticat : CroneEngine {
 		this.addCommand(\viewTrack, "i", { arg msg; this.setViewTrack(msg[1]); });
 		this.addCommand(\idlePauseEnable, "i", { arg msg; this.setIdlePauseEnabled(msg[1]); });
 		this.addCommand(\idleGrace, "f", { arg msg; this.setIdleGrace(msg[1]); });
+		this.addCommand(\masterAmp, "f", { arg msg; this.setMasterAmp(msg[1]); });
 		this.addCommand(\meterAll, "i", { arg msg; meterAll = msg[1].asInteger.clip(0, 1); });
 		this.addCommand(\maxSliceVoices, "i", { arg msg;
 			maxSliceVoices = msg[1].asInteger.clip(1, 64);
@@ -2726,7 +2773,7 @@ Engine_Elasticat : CroneEngine {
 			[\ChorusWidth,    \chorusWidth,    0, 1, 0.5],
 			[\FlangerFeedback, \flangerFeedback, -1, 1, 0],
 			[\PhaserCenter,   \phaserCenter,   0, 1, 0.5],
-			[\PhaserStages,   \phaserStages,   0, 3, 1],
+			[\PhaserStages,   \phaserStages,   0, 7, 1],
 			[\PhaserFeedback, \phaserFeedback, 0, 1, 0.2],
 			[\EqLow,          \eqLow,          -1, 1, 0],
 			[\EqMid,          \eqMid,          -1, 1, 0],
@@ -2793,6 +2840,30 @@ Engine_Elasticat : CroneEngine {
 			var tr;
 			tr = this.track(t);
 			if(t <= activeTrackCount, { tr.alloc; }, { tr.free; });
+		});
+		this.applyNeighborRouting;
+	}
+
+	// NEIGHBOR routing (owner 2026-08-02): a track whose sourceRouting is 1
+	// takes the LEFT track's output as its source, FULL reroute -- the left
+	// track's mix no longer feeds the master at all; it is audible only
+	// through the neighbor track's chain. One pass re-points every allocated
+	// track's mix output: to the right neighbor's neighborBus when that
+	// neighbor is routing, back to masterBus otherwise. Called on any routing
+	// change and on track alloc/free (a re-allocated mix synth starts on
+	// masterBus and must be re-pointed).
+	applyNeighborRouting {
+		(1..8).do({ arg t;
+			var tr = tracks[t];
+			var right = if(t < 8, { tracks[t + 1] }, { nil });
+			if(tr.notNil and: { tr.isAllocated }, {
+				if(right.notNil and: { right.isAllocated }
+					and: { right.sourceRouting == 1 }, {
+					tr.setMixOut(right.neighborBus.index);
+				}, {
+					tr.setMixOut(masterBus.index);
+				});
+			});
 		});
 	}
 
@@ -3000,13 +3071,33 @@ Engine_Elasticat : CroneEngine {
 	}
 
 	// Master insert: reads masterBus (every track's mix + both send returns,
-	// all written by the time masterGroup runs) and is the only thing writing
-	// context.out_b.
+	// all written by the time masterGroup runs) and writes masterOutBus; the
+	// master-out stage (volume) is what writes context.out_b. The insert must
+	// respawn BEFORE the out stage in masterGroup, or a machine change would
+	// order it after the volume and go silent.
 	spawnMasterFx {
 		if(masterSynth.notNil, { masterSynth.free; });
-		masterSynth = Synth.tail(masterGroup, fxInsertNames.wrapAt(masterFxMachine.asInteger),
-			this.sendFxArgs(2, masterBus.index, context.out_b.index));
+		masterSynth = if(masterOutSynth.notNil, {
+			Synth.before(masterOutSynth, fxInsertNames.wrapAt(masterFxMachine.asInteger),
+				this.sendFxArgs(2, masterBus.index, masterOutBus.index));
+		}, {
+			Synth.tail(masterGroup, fxInsertNames.wrapAt(masterFxMachine.asInteger),
+				this.sendFxArgs(2, masterBus.index, masterOutBus.index));
+		});
 		^masterSynth;
+	}
+
+	spawnMasterOut {
+		if(masterOutSynth.notNil, { masterOutSynth.free; });
+		masterOutSynth = Synth.tail(masterGroup, \elasticatMasterOut, [
+			\in, masterOutBus.index, \out, context.out_b.index, \amp, masterAmp
+		]);
+		^masterOutSynth;
+	}
+
+	setMasterAmp { arg amp;
+		masterAmp = amp.clip(0, 1.5);
+		if(masterOutSynth.notNil, { masterOutSynth.set(\amp, masterAmp); });
 	}
 
 	setMasterMachine { arg idx;
@@ -3372,6 +3463,21 @@ Engine_Elasticat : CroneEngine {
 		idlePausedCount = 0;
 	}
 
+	// Double-stop panic (owner QA): stealing the slice voices is not enough --
+	// ringing insert/send/master delay and reverb TAILS keep sounding. A fresh
+	// synth has fresh (silent) delay lines, and every spawn path seeds from the
+	// engine's stored per-slot params, so respawning clears the audio without
+	// losing a single setting.
+	panicClearFx {
+		(1..8).do({ arg t;
+			var tr = tracks[t];
+			if(tr.notNil and: { tr.isAllocated }, { tr.spawnInsert; });
+		});
+		this.spawnSend1;
+		this.spawnSend2;
+		this.spawnMasterFx;
+	}
+
 	setIdlePauseEnabled { arg flag;
 		idlePauseEnabled = flag.asInteger.clip(0, 1);
 		if(idlePauseEnabled == 0, { this.wakeAllTracks; });
@@ -3419,7 +3525,9 @@ Engine_Elasticat : CroneEngine {
 		});
 		if(defaultBufL.notNil, { defaultBufL.free; });
 		if(defaultBufR.notNil and: { defaultBufR != defaultBufL }, { defaultBufR.free; });
+		if(masterOutSynth.notNil, { masterOutSynth.free; });
 		if(masterBus.notNil, { masterBus.free; });
+		if(masterOutBus.notNil, { masterOutBus.free; });
 		if(sendBus1.notNil, { sendBus1.free; });
 		if(sendBus2.notNil, { sendBus2.free; });
 	}
@@ -3467,6 +3575,14 @@ ElasticatTrack {
 	// --- idle pause state (engine.idleScan drives it; see engine var block) ---
 	var <idlePaused = false;
 	var lastLoudTime = 0;   // Main.elapsedTime of the last non-silent 2Hz report
+
+	// --- source routing (owner 2026-08-02) -----------------------------------
+	// 0 = normal buffer reader, 1 = NEIGHBOR (the LEFT track's output is this
+	// track's source; engine.applyNeighborRouting does the mix re-point),
+	// 2 = INPUT (norns audio in). Routing readers are playing-independent.
+	var <sourceRouting = 0;
+	var <neighborBus;   // what the left track's mix writes into when routing = 1
+	var <mixOutIndex;   // where this track's mix currently writes (test-visible)
 
 	// --- transport / reader state -------------------------------------------
 	var <machine = 0, <playing = 0, <muted = 0;
@@ -3704,7 +3820,7 @@ ElasticatTrack {
 			\chorusWidth    -> (arg: \chorusWidth,    synth: \insert, lo: 0, hi: 1),
 			\flangerFeedback -> (arg: \flangerFeedback, synth: \insert, lo: -1, hi: 1),
 			\phaserCenter   -> (arg: \phaserCenter,   synth: \insert, lo: 0, hi: 1),
-			\phaserStages   -> (arg: \phaserStages,   synth: \insert, lo: 0, hi: 3, int: true),
+			\phaserStages   -> (arg: \phaserStages,   synth: \insert, lo: 0, hi: 7, int: true),
 			\phaserFeedback -> (arg: \phaserFeedback, synth: \insert, lo: 0, hi: 1),
 			\eqLow          -> (arg: \eqLow,          synth: \insert, lo: -1, hi: 1),
 			\eqMid          -> (arg: \eqMid,          synth: \insert, lo: -1, hi: 1),
@@ -4029,7 +4145,32 @@ ElasticatTrack {
 			and: { idlePaused.not }
 			and: { index != view }
 			and: { group.notNil }
+			// a routing track (neighbor/input source) passes audio regardless
+			// of its own transport: pausing it would swallow the left track /
+			// the hardware input with nothing to wake it.
+			and: { sourceRouting == 0 }
 			and: { (now - lastLoudTime) > grace }
+	}
+
+	// ---- Source routing (owner 2026-08-02) ----------------------------------
+	setMixOut { arg busIndex;
+		mixOutIndex = busIndex;
+		if(mixSynth.notNil, { mixSynth.set(\out, busIndex); });
+	}
+
+	setSourceRouting { arg mode;
+		var m = mode.asInteger.clip(0, 2);
+		// Track 1 has no left neighbor; the script rejects it too -- belt and
+		// braces so a stale pset can never point track 1 at a silent bus.
+		if((m == 1) and: { index <= 1 }, { m = 0; });
+		if(m == sourceRouting, { ^this });
+		sourceRouting = m;
+		this.idleWake;
+		if(group.notNil, {
+			if(activeSynth.notNil, { activeSynth.free; });
+			activeSynth = this.spawnMode(1);
+		});
+		engine.applyNeighborRouting;
 	}
 
 	// Pause the WHOLE track group -- transport, reader, mod, filter, insert,
@@ -4497,6 +4638,15 @@ ElasticatTrack {
 	spawnMode { arg startAmp;
 		var defName;
 		if(group.isNil, { ^nil });
+		// Routing sources replace the buffer reader outright (playing-
+		// independent pass-throughs; warp mode is irrelevant while active).
+		if(sourceRouting.asInteger == 1, {
+			^Synth.after(transportSynth, \elasticatNeighborReader,
+				[\out, fxBus.index, \in, neighborBus.index]);
+		});
+		if(sourceRouting.asInteger == 2, {
+			^Synth.after(transportSynth, \elasticatInputReader, [\out, fxBus.index]);
+		});
 		defName = engine.modeSynthNames.wrapAt(machine.asInteger);
 		// Spectral modes (freeze = 8 / formant = 9) run an FFT chain -- one is
 		// affordable, 8 are not. Track-1-only: fall back to tape on any other track.
@@ -4547,6 +4697,7 @@ ElasticatTrack {
 		fxBus = Bus.audio(server, 2);
 		insertBus = Bus.audio(server, 2);
 		mixBus = Bus.audio(server, 2);
+		neighborBus = Bus.audio(server, 2);
 		modBusPitch = Bus.control(server, 1);
 		modBusCutoff = Bus.control(server, 1);
 		modBusRes = Bus.control(server, 1);
@@ -4630,7 +4781,7 @@ ElasticatTrack {
 	// neither can drift and leak.
 	chainBusses {
 		^[
-			phaseBus, fxBus, insertBus, mixBus,
+			phaseBus, fxBus, insertBus, mixBus, neighborBus,
 			modBusPitch, modBusCutoff, modBusRes, modBusAmp, modBusPan
 		];
 	}
@@ -4643,6 +4794,7 @@ ElasticatTrack {
 		idlePaused = false;
 		group = nil; sourceGroup = nil;
 		phaseBus = nil; fxBus = nil; insertBus = nil; mixBus = nil;
+		neighborBus = nil;
 		modBusPitch = nil; modBusCutoff = nil; modBusRes = nil;
 		modBusAmp = nil; modBusPan = nil;
 		transportSynth = nil; modSynth = nil; activeSynth = nil;

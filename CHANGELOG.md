@@ -1,5 +1,68 @@
 # Changelog
 
+## Bus tracks, round 2 (owner QA): sequencable buses, master VOL, fixes
+
+- **Sends + master are now SEQUENCABLE**: each bus has its own lane — place
+  trigs on the step row while a bus is selected and hold a step to P-LOCK
+  that bus's FX parameters (locks apply at the step and restore after, like
+  track locks). Bus lanes prime/stop/jump with the transport and save into
+  patterns and projects.
+- **Master AMP page**: the MASTER bus's AMP category is a single p-lockable
+  VOL — a real master output volume stage after the master insert.
+- Fixes from the first bus-tracks QA pass:
+  - The SOURCE settings machine selector was capped at 6 options, so
+    **neighbor/input could not be selected** — fixed (and the test now checks
+    the selector against the machine registry so it can't go stale again).
+  - Bus tracks **no longer block the MASTER and FILE (sample editor)
+    categories** — those are global and now behave normally with a bus
+    selected.
+  - **No more auto-category-jump** on bus select: the category stays where it
+    was (jump between T1 and MASTER while in FX and you stay in FX).
+  - The mixer header reads **"MASTER CPU nn/pp%"** — the CPU readout is no
+    longer truncated.
+
+## Bus tracks: sends + master as selectable tracks; NEIGHBOR + INPUT machines
+
+- The track count is now **6**, and the three keys right of the track row
+  select **SEND 1 / SEND 2 / MASTER as bus pseudo-tracks**: the screen flips
+  to that bus's pages — each send's FX machine is edited on ITS FX page, and
+  the MASTER bus's SOURCE page is the MIX overview (moved from the master
+  category). A track's FX category is now just Insert 1 + the SENDS routing
+  page. Press any track key to get back.
+- New **NEIGHBOR** source machine (tracks 2–6): the track's source is the
+  output of the track to its left, rerouted in full — stack two tracks for a
+  longer serial FX chain (left's filter/insert into the right's).
+- New **INPUT** source machine: the norns audio input as a track source, with
+  norns' built-in input monitoring auto-muted while in use (and restored
+  after — you'd hear the input doubled otherwise).
+- MIGRATION: projects that used tracks 7–8 lose those two tracks.
+
+## Owner QA round: clock recovery, panic, meters, FX fixes, DRIVE removed
+
+From the first full on-device QA pass of the away-batch (all FX listened to):
+
+- **Clock**: the fast-pattern-rate wedge that killed the internal clock now
+  auto-recovers — the watchdog probes the clock pool directly each second and
+  runs the double-stop recovery the moment it's exhausted (the old detector
+  missed this case because the sync fiber survives).
+- **Double-stop = real panic**: also clears every ringing delay/reverb tail
+  in the insert/send/master FX (settings survive; only the audio is cut).
+- **Stopped-track meters** now show the FX tail ringing out and decay to
+  zero, instead of freezing at the stop-moment level.
+- **DRIVE machine removed** (the filter stage already has drive). Machine
+  indices above it shift down one — older projects need a one-time re-pick
+  of any FX machine that sat above DRIVE.
+- **FX fixes**: LOFI no longer goes silent at max sample rate; COMP threshold
+  reads in 0.5 dB steps and big ratios display as "14:1" (no more cut-off
+  text); PHASER stages now 1–8 in steps of 1; MOTION's shape knob needs a
+  deliberate turn, its header reads "Shape:", and RATE spans the full
+  division list (1/32 … 4 BAR); LIMIT ceiling reaches −12 dB and its meter
+  tick is visible at every ceiling (it vanished at 0 dB — the "no tick on
+  insert" report).
+- **FN + REC/PLAY/STOP no longer copy/clear/paste the pattern** — those were
+  surprising destructive duplicates on the most-hammered keys; the page-key
+  scopes remain.
+
 ## CPU headroom: idle track pause + CPU readout
 
 - The engine now **pauses idle tracks**: a track that is stopped, actually silent (FX tails ring out first — silence is measured post-everything), not the selected track, and holding no slice voices has its whole DSP chain suspended. Any play/trig/preview or selecting the track wakes it instantly. Eight mostly-idle tracks now cost roughly nothing — this directly attacks the Pi3's xrun-storm → wedged-clock failure mode. Kill switch: params → system → "idle track pause".

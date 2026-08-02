@@ -2378,6 +2378,28 @@ local function trig_machine_items()
 end
 
 local function page_items_for(category, page, page_index)
+  -- Bus pseudo-track view (SEND1/SEND2/MASTER selected on row 4): the FX
+  -- category resolves to THAT bus's machine page regardless of page_index;
+  -- the master bus's SOURCE is the mixer strip and its AMP a single master
+  -- volume. GLOBAL categories (master, file/sample editor) pass through
+  -- untouched (owner QA: buses must not block global settings); the rest
+  -- have no editable items (placeholder screens).
+  if elasticat.selected_bus ~= nil and category ~= "master" and category ~= "file" then
+    if category == "fx" then
+      local b = elasticat.BUS_VIEWS[elasticat.selected_bus]
+      return fx_slot_items(b.suffix, b.prefix)
+    elseif elasticat.selected_bus == "master" and category == "source" then
+      return elasticat.bus_mix_page.items
+    elseif elasticat.selected_bus == "master" and category == "amp" then
+      return {
+        ParamItem.item("master_amp", "VOL",
+          {lockable = true, min = 0, max = 127, step = 1, snaps = {0, 32, 64, 100, 127}}),
+        ParamItem.blank(), ParamItem.blank(), ParamItem.blank(),
+        ParamItem.blank(), ParamItem.blank(), ParamItem.blank(), ParamItem.blank()
+      }
+    end
+    return {}
+  end
   if category == "amp" and page_index == 1 then
     return amp_env_items()
   elseif category == "filter" and page_index == 1 then
@@ -2388,12 +2410,6 @@ local function page_items_for(category, page, page_index)
     return elasticat.mod_env_lowprofile_items()
   elseif category == "fx" and page_index == 1 then
     return fx_slot_items("fx_insert1_machine", nil)
-  elseif category == "fx" and page_index == 3 then
-    return fx_slot_items("send1_machine", "send1_")
-  elseif category == "fx" and page_index == 4 then
-    return fx_slot_items("send2_machine", "send2_")
-  elseif category == "fx" and page_index == 5 then
-    return fx_slot_items("master_fx_machine", "master_")
   elseif category == "trig" and page_index == 3 then
     return trig_machine_items()
   elseif category == "source" and page_index == 1 then
@@ -2432,12 +2448,19 @@ nav = Navigation.new({
     if elasticat.flush_dirty_pool_state ~= nil then
       elasticat.flush_dirty_pool_state()
     end
-    -- The MIX overview (master page 2) shows all 8 meters; every other page shows
-    -- only the selected track's. Tell the engine which meters to feed at 15Hz.
-    local _, page_index = nav:current_page()
-    elasticat.set_meter_all(nav:current_category() == "master" and page_index == 2)
+    -- The MIX overview (now the MASTER bus's SOURCE page) shows all meters;
+    -- every other page shows only the selected track's.
+    if elasticat.refresh_meter_all ~= nil then elasticat.refresh_meter_all() end
   end
 })
+
+-- All-track meter feed gate, in ONE place (called on nav changes AND bus
+-- selection changes): the mixer lives on the MASTER bus's SOURCE page now.
+-- On the module table -- the main chunk is at LuaJIT's 200-local ceiling.
+elasticat.refresh_meter_all = function()
+  elasticat.set_meter_all(
+    elasticat.selected_bus == "master" and nav:current_category() == "source")
+end
 
 param_values = ParamValues.new({
   -- Selected-track id funnel (Phase 1): per-track suffixes resolve to the
@@ -2768,7 +2791,10 @@ local function draw_page_header(title, page_number)
   end
 
   Header.draw({
-    track = elasticat.selected_track or 1,
+    -- Bus pseudo-track view: the track cell reads S1/S2/M instead of a number.
+    track = (elasticat.selected_bus ~= nil
+        and ({send1 = "S1", send2 = "S2", master = "M"})[elasticat.selected_bus])
+      or elasticat.selected_track or 1,
     ghost = ghost,
     -- A muted track is silent downstream of the meter, so the header says so.
     muted = grid_ui ~= nil and grid_ui.track_muted ~= nil
@@ -2790,6 +2816,15 @@ end
 -- FX identity). Pure rendering -- it reads through param_values/param_value_or
 -- only. Constructed at file scope (like source_page below) to stay clear of
 -- init()'s 60-upvalue limit.
+-- Bus pseudo-track wiring (owner 2026-08-02). On the module table: the main
+-- chunk is at LuaJIT's 200-local ceiling.
+elasticat.BUS_VIEWS = {
+  send1 = {suffix = "send1_machine", prefix = "send1_", title = "SEND1 FX", label = "SEND 1", meter = 101},
+  send2 = {suffix = "send2_machine", prefix = "send2_", title = "SEND2 FX", label = "SEND 2", meter = 102},
+  master = {suffix = "master_fx_machine", prefix = "master_", title = "MASTER FX", label = "MASTER", meter = 103}
+}
+elasticat.bus_mix_page = include("lib/pages/model").bus_master_mix
+
 local page_render = include("lib/ui/page_render").new({
   param_values = param_values,
   value = param_value_or,
@@ -2930,19 +2965,44 @@ local function draw_root_page()
     return
   end
 
-  if page.mixer then
-    -- The mixer is the "what is my kit doing" page, so it carries the standing
-    -- CPU readout (avg/peak% from /elasticat/cpu; the header only warns when
-    -- hot). Composed into the title -- the header layout stays untouched.
-    local cpu = elasticat.cpu_report
-    if cpu ~= nil then
-      title = string.format("%s CPU %d/%d%%", title,
-        math.floor(cpu.avg + 0.5), math.floor(cpu.peak + 0.5))
+  -- Bus pseudo-track screens (SEND1/SEND2/MASTER selected on row 4, owner
+  -- 2026-08-02). MASTER's SOURCE is the mixer (moved from master category
+  -- page 2) and its AMP the master volume; FX falls through to the normal
+  -- flow (page_items_for already resolved the bus machine page, and the
+  -- mode-param banner path renders it); GLOBAL categories (master, file)
+  -- pass through untouched; the rest are placeholders.
+  if elasticat.selected_bus ~= nil
+    and nav:current_category() ~= "master" and nav:current_category() ~= "file" then
+    local b = elasticat.BUS_VIEWS[elasticat.selected_bus]
+    if elasticat.selected_bus == "master" and nav:current_category() == "source" then
+      -- The mixer keeps the standing CPU readout in its title.
+      local mix_title = elasticat.bus_mix_page.title
+      local cpu = elasticat.cpu_report
+      if cpu ~= nil then
+        mix_title = string.format("%s CPU %d/%d%%", mix_title,
+          math.floor(cpu.avg + 0.5), math.floor(cpu.peak + 0.5))
+      end
+      draw_page_header(mix_title, 1)
+      elasticat.MixerPage.draw(elasticat.mixer_tracks(),
+        elasticat.mixer_strip(page_items_for("source", page, page_index), nav:clamp_current_group()))
+      return
     end
-    draw_page_header(title, page_index)
-    elasticat.MixerPage.draw(elasticat.mixer_tracks(),
-      elasticat.mixer_strip(page_items_for("master", page, page_index), nav:clamp_current_group()))
-    return
+    if elasticat.selected_bus == "master" and nav:current_category() == "amp" then
+      -- Generic 2x4 rendering ("master" has no category widget) -- the amp
+      -- category's own renderer expects envelope items.
+      draw_page_header("MASTER VOL", 1)
+      page_render:draw("master", 1, page_items_for("amp", page, page_index), nav:clamp_current_group())
+      return
+    end
+    if nav:current_category() ~= "fx" then
+      draw_page_header(b.label, 1)
+      screen.level(4)
+      screen.move(64, 38)
+      screen.text_center(elasticat.selected_bus == "master"
+        and "MASTER: src/amp/fx" or (b.label .. ": FX + trigs"))
+      return
+    end
+    title = b.title
   end
 
   local items = page_items_for(nav:current_category(), page, page_index)
@@ -3002,21 +3062,24 @@ local function draw_root_page()
     -- simultaneous instances never mix on screen. Draw only while the feed is
     -- fresh. Duck's natural home is a send return, which is exactly pages 3/4.
     if nav:current_category() == "fx" then
-      local slots = {
-        [1] = {machine = "fx_insert1_machine", meter = elasticat.selected_track},
-        [3] = {machine = "send1_machine", meter = 101},
-        [4] = {machine = "send2_machine", meter = 102},
-        [5] = {machine = "master_fx_machine", meter = 103}
-      }
-      local slot = slots[page_index]
+      -- Insert page = the selected track's meter; a bus view = that bus's
+      -- meter (101/102/103), whatever model page nav happens to be on.
+      local slot = nil
+      if elasticat.selected_bus ~= nil then
+        local b = elasticat.BUS_VIEWS[elasticat.selected_bus]
+        slot = {machine = b.suffix, meter = b.meter}
+      elseif page_index == 1 then
+        slot = {machine = "fx_insert1_machine", meter = elasticat.selected_track}
+      end
       if slot ~= nil then
         local fx_machine = math.floor(param_value_or(slot.machine, 1) + 0.5)
         local m = elasticat.fx_meter ~= nil and elasticat.fx_meter[slot.meter] or nil
-        if (fx_machine == 6 or fx_machine == 14 or fx_machine == 19) and m ~= nil
+        -- Metered machines, post-DRIVE-removal indices: COMP 5, DUCK 13,
+        -- LIMIT 18. COMP + LIMIT show the threshold/ceiling tick.
+        if (fx_machine == 5 or fx_machine == 13 or fx_machine == 18) and m ~= nil
           and (util.time() - (m.t or 0)) < 0.3 then
-          -- COMP + LIMIT show the threshold/ceiling tick; DUCK has no threshold.
           page_render:draw_fx_meter(m.key, m.gr, m.thresh,
-            fx_machine == 6 or fx_machine == 19)
+            fx_machine == 5 or fx_machine == 18)
         end
       end
     end
@@ -4287,6 +4350,15 @@ function init()
       elasticat.select_ui_track(track)
       request_redraw()
     end,
+    -- Bus pseudo-tracks (SEND1/SEND2/MASTER keys, x14-16): flip the SCREEN to
+    -- that bus's view of the CURRENT category (owner: no auto-jump -- jumping
+    -- between track 1 and MASTER while in FX must stay in FX). nil = a real
+    -- track was (re)selected; just clear.
+    on_bus_selected = function(name)
+      elasticat.selected_bus = name
+      if elasticat.refresh_meter_all ~= nil then elasticat.refresh_meter_all() end
+      request_redraw()
+    end,
     get_track_muted = function(track)
       return elasticat.track_muted(track) == true
     end,
@@ -4675,6 +4747,10 @@ function cleanup()
   -- norns PARAMS menu (which bypasses settings_delta_value's per-edit save)
   -- still survive the next launch.
   save_editor_prefs()
+  -- Never leave the norns input monitor muted behind us (INPUT machine).
+  if elasticat.restore_input_monitor ~= nil then
+    elasticat.restore_input_monitor()
+  end
   if elasticat.flush_dirty_pool_state ~= nil then
     elasticat.flush_dirty_pool_state()
   end

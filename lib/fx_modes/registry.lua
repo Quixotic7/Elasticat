@@ -17,29 +17,31 @@ local ModeParamLayout = include("lib/ui/mode_param_layout")
 
 local Registry = {}
 
+-- DRIVE removed 2026-08-01 (owner: the filter stage already has drive) --
+-- every machine above it shifted DOWN one index; saved projects that used a
+-- machine above DRIVE land one machine off and need a one-time re-pick.
 local machines = {
   [1] = include("lib/fx_modes/none"),
-  [2] = include("lib/fx_modes/drive"),
-  [3] = include("lib/fx_modes/delay"),
-  [4] = include("lib/fx_modes/reverb"),
-  [5] = include("lib/fx_modes/lofi"),
-  [6] = include("lib/fx_modes/comp"),
-  [7] = include("lib/fx_modes/destroy"),
-  [8] = include("lib/fx_modes/echo"),
-  [9] = include("lib/fx_modes/blackhole"),
-  [10] = include("lib/fx_modes/chorus"),
-  [11] = include("lib/fx_modes/flanger"),
-  [12] = include("lib/fx_modes/phaser"),
-  [13] = include("lib/fx_modes/dj_eq"),
-  [14] = include("lib/fx_modes/duck"),
-  [15] = include("lib/fx_modes/tape_echo"),
-  [16] = include("lib/fx_modes/cassette"),
-  [17] = include("lib/fx_modes/motion"),
-  [18] = include("lib/fx_modes/rings"),
-  [19] = include("lib/fx_modes/limit")
+  [2] = include("lib/fx_modes/delay"),
+  [3] = include("lib/fx_modes/reverb"),
+  [4] = include("lib/fx_modes/lofi"),
+  [5] = include("lib/fx_modes/comp"),
+  [6] = include("lib/fx_modes/destroy"),
+  [7] = include("lib/fx_modes/echo"),
+  [8] = include("lib/fx_modes/blackhole"),
+  [9] = include("lib/fx_modes/chorus"),
+  [10] = include("lib/fx_modes/flanger"),
+  [11] = include("lib/fx_modes/phaser"),
+  [12] = include("lib/fx_modes/dj_eq"),
+  [13] = include("lib/fx_modes/duck"),
+  [14] = include("lib/fx_modes/tape_echo"),
+  [15] = include("lib/fx_modes/cassette"),
+  [16] = include("lib/fx_modes/motion"),
+  [17] = include("lib/fx_modes/rings"),
+  [18] = include("lib/fx_modes/limit")
 }
 
-local names = {"NONE", "DRIVE", "DELAY", "REVERB", "LOFI", "COMP", "DESTROY", "ECHO",
+local names = {"NONE", "DELAY", "REVERB", "LOFI", "COMP", "DESTROY", "ECHO",
   "BLACKHOLE", "CHORUS", "FLANGER", "PHASER", "DJ EQ", "DUCK",
   "TAPE ECHO", "CASSETTE", "MOTION", "RINGS", "LIMIT"}
 
